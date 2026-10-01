@@ -452,6 +452,13 @@ export function trackCurrentFeaturesOnce(params: Record<string, string>): void {
   trackEvent('当前功能启用', params);
 }
 
+/** 单独 API 的去留调查：每会话一票，不参与五组快照抽样；去重交给 Umami 查询侧。 */
+export function trackAmsgSecondaryApiUsageOnce(params: { 角色数: string }): void {
+  if (reportedScales.has('amsg-secondary-api')) return;
+  reportedScales.add('amsg-secondary-api');
+  trackEvent('主动消息单独API配置', { 角色数: params.角色数 });
+}
+
 /** SAR / 私聊输入 / 周年赠礼，与其他快照互斥，每会话最多一次。 */
 export function trackCurrentSARFeaturesOnce(params: Record<string, string>): void {
   if (!shouldReportSnapshot('sar')) return;

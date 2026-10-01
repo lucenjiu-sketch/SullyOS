@@ -523,6 +523,38 @@ describe('快照事件的槽位轮转', () => {
     });
 });
 
+describe('主动消息单独 API 配置的会话上报', () => {
+    it.each(SLOT_ORDER)('快照抽中 %s 时仍独立上报，重复调用只记一次', async slot => {
+        installFakeDom({ withUmami: true });
+        const a = await loadModule(true, slot);
+        a.trackAmsgSecondaryApiUsageOnce({ 角色数: '2-3' });
+        a.trackAmsgSecondaryApiUsageOnce({ 角色数: '4+' });
+        expect(tracked).toEqual([['主动消息单独API配置', { 角色数: '2-3' }]]);
+    });
+
+    it('没有配置单独 API 的会话也上报 0，保留占比分母', async () => {
+        installFakeDom({ withUmami: true });
+        const a = await loadModule(true);
+        a.trackAmsgSecondaryApiUsageOnce({ 角色数: '0' });
+        expect(tracked).toEqual([['主动消息单独API配置', { 角色数: '0' }]]);
+    });
+
+    it.each(['disabled', 'dnt', 'unconfigured', 'localhost'] as const)('%s 时不发送', async gate => {
+        installFakeDom({
+            // DNT / 构建 / 本地门禁阻止脚本加载；只有运行中关统计时 tracker 仍可能存在。
+            withUmami: gate === 'disabled',
+            doNotTrack: gate === 'dnt' ? '1' : null,
+            hostname: gate === 'localhost' ? 'localhost' : undefined,
+        });
+        if (gate === 'disabled') localStorage.setItem('os_analytics', JSON.stringify({ enabled: false }));
+        const a = await loadModule(gate !== 'unconfigured');
+        a.initAnalytics();
+        a.trackAmsgSecondaryApiUsageOnce({ 角色数: '1' });
+        expect(appended).toEqual([]);
+        expect(tracked).toEqual([]);
+    });
+});
+
 describe('自定义值收敛', () => {
     const BUILTIN = ['chime', 'ding', 'pop'];
 
