@@ -653,6 +653,8 @@ export interface CompanionAvatarConfig {
   version: 1;
   /** Shared desktop/video visual source: model uses VRM/Live2D; upload/date use a flat portrait. */
   source: 'model' | 'upload' | 'date';
+  /** Desktop composition is independent for uploaded images and date portraits. */
+  portraitConfigs?: Partial<Record<'upload' | 'date', SpriteConfig>>;
   /** Original PNG / GIF stored in blob_assets. Kept while switching sources. */
   imageRef?: string;
   fileName?: string;
@@ -1189,6 +1191,9 @@ export interface VRWorldNovel {
     createdAt: number;
     updatedAt: number;
 }
+
+/** Lightweight library list entry; fetch the full novel only when opening it. */
+export type VRWorldNovelSummary = Omit<VRWorldNovel, 'segments'> & { segmentCount: number };
 
 export interface VRLibraryCategory { id: string; name: string; }
 

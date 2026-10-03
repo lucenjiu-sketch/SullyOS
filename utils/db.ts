@@ -2563,6 +2563,36 @@ export const DB = {
       });
   },
 
+  getVRNovelSummaries: async (): Promise<import('../types').VRWorldNovelSummary[]> => {
+      const db = await openDB();
+      if (!db.objectStoreNames.contains(STORE_VR_NOVELS)) return [];
+      return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_VR_NOVELS, 'readonly');
+          const summaries: import('../types').VRWorldNovelSummary[] = [];
+          const request = tx.objectStore(STORE_VR_NOVELS).openCursor();
+          request.onsuccess = () => {
+              const cursor = request.result;
+              if (!cursor) { resolve(summaries); return; }
+              const { segments, ...metadata } = cursor.value as VRWorldNovel;
+              summaries.push({ ...metadata, segmentCount: segments.length });
+              cursor.continue();
+          };
+          request.onerror = () => reject(request.error);
+          tx.onabort = () => reject(tx.error || new Error('书目读取中断'));
+      });
+  },
+
+  getVRNovel: async (id: string): Promise<VRWorldNovel | undefined> => {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_VR_NOVELS, 'readonly');
+          const request = tx.objectStore(STORE_VR_NOVELS).get(id);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+          tx.onabort = () => reject(tx.error || new Error('书籍读取中断'));
+      });
+  },
+
   getVRNovels: async (): Promise<VRWorldNovel[]> => {
       const db = await openDB();
       if (!db.objectStoreNames.contains(STORE_VR_NOVELS)) return [];
