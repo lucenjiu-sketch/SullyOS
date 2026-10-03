@@ -15,7 +15,6 @@ import type { APIConfig, CharacterProfile, CloudBackupConfig, OSTheme, RealtimeC
 import {
     amsg2Stage,
     collectAppearance,
-    collectAmsgSecondaryApiUsage,
     collectCharSettings,
     collectFeatureFlags,
     collectSARFeatureFlags,
@@ -153,45 +152,6 @@ function expectNoLeak(flags: Record<string, string>) {
 
 beforeEach(() => {
     localStorage.clear();
-});
-
-describe('主动消息单独 API 配置', () => {
-    const configuredChar = (): CharacterProfile => ({
-        ...amsg2Char(POISON.dbId),
-        activeMsg2Config: {
-            enabled: true,
-            useSecondaryApi: true,
-            secondaryApi: { baseUrl: POISON.url, apiKey: POISON.key, model: POISON.token },
-        },
-    });
-
-    it.each([
-        [0, '0'], [1, '1'], [2, '2-3'], [3, '2-3'], [4, '4+'], [9, '4+'],
-    ])('汇总全部角色：%i 个只报档位 %s，不泄漏配置', (count, bucket) => {
-        const flags = collectAmsgSecondaryApiUsage(Array.from({ length: count }, configuredChar));
-        expect(flags).toEqual({ 角色数: bucket });
-        expectNoLeak(flags);
-    });
-
-    it('没开主动消息、没开单独 API 或从未配置的角色都不计入', () => {
-        const disabled = configuredChar();
-        disabled.activeMsg2Config!.enabled = false;
-        const secondaryDisabled = configuredChar();
-        secondaryDisabled.activeMsg2Config!.useSecondaryApi = false;
-        const flags = collectAmsgSecondaryApiUsage([
-            configuredChar(), disabled, secondaryDisabled, amsg2Char('main-only'), untouchedChar('none'),
-        ]);
-        expect(flags).toEqual({ 角色数: '1' });
-        expectNoLeak(flags);
-    });
-
-    it.each(['baseUrl', 'apiKey', 'model'] as const)('单独 API 的 %s 缺失或只有空白时不计入', field => {
-        for (const value of [undefined, '', '   ']) {
-            const char = configuredChar();
-            char.activeMsg2Config!.secondaryApi = { ...char.activeMsg2Config!.secondaryApi!, [field]: value };
-            expect(collectAmsgSecondaryApiUsage([char])).toEqual({ 角色数: '0' });
-        }
-    });
 });
 
 describe('当前功能启用 · 不泄漏配置内容', () => {

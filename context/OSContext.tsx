@@ -45,9 +45,9 @@ import { isGlobalStreamEnabled, upgradeChatBodyToStream, assembleUpgradedRespons
 import { rewriteStaleWorkerUrl } from '../utils/proxyWorker';
 import { buildFetchFailureDetail, classifyFetchFailure, describeReachabilityProbe, parseTargetUrl, probeOriginReachability, shouldProbeReachability, summarizeFetchRequestBody } from '../utils/networkFailureDiagnosis';
 import { INSTALLED_APPS, HIDDEN_APP_NAMES } from '../constants';
-import { isAnalyticsRequestUrl, trackEvent, shouldReportSnapshot, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce, trackCurrentSARFeaturesOnce, trackAmsgSecondaryApiUsageOnce } from '../utils/analytics';
+import { isAnalyticsRequestUrl, trackEvent, shouldReportSnapshot, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce, trackCurrentSARFeaturesOnce } from '../utils/analytics';
 import { loadChatInputPreferences, saveChatInputPreferences } from '../utils/chatInputPreferences';
-import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync, collectSARFeatureFlags, collectAmsgSecondaryApiUsage } from '../utils/analyticsSnapshot';
+import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync, collectSARFeatureFlags } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
 import { resolveCharacterApiConfig } from '../utils/characterApi';
 import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
@@ -1160,12 +1160,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       if (!isDataLoaded || !shouldReportSnapshot('sar')) return;
       trackCurrentSARFeaturesOnce(collectSARFeatureFlags());
   }, [isDataLoaded]);
-
-  // 单独 API 的去留调查覆盖每次会话，等角色加载完成再数，避免启动时把空列表报成 0。
-  useEffect(() => {
-      if (!isDataLoaded) return;
-      trackAmsgSecondaryApiUsageOnce(collectAmsgSecondaryApiUsage(characters));
-  }, [isDataLoaded, characters]);
 
   // --- Global Error Interception ---
   useEffect(() => {
@@ -2320,11 +2314,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               return;
           }
 
-          // Determine which API to use
-          const pCfg = char.proactiveConfig;
-          const useSecondary = pCfg?.useSecondaryApi && pCfg.secondaryApi?.baseUrl;
-          const characterApi = resolveCharacterApiConfig(char, currentApiConfig, apiPresetsRef.current);
-          const api = useSecondary ? pCfg!.secondaryApi! : characterApi;
+          // Use this character's configured API, falling back to the chat default.
+          // Legacy proactive secondary API settings are intentionally ignored.
+          const api = resolveCharacterApiConfig(char, currentApiConfig, apiPresetsRef.current);
           if (!api.baseUrl) {
               drainQueuedProactive();
               return;
@@ -2332,7 +2324,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
           proactiveRunningRef.current = true;
           setProactiveComposingChars(prev => prev[charId] ? prev : { ...prev, [charId]: true });
-          console.log(`🔔 [Proactive/Global] Trigger fired for ${char.name}${useSecondary ? ' (副API)' : ''}`);
+          console.log(`🔔 [Proactive/Global] Trigger fired for ${char.name}`);
 
           try {
               // 1. Calculate time gap

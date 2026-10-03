@@ -416,18 +416,6 @@ export function collectSARFeatureFlags(): Record<string, string> {
     };
 }
 
-/** 只统计已启用主动消息、打开单独 API 且三项配置齐全的角色，不判断实际请求是否走了它。 */
-export function collectAmsgSecondaryApiUsage(characters: CharacterProfile[]): { 角色数: string } {
-    const count = characters.filter(char => {
-        const config = char.activeMsg2Config;
-        const api = config?.secondaryApi;
-        return isAmsg2EnabledForChar(char)
-            && config?.useSecondaryApi === true
-            && Boolean(api?.baseUrl?.trim() && api.apiKey?.trim() && api.model?.trim());
-    }).length;
-    return { 角色数: bucketFewCount(count) };
-}
-
 /** OSContext 手上有、这里读不到的那部分状态。 */
 export interface FeatureSources {
     realtimeConfig: RealtimeConfig;
