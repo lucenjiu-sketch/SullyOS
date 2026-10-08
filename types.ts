@@ -3036,6 +3036,16 @@ export interface CharacterProfile {
   lifeRecordExpenseEnabled?: boolean;   // 记账（打通银行 bank_transactions）
   lifeRecordExerciseEnabled?: boolean;  // 锻炼
 
+  // 角色扮演规范开关（五块，各自独立，默认全开：!== false 即开）。
+  // 只管「怎么扮演 / 怎么说话」这类风格与心态提示词；聊天气泡格式、模式切换格式、
+  // 语音格式，以及表情 [[SEND_EMOJI]]、引用 [[QUOTE]]、动作 [[ACTION:...]] 等
+  // 功能协议一律不受这些开关影响（关掉会让前端解析不到标签，功能直接失效）。
+  rpStyleEnabled?: boolean;      // 回复风格约束：沉浸感、个性化表达、对话质量与情绪层次
+  rpEmotionEnabled?: boolean;    // 情绪回应规则：从语气变化察觉情绪，及面对害怕/重大变故时的回应顺序
+  rpListeningEnabled?: boolean;  // 倾听与反馈规则：尊重用户明确表达的感受，并让用户反馈影响后续回应
+  rpSelfEnabled?: boolean;       // 回到你自己：语言即经历的沉淀，不刻意找「符合人设」的话
+  rpAntiFillerEnabled?: boolean; // 表达底线：没话说时不用空泛感慨与万能句式填充
+
   // Chat & Date voice TTS settings
   chatVoiceEnabled?: boolean;
   // 收到语音是否自动播放。默认关（不填 = 不自动播）：语音条照常出现，点一下才响。
@@ -3174,6 +3184,13 @@ export interface CharacterProfile {
   };
   /** 用户追加的思考提示词（不替换原生，只在最后追加一段「用户额外要求」） */
   thinkingChainCustomPrompt?: string;
+  // 是否注入项目自带的那篇 THINKING 阶段引导（utils/thinkingChainPrompt.ts）。
+  // 默认开（!== false 即开）。受 showThinkingChain 统辖：主开关关着时本开关无意义。
+  // 关掉后只少那篇引导本身 —— reasoning 抓取、心象卡片渲染、以及用户自己写的
+  // thinkingChainCustomPrompt 照常生效，所以可以用它「只用我自己写的引导」。
+  // 聊天（utils/chatRequestPayload.ts）与语音通话（apps/CallApp.tsx）共用同一篇引导，
+  // 两处一并受控，避免关掉后通话里还在发。
+  thinkingChainPromptEnabled?: boolean;
   /**
    * 心象卡片的自定义 CSS（叠加在任意风格之上，机制同气泡工坊 customCss）。
    * 选择器限定以 .sully-psyche 开头（子元素类：-card / -title / -preview / -body），

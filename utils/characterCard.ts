@@ -36,8 +36,16 @@ export const CARD_STRIPPED_FIELDS = [
   'thinkingChainStyle',
   'thinkingChainCustomColors',
   'thinkingChainCustomPrompt',
+  'thinkingChainPromptEnabled', // 与上一行同类：是否发送内置思考引导，属本机偏好
   'thinkingChainCustomCss',
   'chatCollaborationEnabled', // 用户在本机选择的日常聊天注意力模式
+  // 角色扮演规范五开关：同属「用户在本机怎么想让这个角色被提示」的偏好。
+  // 不随卡分享 → 接收方一律按默认全开（= 现状行为），不会拿到一张被悄悄关掉几块规范的卡。
+  'rpStyleEnabled',
+  'rpEmotionEnabled',
+  'rpListeningEnabled',
+  'rpSelfEnabled',
+  'rpAntiFillerEnabled',
 
   // 3) 语言 / 语音 / 组织类本地偏好
   'groupId',                 // 角色分组是发卡人自己的整理方式，指向的分组 id 在接收方本地也不存在

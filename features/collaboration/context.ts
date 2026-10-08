@@ -33,7 +33,13 @@ format: docx
 const collaborationThinkingPrompt = (char: CharacterProfile, user: UserProfile): string => {
   if (!char.showThinkingChain) return '';
   const custom = (char.thinkingChainCustomPrompt || '').trim();
-  return `\n\n${buildThinkingChainPrompt(char.name, user.name)}${custom ? `\n\n### 用户追加的心象规则\n${custom}` : ''}`;
+  // 项目自带引导可在心象面板单独关掉；用户自己写的规则照常追加。
+  const builtin = char.thinkingChainPromptEnabled !== false
+    ? buildThinkingChainPrompt(char.name, user.name)
+    : '';
+  const customBlock = custom ? `\n\n### 用户追加的心象规则\n${custom}` : '';
+  if (!builtin && !customBlock) return '';
+  return `\n\n${builtin}${customBlock}`;
 };
 
 const collaborationRichOutputPrompt = (

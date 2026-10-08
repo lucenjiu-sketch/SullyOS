@@ -76,6 +76,7 @@ import {
 } from '../utils/ttsRouter';
 import { playVoiceAudio, primeVoiceAudio, stopVoiceAudio, voicePlaybackErrorMessage, shouldAutoGenerateVoice, shouldAutoPlayGeneratedVoice } from '../utils/voicePlayback';
 import { voiceLanguageAnalyticsValue, voiceLanguagePromptLabel } from '../utils/voiceLanguage';
+import { resolveRpPromptToggles } from '../utils/rpPromptToggles';
 import { fetchBlobForShare, shareOrDownloadBlob } from '../utils/shareExport';
 import { CollaborationStore } from '../features/collaboration/store';
 import { resolveTtsProvider } from '../utils/ttsProvider';
@@ -3835,6 +3836,19 @@ const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
                 onToggleHtmlMode={() => updateCharacter(char.id, { htmlModeEnabled: !((char as any).htmlModeEnabled) } as any)}
                 htmlModeCustomPrompt={settingsHtmlModeCustomPrompt}
                 setHtmlModeCustomPrompt={setSettingsHtmlModeCustomPrompt}
+                rpToggles={resolveRpPromptToggles(char)}
+                onToggleRpPrompt={(key) => {
+                    const fieldByKey = {
+                        style: 'rpStyleEnabled',
+                        emotion: 'rpEmotionEnabled',
+                        listening: 'rpListeningEnabled',
+                        self: 'rpSelfEnabled',
+                        antiFiller: 'rpAntiFillerEnabled',
+                    } as const;
+                    const field = fieldByKey[key];
+                    // 字段默认 undefined = 开，所以取反要先经 resolve 归一化成布尔值。
+                    updateCharacter(char.id, { [field]: !resolveRpPromptToggles(char)[key] });
+                }}
                 chatVoiceEnabled={!!char.chatVoiceEnabled}
                 onToggleChatVoice={() => updateCharacter(char.id, { chatVoiceEnabled: !char.chatVoiceEnabled })}
                 chatVoiceAutoPlay={!!char.chatVoiceAutoPlay}
@@ -4447,6 +4461,7 @@ const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
                             text: (char as any).thinkingChainCustomColors?.text || '#f1f5f9',
                         },
                         customPrompt: (char as any).thinkingChainCustomPrompt || '',
+                        builtinPromptEnabled: (char as any).thinkingChainPromptEnabled !== false,
                         customCss: (char as any).thinkingChainCustomCss || '',
                     }}
                     onChange={(next) => {
@@ -4455,6 +4470,7 @@ const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
                         if (next.styleId !== undefined) patch.thinkingChainStyle = next.styleId;
                         if (next.customColors !== undefined) patch.thinkingChainCustomColors = next.customColors;
                         if (next.customPrompt !== undefined) patch.thinkingChainCustomPrompt = next.customPrompt;
+                        if (next.builtinPromptEnabled !== undefined) patch.thinkingChainPromptEnabled = next.builtinPromptEnabled;
                         if (next.customCss !== undefined) patch.thinkingChainCustomCss = next.customCss;
                         if (Object.keys(patch).length) updateCharacter(char.id, patch as any);
                     }}

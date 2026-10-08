@@ -1920,7 +1920,10 @@ ${sentencePlan}`;
     const messages = await buildHistoryMessages(input, skipDbId, touchContext);
     const thinkingPrompt = selectedChar?.showThinkingChain
       ? [
-          buildThinkingChainPrompt(selectedChar.name, userName),
+          // 项目自带引导可在心象面板单独关掉；用户自己写的要求照常追加。
+          selectedChar.thinkingChainPromptEnabled !== false
+            ? buildThinkingChainPrompt(selectedChar.name, userName)
+            : '',
           selectedChar.thinkingChainCustomPrompt?.trim()
             ? `【用户追加的 THINKING 要求】\n${selectedChar.thinkingChainCustomPrompt.trim()}`
             : '',
