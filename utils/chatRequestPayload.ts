@@ -426,7 +426,11 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     const thinkingActive = !input.appPrompt && !!thinkingChain?.enabled;
     if (thinkingActive) {
         const userName = (userProfile?.name && userProfile.name.trim()) || '用户';
-        systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
+        // 项目自带的那篇引导可以单独关掉（心象面板里的子开关），只留用户自己写的要求。
+        // 读 char 而不是 thinkingChain 入参：这是角色级偏好，各调用方无需逐个透传。
+        if (char.thinkingChainPromptEnabled !== false) {
+            systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
+        }
         const extra = (thinkingChain?.customPrompt || '').trim();
         if (extra) {
             systemPrompt += `\n\n## 用户对内心独白的额外要求\n${extra}`;

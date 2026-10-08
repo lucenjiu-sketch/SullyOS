@@ -7,6 +7,7 @@ import ScheduleCard from '../schedule/ScheduleCard';
 import EmotionSettingsPanel from './EmotionSettingsPanel';
 import ChatInputSettings from './ChatInputSettings';
 import ChatSettingsSection from './ChatSettingsSection';
+import { DEFAULT_RP_PROMPT_TOGGLES, type RpPromptToggles } from '../../utils/rpPromptToggles';
 import type { ChatInputPreferences } from '../../utils/chatInputPreferences';
 import { isTranslationLangPreset, normalizeTranslationLangLabel, TRANSLATION_LANG_MAX_LENGTH, TRANSLATION_LANG_PRESETS } from '../../utils/translationLang';
 import type { ContextRangeMode, ContextRangeSnapshot } from '../../utils/chatContextRange';
@@ -112,6 +113,9 @@ interface ChatModalsProps {
     onToggleHtmlMode?: () => void;
     htmlModeCustomPrompt?: string;
     setHtmlModeCustomPrompt?: (v: string) => void;
+    // 角色扮演规范五开关（默认全开；见 utils/rpPromptToggles.ts）
+    rpToggles?: RpPromptToggles;
+    onToggleRpPrompt?: (key: keyof RpPromptToggles) => void;
     // Voice TTS
     chatVoiceEnabled?: boolean;
     onToggleChatVoice?: () => void;
@@ -266,6 +270,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     translationEnabled, onToggleTranslation, translationExpanded, onToggleTranslationExpanded, translateSourceLang, translateTargetLang, onSetTranslateSourceLang, onSetTranslateLang,
     xhsEnabled, onToggleXhs,
     htmlModeEnabled, onToggleHtmlMode, htmlModeCustomPrompt, setHtmlModeCustomPrompt,
+    rpToggles = DEFAULT_RP_PROMPT_TOGGLES, onToggleRpPrompt,
     chatVoiceEnabled, onToggleChatVoice, chatVoiceAutoPlay, onToggleChatVoiceAutoPlay, chatVoiceLang, onSetChatVoiceLang,
     onGenerateVoice, voiceAvailable, onDownloadVoice, voiceDownloadable, voiceCollectable, onToggleVoiceFavorite, voiceFavorited,
     scheduleData, isScheduleGenerating, onScheduleEdit, onScheduleDelete, onScheduleReroll, onScheduleCoverChange,
@@ -406,6 +411,33 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                                 开启后隐藏见面/小程序等自动产生的灰色提示（转账、戳一戳、发图提示除外）。
                             </p>
                         </div>
+                    </ChatSettingsSection>
+                    <ChatSettingsSection title="角色扮演规范" summary="分别控制回复风格、情绪回应与倾听反馈规范">
+                        {([
+                            { key: 'style', label: '回复风格约束', desc: '沉浸感、个性化表达、对话质量与情绪层次' },
+                            { key: 'emotion', label: '情绪回应规则', desc: '从语气变化察觉情绪，以及面对害怕或重大变故时的回应顺序' },
+                            { key: 'listening', label: '倾听与反馈规则', desc: '尊重用户明确表达的感受，并让用户反馈影响后续回应' },
+                            { key: 'self', label: '回到你自己', desc: '说话方式是经历的沉淀，不刻意去找「符合人设」的话' },
+                            { key: 'antiFiller', label: '表达底线', desc: '没话说时不用空泛感慨、万能句式或华丽排比填充' },
+                        ] as { key: keyof RpPromptToggles; label: string; desc: string }[]).map(item => (
+                            <div key={item.key} className="pt-2 border-t border-slate-100">
+                                <button
+                                    type="button"
+                                    onClick={() => onToggleRpPrompt?.(item.key)}
+                                    aria-pressed={rpToggles[item.key]}
+                                    className="w-full flex justify-between items-center gap-3 text-left"
+                                >
+                                    <span className="text-xs font-bold text-slate-400 uppercase">{item.label}</span>
+                                    <span className={`shrink-0 w-10 h-6 rounded-full p-1 transition-colors flex items-center ${rpToggles[item.key] ? 'bg-primary' : 'bg-slate-200'}`}>
+                                        <span className={`block w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${rpToggles[item.key] ? 'translate-x-4' : ''}`} />
+                                    </span>
+                                </button>
+                                <p className="text-[10px] text-slate-400 mt-1.5 leading-relaxed">{item.desc}</p>
+                            </div>
+                        ))}
+                        <p className="text-[10px] text-slate-400 mt-3 pt-2 border-t border-slate-100 leading-relaxed">
+                            默认全部开启，按角色分别记住。聊天气泡格式、模式切换格式、语音格式和角色声音提示始终保留；表情、引用和工具指令也不受这些开关影响。
+                        </p>
                     </ChatSettingsSection>
                     <ChatSettingsSection title="上下文与记忆" summary="智能语境、原文范围与记忆整理">
                         <div className="rounded-2xl border border-violet-200 bg-violet-50 p-3.5">

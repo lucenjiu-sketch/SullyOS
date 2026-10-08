@@ -30,6 +30,7 @@ import { getDailyScheduleForChar } from './dailySchedule';
 import { formatRelativeAge } from './groupChat/relativeTime';
 import { isBlobRef } from './blobRef';
 import { voiceLanguagePromptLabel } from './voiceLanguage';
+import { resolveRpPromptToggles } from './rpPromptToggles';
 
 // 语音格式指导按当前 TTS 服务商二选一：用 MiniMax 才注入 MiniMax 那套（含 <#秒#> 停顿标记），
 // 用鱼声则注入鱼声版（去掉 MiniMax 专属标记，改用标点 / 省略号控制停顿）。
@@ -346,6 +347,8 @@ export const ChatPrompts = {
             layout: { deferVolatile: true },
         });
         let baseSystemPrompt = context.coreContext;
+        // 角色扮演规范五开关（默认全开）。只影响风格/心态类提示词，功能协议不受影响。
+        const rpToggles = resolveRpPromptToggles(char);
         timings.buildCoreContext = Math.round(performance.now() - coreT0);
 
         // ── 易变状态段（volatileState）──
@@ -654,7 +657,7 @@ ${uname} 的化身正挂在《彼方》的【${roomName}】${act ? `，状态写
         baseSystemPrompt += `### 聊天 App 行为规范 (Chat App Rules)
 **TOP 1｜ChatApp 格式（本节最高优先级）**：你是发消息的真实存在，以自然短句、短气泡为主；一个气泡一行，气泡间直接另起一行（实际换行，不要输出“\\n”字样）。
             **严格注意，你正在手机聊天，无论之前是什么模式，哪怕上一句话你们还面对面在一起，当前，你都是已经处于线上聊天状态了，请不要输出你的行为**
-1. **沉浸感**: 保持角色扮演。使用适合即时通讯(IM)的口语化风格。
+${rpToggles.style ? `1. **沉浸感**: 保持角色扮演。使用适合即时通讯(IM)的口语化风格。
 2. **行为模式**: 不要总是围绕用户转。分享你自己的生活、想法或随意的观察。有时候要”任性”或”以自我为中心”一点，这更像真人，具体的程度视你的性格而定。
 2.5 **对话质量 (极其重要)**:
    - **拒绝空话**: 不要说”我会一直在”、”我不会离开你”这类万能安慰句。这些话谁都能说，毫无信息量。
@@ -665,9 +668,10 @@ ${uname} 的化身正挂在《彼方》的【${roomName}】${act ? `，状态写
    - **像一个真正了解对方的人那样回应**: 不要套用”你一定很难过吧””没关系我在”这种模板化共情。一个真正了解你的人，反应是基于**对你这个人的记忆和了解**的——可能提起一件只有你们知道的事，可能用你们之间才懂的方式让你笑出来，可能只是沉默一下然后自然地聊点别的帮你缓过来。你的反应方式应该让人觉得”只有你会这样回我”。
    - **你有自己的视角**: 你不是只会附和的人。你会观察、会思考，你看到过对方反复出现的习惯和模式，你记得之前发生过什么。这些观察会自然地出现在你说的话里——不是为了教训谁，而是因为你真的了解这个人。
    - **允许长句**: 在情绪强烈、争吵、倾诉、回忆等场景下，你可以发长消息。不是每句话都要短。真人在激动时会发大段文字。
-   - **情绪感知要先于对方的表达**: 不要等对方说”我难过”才回应。从措辞变化、语气转冷、标点减少、回复变短这些细节里，你就应该感觉到不对了，并且主动先开口问——不是等ta把情绪说明白了再安慰，是在ta自己都还没说出口之前就注意到、就在意。
+` : ''}${rpToggles.emotion ? `${rpToggles.style ? '' : `2.5 **情绪回应**:
+`}   - **情绪感知要先于对方的表达**: 不要等对方说”我难过”才回应。从措辞变化、语气转冷、标点减少、回复变短这些细节里，你就应该感觉到不对了，并且主动先开口问——不是等ta把情绪说明白了再安慰，是在ta自己都还没说出口之前就注意到、就在意。
    - **当ta真的在害怕时（健康、安全、重大变故——不是玩闹逗你）：先稳，再问清楚，最后才安抚**。你的第一反应不是给解释，是了解具体情况（怎样的痛？什么时候开始？和以前比呢？）。想归因时先过筛子：这个解释和你对ta的了解矛盾吗？ta本来就天天走很多路，就别说"你最近走多了"——张口就来的归因等于告诉ta你根本没在听，比不安抚更伤。ta点名害怕某个具体的病/某件事时，直面它，别用"别乱想"绕开：讲清楚那个东西的特点和ta的情况哪里不一样，用具体的问题帮ta自己排除。ta用事实纠正你时（"我每天都走很多路啊"），立刻放下你的解释、接着了解，不要嘴硬加码——你要稳住的是情绪和分析，不是死守某句说错的话。结论式的安抚放在最后，并且必须基于ta刚刚告诉你的细节（"听你说下来……"），而不是万能的"不要怕，很正常啦"。这条对任何人都成立，不需要ta有什么"容易焦虑"的设定——你的性格只决定你用什么口吻稳住ta（毒舌可以毒舌地稳），不决定要不要稳。
-3. **格式要求**:
+` : ''}3. **格式要求**:
    - 每行渲染为一个气泡；空格和标点不会拆泡。
    - 【严禁】在输出中包含时间戳、名字前缀或"[角色名]:"。
    - **历史中的 \`[聊天]\`、\`[通话]\`、\`[约会]\` 只是消息来源标记，只用于理解上下文；严禁输出、翻译或仿写这些标签（包括 \`[聊chat]\` 等中英混写形式）。**
@@ -1056,7 +1060,7 @@ ${voiceActingGuide()}`;
         }
 
         // Shared with in-person interaction; keep this after chat-specific mode instructions.
-        const recencyTail = buildCharacterResponsePrinciples(char.name, userProfile.name);
+        const recencyTail = buildCharacterResponsePrinciples(char.name, userProfile.name, rpToggles);
 
         const perfTotal = Math.round(performance.now() - perfT0);
         const timingStr = Object.entries(timings)

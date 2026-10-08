@@ -24,6 +24,7 @@ import {
     type WorldbookScanMessage,
 } from './worldbook';
 import { buildSARModulePrompt } from './vrWorld/sarModuleRuntime';
+import { resolveRpPromptToggles } from './rpPromptToggles';
 
 /**
  * Memory Central
@@ -691,7 +692,8 @@ const renderCoreContext = async (
         // （去挖具体素材），不列任何禁语——把禁语写进提示词反而会激活它（粉色大象）。
         // 完整方法版在 datePrompts 的 DIG_DEEPER_BLOCK（见面模式专用，可按角色开关）。
         // 群聊流（groupOptions）跳过：多成员场景会重复注入 N 份，群聊侧暂不接入。
-        if (!groupOptions) {
+        // 角色关掉「表达底线」开关时也跳过（见 utils/rpPromptToggles.ts）。
+        if (!groupOptions && resolveRpPromptToggles(char).antiFiller) {
             context += `### 表达底线 (Anti-Filler)\n当你觉得"没什么可说"的时候，不要用空泛的感慨、万能句式或华丽排比去填充——那是没话找话，对方一眼就能看出来。素材永远比你以为的多：对方的用词、ta 怎么说的、ta 没说的部分、此刻的情境、你们的过去、你心里闪过的念头——挑一两条往深处走就够了。宁可一个具体的小细节，不要一句谁都能说的话。\n\n`;
         }
 

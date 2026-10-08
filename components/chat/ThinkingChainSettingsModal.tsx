@@ -6,6 +6,8 @@ interface ThinkingChainSettingsValue {
     styleId: ThinkingChainStyleId;
     customColors: { bg: string; accent: string; text: string };
     customPrompt: string;
+    /** 是否注入项目自带的那篇 THINKING 引导；关掉只少这篇，抓取与卡片照常 */
+    builtinPromptEnabled: boolean;
     /** 叠加在任意风格之上的自定义 CSS，选择器限定 .sully-psyche 开头 */
     customCss: string;
 }
@@ -100,11 +102,33 @@ const ThinkingChainSettingsModal: React.FC<Props> = ({ isOpen, onClose, value, o
                         </div>
                     </section>
 
+                    {/* 2. 原生引导开关 —— 总开关开启时才有意义 */}
+                    {value.enabled && (
+                        <section>
+                            <div className="flex items-center justify-between cursor-pointer" onClick={() => onChange({ builtinPromptEnabled: !value.builtinPromptEnabled })}>
+                                <div>
+                                    <div className="text-[13px] font-bold text-slate-700">内置思考引导</div>
+                                    <div className="text-[10.5px] text-slate-400 mt-0.5">关闭后不再发送内置的那篇长引导，思考链照常抓取、心象卡片照常显示，下面的追加提示词也照常发送。</div>
+                                </div>
+                                <div className={`shrink-0 ml-3 w-10 h-6 rounded-full p-1 transition-colors flex items-center ${value.builtinPromptEnabled ? 'bg-indigo-500' : 'bg-slate-200'}`}>
+                                    <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${value.builtinPromptEnabled ? 'translate-x-4' : ''}`} />
+                                </div>
+                            </div>
+                            {!value.builtinPromptEnabled && (
+                                <p className="text-[10px] text-amber-600/80 mt-2 leading-relaxed">
+                                    已关闭内置引导。模型会按自己默认的方式思考（通常偏逻辑分析），想要角色化的内心独白请在下面自己写。
+                                </p>
+                            )}
+                        </section>
+                    )}
+
                     {/* 3. 追加提示词 */}
                     <section>
                         <h3 className="text-[10.5px] font-bold text-slate-400 uppercase tracking-wider mb-2">追加提示词</h3>
                         <p className="text-[10.5px] text-slate-400 mb-2 leading-relaxed">
-                            原生提示词（让模型用角色第一人称、中文意识流思考）保持不变；这里写的内容**追加在最后**作为「用户对内心独白的额外要求」。
+                            {value.builtinPromptEnabled
+                                ? '内置引导（让模型用角色第一人称、中文意识流思考）保持不变；这里写的内容追加在最后，作为「用户对内心独白的额外要求」。'
+                                : '内置引导已关闭，这里写的内容就是唯一的思考引导。'}
                         </p>
                         <textarea
                             value={draftPrompt}
@@ -113,7 +137,9 @@ const ThinkingChainSettingsModal: React.FC<Props> = ({ isOpen, onClose, value, o
                             placeholder="比如：思考时偶尔切到日语 / 多写一些感官细节 / 想到用户时用昵称…"
                             className="w-full h-28 bg-slate-50 rounded-xl p-3 text-[12px] resize-none border border-slate-200 focus:outline-none focus:border-indigo-300"
                         />
-                        <div className="text-[9.5px] text-slate-400 mt-1">留空 = 仅使用原生提示词。</div>
+                        <div className="text-[9.5px] text-slate-400 mt-1">
+                            {value.builtinPromptEnabled ? '留空 = 仅使用内置引导。' : '留空 = 不发送任何思考引导。'}
+                        </div>
                     </section>
                 </div>
             </div>
