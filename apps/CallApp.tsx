@@ -2043,7 +2043,6 @@ ${sentencePlan}`;
         }),
       }, maxRetries, 0, { appName: '电话', charId: selectedChar?.id, charName: selectedChar?.name, purpose });
       let chatData: any;
-      }
       const touchContext = selectedChar
         ? buildPendingAvatarTouchContext(pendingTouches, selectedChar.name, userName)
         : '';
