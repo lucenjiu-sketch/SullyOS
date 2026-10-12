@@ -1,7 +1,8 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {DB} from './db';
-import {prepareHomeSecretTask, landHomeSecrets, readHomeSecrets, buildHomeSecretsContext, markHomeSecretsSeen, HOME_SECRET_REQUEST_LEASE_MS} from './homeSecrets';
-import {applyEmotionEvalRaw, parseEmotionEvalOutput} from './emotionApply';
+import {prepareHomeSecretTask, landHomeSecrets as landHomeSecretsRaw, readHomeSecrets, buildHomeSecretsContext, markHomeSecretsSeen, HOME_SECRET_REQUEST_LEASE_MS} from './homeSecrets';
+import {applyEmotionEvalRaw as applyEmotionEvalRawRaw, parseEmotionEvalOutput} from './emotionApply';
+import {ChatPrompts} from './chatPrompts';
 import {ContextBuilder} from './context';
 import {runAmsgEmotionEval} from '../worker/amsg/src/emotionEval';
 import type {CharacterProfile, UserProfile} from '../types';
@@ -9,12 +10,21 @@ import {DEFAULT_DEV_DEBUG_FLAGS, writeDevDebugFlags} from './devDebug';
 
 const char = (id = 'secret-c', pets: any[] = []): CharacterProfile => ({id, name: '阿澄', timeAwarenessEnabled: false,
     home3D: {version: 1, activeRoomId: 'r', rooms: [{id: 'r', name: '客厅', items: []}], petLife: {pets}},
-} as CharacterProfile);
+} as unknown as CharacterProfile);
 const history = (text = '你好看') => [{role: 'user', content: text}, {role: 'assistant', content: '嗯。'}, {role: 'user', content: '这一轮还没答'}];
-const draft = (id: string, extra = {}) => ({kind: 'character', anchorId: id, petIds: [], text: '你夸阿澄好看时，ta 偷偷照了镜子。', memory: '聊到我的穿搭时，我照了一下镜子，没有告诉用户。', ...extra});
+const draft = (id: string, extra = {}) => ({kind: 'character', anchorId: id, petIds: [], text: '你夸阿澄好看时，ta 偷偷照了镜子。', ...extra});
 const output = (id: string, extra = {}) => ({changed: false, innerState: '心情平稳', homeSecretRequestId: id, homeSecrets: [draft(id)], ...extra});
 
-beforeEach(async () => {vi.restoreAllMocks(); await DB.deleteDB();});
+const origins = new Map<string, number[]>();
+async function origin(charId: string) {
+    if (!origins.has(charId)) origins.set(charId, [await DB.saveMessage({charId, role:'assistant', type:'text', content:'本轮回复第一句'}),
+        await DB.saveMessage({charId, role:'assistant', type:'text', content:'本轮回复第二句'})]);
+    return {source:'chat' as const, messageIds:origins.get(charId)!};
+}
+const landHomeSecrets = async (charId:string, result:any, id?:string, raw?:string) => landHomeSecretsRaw(charId,result,id,raw,await origin(charId));
+const applyEmotionEvalRaw = async (raw:string, c:CharacterProfile, id?:string) => applyEmotionEvalRawRaw(raw,c,id,await origin(c.id));
+
+beforeEach(async () => {vi.restoreAllMocks(); origins.clear(); await DB.deleteDB();});
 
 describe('home secrets probability and prompt', () => {
     it('the wrench override bypasses only randomness and stops when disabled or debug is unavailable', async () => {
@@ -99,11 +109,11 @@ describe('home secrets end-to-end landing', () => {
         const stored = JSON.parse((await DB.getAsset(key))!);
         expect(stored.requests.find((r: any) => r.id === task.id)).toMatchObject({raw: 'legacy diagnostic', error: expect.any(String)});
     });
-    it('rejects truncated secret text or memory instead of inventing the missing ending', async () => {
+    it('rejects truncated secret text instead of inventing the missing ending', async () => {
         const c = char(); await DB.saveCharacter(c);
         const task = (await prepareHomeSecretTask(c, history(), () => 0))!;
         const complete = JSON.stringify(output(task.id));
-        const raw = complete.slice(0, complete.indexOf('没有告诉用户'));
+        const raw = complete.slice(0, complete.indexOf('照了镜子'));
         expect(parseEmotionEvalOutput(raw)?.homeSecrets).toBeUndefined();
         await applyEmotionEvalRaw(raw, c, task.id);
         expect(await readHomeSecrets(c.id)).toEqual([]);
@@ -129,14 +139,17 @@ describe('home secrets end-to-end landing', () => {
         const raw = JSON.stringify(output(task.id));
         expect(parseEmotionEvalOutput(raw)?.homeSecrets).toEqual([draft(task.id)]);
         expect(await applyEmotionEvalRaw(raw, c, task.id)).toBe('心情平稳');
-        expect(await readHomeSecrets(c.id)).toEqual([expect.objectContaining({seen: false, memory: draft(task.id).memory})]);
+        expect(await readHomeSecrets(c.id)).toEqual([expect.objectContaining({seen: false, text: draft(task.id).text})]);
         const context = await ContextBuilder.buildCoreContext(c, {name: '用户'} as UserProfile);
-        expect(context).toContain(draft(task.id).memory);
-        expect(context).toContain('你并不知道用户看过');
+        expect(context).not.toContain(draft(task.id).text);
+        const timeline = await DB.getRecentMessagesByCharId(c.id, 20);
+        const sent = ChatPrompts.buildMessageHistory(timeline,20,c,{name:'用户'} as UserProfile,[],undefined,{contextHighWaterMark:0}).apiMessages;
+        expect(JSON.stringify(sent)).toContain(draft(task.id).text);
+        expect(JSON.stringify(sent)).toContain('你并不知道用户看过');
         await markHomeSecretsSeen(c.id, [task.id]);
         await applyEmotionEvalRaw(raw, c);
         expect(await readHomeSecrets(c.id)).toEqual([expect.objectContaining({seen: true})]);
-        expect(await buildHomeSecretsContext(c.id)).toContain(draft(task.id).memory);
+        expect(await buildHomeSecretsContext(c.id)).toBe('');
         expect(await readHomeSecrets('other')).toEqual([]);
     });
     it('preserves secrets through damaged JSON field salvage', () => {

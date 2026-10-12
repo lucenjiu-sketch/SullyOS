@@ -9,7 +9,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const saveCharacter = vi.fn(async (_char: any) => {});
-vi.mock('./db', () => ({ DB: { saveCharacter: (c: any) => saveCharacter(c) } }));
+vi.mock('./db', () => ({ DB: {
+    saveCharacterEmotion: (id: string, activeBuffs: any, buffInjection: string) => saveCharacter({id, activeBuffs, buffInjection}),
+} }));
 
 import { parseEmotionEvalOutput, applyEmotionEvalRaw, extractAssistantText } from './emotionApply';
 

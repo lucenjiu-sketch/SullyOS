@@ -8,6 +8,8 @@ import { SAR_UPDATE_KEY, SAR_CHANGELOG, sarLaunch } from '../utils/sarUpdate';
 import HomeUpdatePopup from './os/HomeUpdatePopup';
 import { HOME_UPDATE_KEY, HOME_CHANGELOG } from '../utils/homeUpdate';
 import { roomLaunch } from '../utils/roomLaunch';
+import NavigationBallNotice, { NAVIGATION_BALL_NOTICE_KEY } from './os/NavigationBallNotice';
+import { requestSettingsFocus } from '../utils/settingsNavigation';
 /**
  * 全局版本更新提醒。
  *
@@ -600,7 +602,15 @@ const HomeUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) 
     }}/>;
 };
 
+const NavigationBallAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <NavigationBallNotice onDone={onDone} onConfigure={() => {
+        requestSettingsFocus('navigation'); openApp(AppID.Settings); onExit();
+    }} />;
+};
+
 const UPDATE_QUEUE: { key: string; render: (props: UpdatePopupProps) => React.ReactNode }[] = [
+    { key: NAVIGATION_BALL_NOTICE_KEY, render: props => <NavigationBallAnnouncement {...props} /> },
     { key: HOME_UPDATE_KEY, render: props => <HomeUpdateAnnouncement {...props} /> },
     { key: SMALL_UPDATES_KEY, render: props => <SmallUpdatesPopup onDone={props.onDone} /> },
     { key: HOLIDAY_NOTICE_KEY, render: props => <UserHolidayIntro {...props} /> },

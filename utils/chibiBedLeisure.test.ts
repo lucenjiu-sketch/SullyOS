@@ -30,12 +30,16 @@ it('retains supported hip, bone lengths and deterministic poses across sizes and
   animate(0,'sleep','lying',base);root.updateMatrixWorld(true);const hip=rig.bones.hips.getWorldPosition(new T.Vector3());
   for(const [mode]of BED_LEISURE){
    const pose={...base,bedMode:mode};animate(3,'idle','lying',pose);root.updateMatrixWorld(true);
-   expect(rig.bones.hips.getWorldPosition(new T.Vector3()).distanceTo(hip)).toBeLessThan(.001);
+   // Keep the authored horizontal bed anchor. Vertical clearance now follows
+   // the actual head/back surface instead of pinning the penetrating hip.
+   const supported=rig.bones.hips.getWorldPosition(new T.Vector3());expect(supported.x).toBeCloseTo(hip.x);expect(supported.z).toBeCloseTo(hip.z);
+   rig.skeleton.update();let lowest=Infinity;const vertex=new T.Vector3();for(let i=0;i<geometry.attributes.position.count;i++){rig.mesh.getVertexPosition(i,vertex);rig.mesh.localToWorld(vertex);lowest=Math.min(lowest,vertex.y);}
+   expect(lowest).toBeGreaterThanOrEqual(-.005);
    const snapshot=rig.skeleton.bones.map(b=>b.quaternion.clone());
    animate(8,'idle','lying',pose);animate(3,'idle','lying',pose);
    rig.skeleton.bones.forEach((b,i)=>{expect(b.quaternion.angleTo(snapshot[i])).toBeLessThan(.0001);expect(b.position.length()).toBeCloseTo(lengths[i],8);expect(b.quaternion.toArray().every(Number.isFinite)).toBe(true);});
   }
-  const palm=(side:string)=>rig.bones[side+'_hand'].localToWorld(furniturePalm(side));
+  const palm=(side:string)=>body.worldToLocal(rig.bones[side+'_hand'].localToWorld(furniturePalm(side)));
   animate(1.5,'idle','lying',{...base,bedMode:'bed-phone'});const hold=palm('L'),tap=palm('R');
   animate(3.1,'idle','lying',{...base,bedMode:'bed-phone'});
   expect(palm('L').distanceTo(hold)).toBeLessThan(.001);expect(palm('R').distanceTo(tap)).toBeGreaterThan(.005);

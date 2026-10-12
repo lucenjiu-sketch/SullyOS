@@ -4,7 +4,7 @@ import {OSProvider,OSPreviewProvider,useOS} from '../../context/OSContext';
 import {MusicProvider,useMusic} from '../../context/MusicContext';
 import HomelyHome from '../../components/os/HomelyHome';
 import PhoneShell from '../../components/PhoneShell';
-import {AppID,type CharacterProfile} from '../../types';
+import {AppID,type CharacterProfile,type OSTheme} from '../../types';
 import {testCharacter} from './room3d-test-character';
 import {createStarterHome} from '../../apps/room3d/starterHome.js';
 import {DB} from '../../utils/db';
@@ -43,6 +43,9 @@ async function previewMusic(music:ReturnType<typeof useMusic>){
 }
 function Preview(){
  const os=useOS(),[character,setCharacter]=useState(initial),[activeApp,setActiveApp]=useState(AppID.Launcher),[editor,setEditor]=useState<HomeEditor>(),[report,setReport]=useState('');
+ const [previewTheme,setPreviewTheme]=useState<OSTheme>(()=>({...os.theme,skin:'homely',contentColor:'#695344',homelyPalette:'apricot',homelyLockedCharacterId:undefined}));
+ const [entryKey,setEntryKey]=useState(0);
+ const showSecret=async()=>{await DB.saveAsset('home_secrets_v1_'+initial.id,JSON.stringify({requests:[],secrets:[{id:'qa-paper',anchor:'qa-paper',anchorId:'qa-paper',kind:'character',petIds:[],seen:false,text:'你回家前，Sully 把沙发上的靠垫重新摆好了。ta 说是随手整理，实际上已经悄悄挑过一个最舒服的位置。'}]}));setEntryKey(n=>n+1);};
  const qa=new URLSearchParams(location.search).has('qa');
  const music=useMusic(),[presence,setPresence]=useState('');
  const freezeTimer=useRef<ReturnType<typeof setInterval>>();
@@ -63,9 +66,9 @@ function Preview(){
  useEffect(()=>{if(!qa||!editor)return;const timer=setInterval(()=>{const s=editor.inspect?.() as {homelyAttention?:unknown;musicSway?:number;zoom?:number}|undefined;setPresence(JSON.stringify({attention:s?.homelyAttention,sway:s?.musicSway,zoom:s?.zoom}));},500);return()=>clearInterval(timer);},[qa,editor]);
  const inspect=()=>{const s=editor?.inspect();setReport(JSON.stringify({scene:editor?.getHomeScene(),companion:editor?.getCompanionSnapshot?.(),autonomy:editor?.getState().autonomy,gestures:s?.cameraGestures,residents:s?.social,position:s?.chibiPosition,posture:s?.chibiPosture,responseMotion:s?.responseMotion,touch:s?.lastHomelyTouch}));};
  const updateCharacter=(id:string,updates:any)=>{if(id!==initial.id)return;setCharacter(previous=>{const next={...previous,...(typeof updates==='function'?updates(previous):updates)};void DB.saveCharacter(next);return next;});};
- return <OSPreviewProvider value={{...os,characters:[character],activeCharacterId:character.id,setActiveCharacterId:()=>{},updateCharacter,activeApp,openApp:setActiveApp,closeApp:()=>setActiveApp(AppID.Launcher),isLocked:false,isDataLoaded:true,apiConfig:mockApi,customIcons:{},theme:{...os.theme,skin:'homely',contentColor:'#78542f'},userProfile:{...os.userProfile,name:'你'},groups:[]}}>
-  {activeApp===AppID.Launcher?<HomelyHome onEditor={setEditor}/>:<PhoneShell/>}
-  {qa&&editor&&<details style={{position:'absolute',zIndex:80,top:0,left:0,maxWidth:'100%',background:'white',fontSize:10}}><summary>测试工具</summary><button onClick={inspect}>检查现场</button><button onClick={()=>editor.setResidentRoom(null)}>测试外出</button><button onClick={()=>editor.setResidentRoom(home.activeRoomId)}>测试回家</button><button onClick={()=>{editor.setAutonomy(editor.getState().autonomy===false);inspect();}}>切换自主活动</button><button onClick={()=>{editor.performCompanionAction?.('sit',.3);}}>测试自主入座</button><button onClick={()=>void previewMusic(music)}>播放测试音乐</button><button onClick={()=>setReport(editor.startHomelyAttention?.()?'开始靠近':'当前正在忙，稍后再试')}>测试探头</button><button onClick={freezePeek}>定格探头（截图）</button><output style={{display:'block'}}>{presence}</output><output style={{display:'block',maxHeight:220,overflow:'auto',overflowWrap:'anywhere'}}>{report}</output></details>}
+ return <OSPreviewProvider value={{...os,characters:[character],activeCharacterId:character.id,setActiveCharacterId:()=>{},updateCharacter,activeApp,openApp:setActiveApp,closeApp:()=>setActiveApp(AppID.Launcher),isLocked:false,isDataLoaded:true,apiConfig:mockApi,customIcons:{},theme:previewTheme,updateTheme:async updates=>{setPreviewTheme(previous=>({...previous,...updates}));},userProfile:{...os.userProfile,name:'你'},groups:[]}}>
+  {activeApp===AppID.Launcher?<HomelyHome key={entryKey} onEditor={setEditor}/>:<PhoneShell/>}
+  {qa&&editor&&<details style={{position:'absolute',zIndex:80,top:0,left:0,maxWidth:'100%',background:'white',fontSize:10}}><summary>测试工具</summary><button onClick={inspect}>检查现场</button><button onClick={()=>void showSecret()}>测试秘密纸条</button><button onClick={()=>editor.setResidentRoom(null)}>测试外出</button><button onClick={()=>editor.setResidentRoom(home.activeRoomId)}>测试回家</button><button onClick={()=>{editor.setAutonomy(editor.getState().autonomy===false);inspect();}}>切换自主活动</button><button onClick={()=>{editor.performCompanionAction?.('sit',.3);}}>测试自主入座</button><button onClick={()=>void previewMusic(music)}>播放测试音乐</button><button onClick={()=>setReport(editor.startHomelyAttention?.()?'开始靠近':'当前正在忙，稍后再试')}>测试探头</button><button onClick={freezePeek}>定格探头（截图）</button><output style={{display:'block'}}>{presence}</output><output style={{display:'block',maxHeight:220,overflow:'auto',overflowWrap:'anywhere'}}>{report}</output></details>}
  </OSPreviewProvider>;
 }
 const root=createRoot(document.getElementById('root')!);

@@ -1,3 +1,4 @@
+import { handleLocalBack } from '../utils/localBackHandlers';
 import {isHomeAssetDisposal} from '../utils/homeAssetCancellation';
 import { processHomeMemoryAfterSave } from '../utils/homeMemoryPostHook';
 import { retireCloudCharacter } from '../utils/amsgCloudRetirement';
@@ -90,6 +91,7 @@ import { loadMusicPlaybackSnapshot } from './MusicContext';
 import { setCharNameRegistry } from '../utils/charNameRegistry';
 import { setMinimaxRegion } from '../utils/minimaxEndpoint';
 import { setElevenLabsModel, setTtsProvider, setVoicePromptOverrides } from '../utils/ttsProvider';
+import { DEFAULT_ELEVENLABS_MODEL } from '../utils/elevenLabsModels';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { formatBytes } from '../utils/format';
@@ -689,7 +691,7 @@ const defaultApiConfig: APIConfig = {
   ttsProvider: 'minimax',
   fishAudioModel: 's2.1-pro',
   elevenLabsApiKey: '',
-  elevenLabsModel: 'eleven_flash_v2_5',
+  elevenLabsModel: DEFAULT_ELEVENLABS_MODEL,
   elevenLabsStability: 0.5,
   elevenLabsSimilarityBoost: 0.8,
   elevenLabsStyle: 0,
@@ -1640,6 +1642,12 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
         await loadSettings();
 
+        // 旧剧情副本曾把设定日期写成现实收发时间。先校正，再让历史/记忆/云端读取。
+        const storyTimelineRepair = await DB.ensureStoryTheaterTimestamps().catch(error => {
+            console.error('剧情收发时间校正失败，将在读取历史时重试', error);
+            return { repairedCharacterIds: [] as string[] };
+        });
+
         // 老用户库存的鲨盘图链接就地改写成 jsDelivr（幂等、跑一次）。放在读 characters 之前，
         // 让下面 getAllCharacters 拿到的就是改好的数据。见 utils/sharkpanAssetMigration.ts。
         await migrateSharkpanAssets();
@@ -1794,13 +1802,19 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
         try {
           const savedRealtime = localStorage.getItem('os_realtime_config');
           const savedApiRaw = localStorage.getItem('os_api_config');
+          const restoredRealtime = savedRealtime
+            ? { ...defaultRealtimeConfig, ...JSON.parse(savedRealtime) }
+            : defaultRealtimeConfig;
+          for (const char of finalChars) {
+            if (storyTimelineRepair.repairedCharacterIds.includes(char.id)) {
+              markAmsgStateDirty({ char, userProfile: dbUser ?? defaultUserProfile, groups: dbGroups, realtimeConfig: restoredRealtime });
+            }
+          }
           resumePendingAmsgStateSync({
             characters: finalChars,
             userProfile: dbUser ?? defaultUserProfile,
             groups: dbGroups,
-            realtimeConfig: savedRealtime
-              ? { ...defaultRealtimeConfig, ...JSON.parse(savedRealtime) }
-              : defaultRealtimeConfig,
+            realtimeConfig: restoredRealtime,
             // 上次没传成功的 LLM 凭据行按这份重算补传；没有就跳过那一项。
             apiConfig: savedApiRaw ? JSON.parse(savedApiRaw) : undefined,
           });
@@ -5498,6 +5512,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   }, []);
 
   const handleBack = useCallback(() => {
+      if (handleLocalBack()) return;
       if (backHandlerRef.current) {
           const handled = backHandlerRef.current();
           if (handled) return;

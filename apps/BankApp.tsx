@@ -72,6 +72,7 @@ const BankApp: React.FC = () => {
     
     // Tabs: 'game' (Shop) | 'manage' (Menu) | 'report' (Finance)
     const [activeTab, setActiveTab] = useState<'game' | 'manage' | 'report'>('game');
+    useAppShortcut(ShortcutAppID.Bank, intent => setActiveTab((intent.entryId || 'game') as typeof activeTab));
     
     // UI Modals
     const [showAddTxModal, setShowAddTxModal] = useState(false);
@@ -1179,3 +1180,5 @@ ${previousGuestbook}
 };
 
 export default BankApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

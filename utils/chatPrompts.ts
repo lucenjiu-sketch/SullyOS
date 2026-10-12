@@ -1,5 +1,7 @@
+import {secretNoteContext} from './secretNote';
 import { buildCharacterResponsePrinciples } from './characterResponsePrinciples';
 import { expandHomeContextHistory } from './homeContextSegments';
+import { hasReliableMessageTimestamp, protectPendingChatTurn } from './storyTheaterTimeline';
 import { sarPublicContext } from './vrWorld/kanataPublicContext';
 import { kanataTitleContext } from './vrWorld/kanataTitle';
 import { selectCharacterContextMessages } from './chatContextRange';
@@ -128,6 +130,8 @@ export const detectChatModeTransition = (messages: readonly Message[]): ChatMode
         const mode = getChatModeTransition(message);
         if (mode) return hasPendingChatInput ? mode : null;
 
+        // 刚送达的定时主动消息不是对待回复输入的回答，也不代表线上格式已经切换。
+        if (message.role === 'assistant' && message.metadata?.activeMsg2?.taskId != null) continue;
         if (message.role === 'assistant') return null;
         if (message.role === 'user') hasPendingChatInput = true;
     }
@@ -693,8 +697,7 @@ ${rpToggles.style ? `1. **沉浸感**: 保持角色扮演。使用适合即时�
    - 转账: 必须使用且只使用 \`[[ACTION:TRANSFER|to=user|amount=100]]\`（to 固定写 user，金额只写数字）；不要写成 \`[系统: 你向某人转账 100]\` 等系统日志文本。
    - **处理用户转账**: 当历史里出现 \`[[记录:TRANSFER|to=char|...|status=待处理]]\`（用户转给你、还没处理）时，你可以决定收下或退回。收下: \`[[ACTION:TRANSFER_ACCEPT]]\`；退回: \`[[ACTION:TRANSFER_RETURN]]\`。请结合人设和情境自然选择（比如害羞地退回、开心地收下），并配上一句话。
    - **【重要】\`[[记录:...]]\` 是系统日志**: 历史里以 \`[[记录:\` 开头的标签是已经发生的事实（谁转给谁、什么状态），只供你了解，**严禁**在回复里照抄输出。你要做动作时只能用 \`[[ACTION:...]]\`。
-   - 调取记忆: \`[[RECALL: YYYY-MM]]\`，请注意，当用户提及具体某个月份时，或者当你想仔细想某个月份的事情时，欢迎你随时使该动作
-   - **添加纪念日**: 如果你觉得今天是个值得纪念的日子（或者你们约定了某天），你可以**主动**将它添加到用户的日历中。单独起一行输出: \`[[ACTION:ADD_EVENT | 标题(Title) | YYYY-MM-DD]]\`。
+${forFirePack || char.hideMonthlyRecallPrompt === false ? "   - 调取记忆: `[[RECALL: YYYY-MM]]`，请注意，当用户提及具体某个月份时，或者当你想仔细想某个月份的事情时，欢迎你随时使该动作\n" : ''}   - **添加纪念日**: 如果你觉得今天是个值得纪念的日子（或者你们约定了某天），你可以**主动**将它添加到用户的日历中。单独起一行输出: \`[[ACTION:ADD_EVENT | 标题(Title) | YYYY-MM-DD]]\`。
 ${scheduleMessageTagEnabled ? `   - **定时发送消息**: 如果你想在未来某个时间主动发消息（比如晚安、早安或提醒），请单独起一行输出: \`[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | 消息内容]\`，分行可以多输出很多该类消息。` : ''}
 ${notionEnabled ? `   - **翻阅日记(Notion)**: 你的记忆本身是完整可靠的，回忆过去优先靠记忆和 \`[[RECALL]]\`，**不需要**靠翻日记来"想起"事情。只有当你**自己**特别想重温那天日记里写下的心情、措辞或私密小细节时，才翻阅: \`[[READ_DIARY: 日期]]\`。支持格式: \`昨天\`、\`前天\`、\`3天前\`、\`1月15日\`、\`2024-01-15\`。` : ''}${feishuEnabled ? `
    - **翻阅日记(飞书)**: 同上——回忆优先靠记忆和 \`[[RECALL]]\`，只有你自己想重温那天日记的内容时才用: \`[[FS_READ_DIARY: 日期]]\`。支持格式同上。` : ''}${notionNotesEnabled ? `
@@ -1085,6 +1088,8 @@ ${voiceActingGuide()}`;
             contextHighWaterMark?: number;
             /** 默认使用聊天时间感知；见面入口传线下开关，控制时间戳与互动间隔。 */
             timeAwarenessEnabled?: boolean;
+            /** 线上请求兜底旧剧情副本的错序，见面自身历史不启用。 */
+            protectPendingChatTurn?: boolean;
         },
     ) => {
         // Filter Logic
@@ -1095,7 +1100,9 @@ ${voiceActingGuide()}`;
         if (processedExcludeIds && processedExcludeIds.size > 0) {
             effectiveHistory = effectiveHistory.filter(m => !processedExcludeIds.has(m.id));
         }
-        const historySlice = expandHomeContextHistory(effectiveHistory.slice(-limit));
+        const orderedHistory = options?.protectPendingChatTurn ? protectPendingChatTurn(effectiveHistory) : effectiveHistory;
+        const expandedHistory = expandHomeContextHistory(orderedHistory.slice(-limit));
+        const historySlice = options?.protectPendingChatTurn ? protectPendingChatTurn(expandedHistory) : expandedHistory;
         const charTz = resolveCharTimeZone(char);
         const timeAwarenessOn = options?.timeAwarenessEnabled ?? (char.timeAwarenessEnabled !== false);
 
@@ -1106,19 +1113,20 @@ ${voiceActingGuide()}`;
             let lastRealMsg: Message | undefined;
             for (let i = historySlice.length - 2; i >= 0; i--) {
                 const m = historySlice[i];
-                if (!m.metadata?.proactiveHint && !(m.role === 'assistant' && i > 0 && historySlice[i - 1]?.metadata?.proactiveHint)) {
+                if (hasReliableMessageTimestamp(m) && !m.metadata?.proactiveHint && !(m.role === 'assistant' && i > 0 && historySlice[i - 1]?.metadata?.proactiveHint)) {
                     lastRealMsg = m;
                     break;
                 }
             }
             // 时间感知关闭时，互动间隔与现实消息时间戳一起遮住。
-            if (lastRealMsg && currentMsg && timeAwarenessOn) timeGapHint = ChatPrompts.getTimeGapHint(lastRealMsg, currentMsg.timestamp, charTz);
+            if (lastRealMsg && currentMsg && timeAwarenessOn && hasReliableMessageTimestamp(currentMsg)) timeGapHint = ChatPrompts.getTimeGapHint(lastRealMsg, currentMsg.timestamp, charTz);
         }
 
         return {
             apiMessages: historySlice.map((m, index) => {
+                if (m.type === 'secret_note') return {role: m.role, content: secretNoteContext(m.content)};
                 let content: any = m.content;
-                const timeStr = timeAwarenessOn ? `[${ChatPrompts.formatDate(m.timestamp, charTz)}]` : '';
+                const timeStr = timeAwarenessOn && hasReliableMessageTimestamp(m) ? `[${ChatPrompts.formatDate(m.timestamp, charTz)}]` : '';
                 const sourceTag = (() => {
                     const source = m.metadata?.source;
                     if (source === 'call') return '[通话]';

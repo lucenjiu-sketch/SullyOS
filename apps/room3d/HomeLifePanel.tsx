@@ -19,6 +19,8 @@ import {generateHomeReply} from '../../utils/homeConversation';
 import './homeLife.css';
 import {isScheduleFeatureOn} from '../../utils/scheduleFeature';
 import HomeScheduleTip from './HomeScheduleTip';
+import {waitForHomeSecretOrigin} from '../../utils/homeSecrets';
+import type {SecretNoteOrigin} from '../../utils/secretNote';
 
 export default function HomeLifePanel({editor,character,user,api,conversationContext,panel,onPanel,onDefinition,onFigures,initiative,active=true,onBusyChange,presentation='home'}:{presentation?:'home'|'homely';onBusyChange?:(busy:boolean)=>void;active?:boolean;initiative?:HomeInitiativeRequest;editor:HomeEditor;character?:CharacterProfile;user?:UserProfile;api?:APIConfig;conversationContext?:HomeConversationContext;panel:string|null;onPanel:(name:string|null)=>void;onDefinition?:()=>void;onFigures?:()=>void}){
  const [inner,setInner]=useState<{charId?:string;text:string}>({charId:character?.id,text:character?getLastInnerState(character.id):''});
@@ -73,15 +75,20 @@ export default function HomeLifePanel({editor,character,user,api,conversationCon
   let timeout:ReturnType<typeof setTimeout>|undefined;
   const onStage=(stage:string)=>{if(abort.signal.aborted)return;setReplyStage(stage);clearTimeout(timeout);timeout=setTimeout(()=>abort.abort(new DOMException(stage+'等待超过 120 秒，可重试','TimeoutError')),120000);};
   onStage('准备上下文');
+  let resolveOrigin!:(origin:SecretNoteOrigin|undefined)=>void;
+  const secretOrigin=new Promise<SecretNoteOrigin|undefined>(resolve=>{resolveOrigin=resolve;});
+  let savedReply=false;
+  const replyRecord=old||makeHomeRecord({kind:'message',source:'model',actor:'character',text:'',roomId:input.roomId,roomName:input.roomName,replyTo:userId});
   try{
    const history=all.slice(0,all.findIndex(e=>e.id===userId)+1);
-   const result=await awaitHomeStage(abort.signal,()=>generateHomeReply({onStage,context:{...conversationContext,musicSnapshot:loadMusicPlaybackSnapshot()},char:{...character,home3D:editor.getState?.()??character.home3D},initiative:input.initiative,automatic:input.automatic,user,api,scene:replyId?{...snapshot,present:true,actions:[],roomId:input.roomId,roomName:input.roomName}:snapshot,records:history,regenerating:!!replyId,signal:abort.signal}));
+   const result=await awaitHomeStage(abort.signal,()=>generateHomeReply({secretOrigin,onStage,context:{...conversationContext,musicSnapshot:loadMusicPlaybackSnapshot()},char:{...character,home3D:editor.getState?.()??character.home3D},initiative:input.initiative,automatic:input.automatic,user,api,scene:replyId?{...snapshot,present:true,actions:[],roomId:input.roomId,roomName:input.roomName}:snapshot,records:history,regenerating:!!replyId,signal:abort.signal}));
    if(abort.signal.aborted||!alive.current)return;
    const latest=current();
    if(latest.find(e=>e.id===userId)?.text!==input.text||replyId&&latest.find(e=>e.id===replyId)?.text!==old?.text)throw Error('这段记录已修改，本次回复未覆盖它');
+   const committedReply={...replyRecord,text:result.text};
    if(replyId)update(latest.map(e=>e.id===replyId?{...e,text:result.text,editedAt:Date.now()}:e));
    else{
-    update([...latest,makeHomeRecord({kind:'message',source:'model',actor:'character',text:result.text,roomId:input.roomId,roomName:input.roomName,replyTo:userId})]);
+    update([...latest,committedReply]);
     const actionIds=result.actionIds??(result.actionId?[result.actionId]:[]);
     const now=editor.getHomeScene();
     if(actionIds.length&&(!now.present||now.roomId!==snapshot.roomId||now.manualRevision!==snapshot.manualRevision)){actionLog.info('动作未执行：现场已变化',{present:now.present,sameRoom:now.roomId===snapshot.roomId,sameRevision:now.manualRevision===snapshot.manualRevision});setError('回复已收到，但等待期间现场发生变化，本次动作未执行');}
@@ -89,8 +96,10 @@ export default function HomeLifePanel({editor,character,user,api,conversationCon
     if(!actionIds.length&&now.present&&now.roomId===snapshot.roomId&&now.manualRevision===snapshot.manualRevision){speakingSeconds=Math.min(12,Math.max(3,result.text.length/6));editor.playHomeResponse?.('model',userId);}
     if(actionIds.length&&now.present&&now.roomId===snapshot.roomId&&now.manualRevision===snapshot.manualRevision){if(editor.performHomeActions){void editor.performHomeActions(actionIds,userId).then(outcome=>{actionLog.info('动作计划结束',{outcome});if(alive.current&&outcome==='unavailable')setError('回复已收到，动作计划有一步无法执行，已停在该步骤');}).catch(()=>{if(alive.current)setError('动作计划未能完成');});}else{const outcome=editor.performHomeAction(actionIds[0],'model',userId);if(outcome==='unavailable')setError('回复已收到，不过现在的空间没能执行这个动作');}}
    }
+   savedReply=true;
+   void waitForHomeSecretOrigin(character.id,[input,committedReply],abort.signal).then(resolveOrigin);
   }catch(e){if(alive.current){setError(abort.signal.aborted?(abort.signal.reason?.message||'回复已停止，可重试'):e instanceof Error?e.message:'暂时没收到回复');setRetry({userId,replyId});if(input.initiative)onPanel('chat');}}
-  finally{endConversation?.(abort.signal.aborted?0:speakingSeconds);clearTimeout(timeout);if(controller.current===abort)controller.current=undefined;if(alive.current){setBusy(false);refresh(n=>n+1);}}
+  finally{if(!savedReply)resolveOrigin(undefined);endConversation?.(abort.signal.aborted?0:speakingSeconds);clearTimeout(timeout);if(controller.current===abort)controller.current=undefined;if(alive.current){setBusy(false);refresh(n=>n+1);}}
  };
  const handledInitiative=useRef<string>();
  useEffect(()=>{if(!initiative||handledInitiative.current===initiative.id)return;handledInitiative.current=initiative.id;
@@ -111,7 +120,7 @@ export default function HomeLifePanel({editor,character,user,api,conversationCon
  const docked=presentation==='homely'&&panel==='chat';
  return <div className={`home-life-overlay ${docked?'homely-chat':''}`} onPointerDown={e=>{if(!docked&&e.target===e.currentTarget)onPanel(null);}}>
   <section ref={sheet} className={`home-life-sheet home-life-${panel}`} aria-label={title} role="dialog" aria-modal={docked?undefined:true} onKeyDown={e=>{if(e.key==='Escape'){e.stopPropagation();onPanel(null);}if(e.key==='Tab'&&!docked){const items=[...e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled),textarea:not(:disabled),input:not(:disabled),summary')].filter(el=>el.getClientRects().length);const first=items[0],last=items.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}}}>
-   <header><div><small>{scene.roomName}</small><h2>{title}</h2></div><button className="home-icon" aria-label={docked?'收起家园聊天':'关闭面板'} onClick={()=>onPanel(null)}>{docked?<span aria-hidden="true">›</span>:<X size={22}/>}</button></header>
+   <header><div><small>{scene.roomName}</small><h2>{title}</h2></div><button className="home-icon" aria-label={docked?'收起家园聊天':'关闭面板'} onClick={()=>onPanel(null)}>{docked?<span className="homely-chat-collapse" aria-hidden="true">⌄</span>:<X size={22}/>}</button></header>
    {panel==='mood'?<div className="home-mood-detail">
     {character&&homeEmotionEnabled(character)&&<section className="home-inner-state" aria-label="内心想法"><h3>内心想法</h3><p>{inner.charId===character.id&&inner.text?inner.text:'还没有内心想法，情绪评估完成后会显示在这里。'}</p></section>}
     {!character||!homeEmotionEnabled(character)?<p className="home-life-empty">尚未开启情绪 buff，可在角色的情绪设置中开启。</p>:!character.activeBuffs?.length?<p className="home-life-empty">暂时没有情绪 buff，交谈后的情绪更新会显示在这里。</p>:character.activeBuffs.map(buff=><article key={buff.id} className="home-mood-item"><span className="home-mood-icon" aria-hidden="true">{buff.emoji||'💭'}</span><div><h3>{buff.label}</h3><span className="home-mood-strength" aria-label={`强度 ${buff.intensity}`}>{'●'.repeat(Math.max(1,Math.min(5,buff.intensity||1)))}</span>{buff.description&&<p>{buff.description}</p>}</div></article>)}

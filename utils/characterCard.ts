@@ -39,6 +39,7 @@ export const CARD_STRIPPED_FIELDS = [
   'thinkingChainPromptEnabled', // 与上一行同类：是否发送内置思考引导，属本机偏好
   'thinkingChainCustomCss',
   'chatCollaborationEnabled', // 用户在本机选择的日常聊天注意力模式
+  'chatShowRemark',          // 聊天顶栏显示备注还是名字，由接收方自己决定
   // 角色扮演规范五开关：同属「用户在本机怎么想让这个角色被提示」的偏好。
   // 不随卡分享 → 接收方一律按默认全开（= 现状行为），不会拿到一张被悄悄关掉几块规范的卡。
   'rpStyleEnabled',
@@ -57,6 +58,7 @@ export const CARD_STRIPPED_FIELDS = [
   'dateVoiceEnabled',
   'dateExtraPresets',        // 用户私有补充预设随系统备份保存，不随角色卡分享
   'memoryPalaceWaterline', // 发卡人的使用节奏；接收方按自己的聊天习惯选择
+  'hideMonthlyRecallPrompt', // ChatApp 的旧版记忆调阅提示偏好由接收方自己决定
 
   // 4) 运行时状态残留
   'activeBuffs',

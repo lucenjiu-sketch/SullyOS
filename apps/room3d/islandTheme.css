@@ -55,7 +55,10 @@
 .home-island .home3d:not(.h3-playing) .h3-top .h3-pill{background:transparent;color:var(--animal-text-color);border:0;padding:8px;font-size:13px}
 .home-island .home3d:not(.h3-playing) .h3-top [data-action=overview]{display:none}
 .home-island .home3d:not(.h3-playing) .h3-top [data-action=edit]{background:var(--animal-primary-color);color:white;border-radius:18px;padding:8px 16px}
-.home-island .h3-sheet{background:var(--animal-bg-color);color:var(--animal-text-color);border:1px solid var(--animal-border-color);border-radius:24px 24px 0 0;padding:16px;box-shadow:0 -8px 32px #503e2510;max-height:55%;scrollbar-width:thin;scrollbar-color:#ded4b7 transparent}
+/* Editor sheets sit above the resident/pet rail and scene controls. */
+.home-island .h3-sheet{z-index:30;background:var(--animal-bg-color);color:var(--animal-text-color);border:1px solid var(--animal-border-color);border-radius:24px 24px 0 0;padding:16px;box-shadow:0 -8px 32px #503e2510;max-height:55%;scrollbar-width:thin;scrollbar-color:#ded4b7 transparent}
+/* The phone launcher is outside the editor's isolated stacking context. */
+.home-island:has(.h3-sheet) .home-phone-launch{visibility:hidden;pointer-events:none}
 .home-island .h3-sheet header{display:flex;align-items:center;justify-content:space-between;margin:0 0 12px}
 .home-island .h3-sheet header h2{font-size:17px;margin:0}.home-island .h3-sheet header button{border:0;background:#f1ecdc;border-radius:50%;width:32px;height:32px}
 .home-island .h3-furniture-search{display:block;width:100%;box-sizing:border-box;background:#f1ecdc;border:0;border-radius:12px;padding:11px 14px;margin:0 0 12px;font-size:14px;color:inherit;outline-offset:2px}
@@ -88,7 +91,7 @@
 .home-island .h3-formal-home.h3-playing .h3-title{background:#ffffffed;border-radius:12px;padding:4px 8px}
 .home-island .h3-camera-menu-toggle{min-height:30px;font-size:12px;color:#78542f}
 /* A single quiet navigation bar; the room title never grows into a card. */
-.home-island .home3d.h3-formal-home.h3-playing .h3-top{left:12px;right:12px;top:max(12px,env(safe-area-inset-top));padding:6px 8px;gap:8px;min-height:48px;box-sizing:border-box;border:1px solid #e8dfc999;border-radius:20px;background:#fffffff5;box-shadow:0 3px 14px #46351c0a;align-items:center}
+.home-island .home3d.h3-formal-home.h3-playing .h3-top{left:12px;right:12px;top:calc(var(--chrome-top,0px) + 8px);padding:6px 8px;gap:8px;min-height:48px;box-sizing:border-box;border:1px solid #e8dfc999;border-radius:20px;background:#fffffff5;box-shadow:0 3px 14px #46351c0a;align-items:center}
 .home-island .home3d.h3-formal-home.h3-playing .h3-title{min-width:0;padding:0;background:transparent;border-radius:0;flex:1}
 .home-island .home3d.h3-formal-home.h3-playing .h3-title>small{display:none}
 .home-island .home3d.h3-formal-home.h3-playing .h3-title-row{gap:10px;min-width:0}
@@ -97,12 +100,20 @@
 .home-island .home3d.h3-formal-home.h3-playing .h3-top .h3-back{width:32px;padding:6px;border-right:1px solid #e8dfc9;border-radius:0}
 .home-island .home3d.h3-formal-home.h3-playing .h3-top .h3-pill svg{width:19px;height:19px}
 .home-island .home3d.h3-formal-home.h3-playing .h3-camera-menu-toggle{font-size:11px;min-height:36px;padding:0 3px;color:#978369;flex-shrink:0}
-.home-island .home3d.h3-formal-home.h3-playing .h3-home-map{top:max(76px,calc(env(safe-area-inset-top) + 64px))}
+.home-island .home3d.h3-formal-home.h3-playing .h3-home-map{top:calc(var(--chrome-top,0px) + 76px)}
 .home-island .home3d.h3-formal-home.h3-playing .h3-home-map[data-collapsed=true]{padding:5px 9px;border-width:1px;border-radius:15px}
-.home-island .home3d.h3-formal-home.h3-playing .h3-camera-menu{top:max(68px,calc(env(safe-area-inset-top) + 56px));left:52px;max-width:calc(100% - 76px)}
+.home-island .home3d.h3-formal-home.h3-playing .h3-camera-menu{top:calc(var(--chrome-top,0px) + 68px);left:52px;max-width:calc(100% - 76px)}
 .home-island .home3d.h3-formal-home.h3-playing .h3-camera-menu button{white-space:nowrap;padding:9px 5px;font-size:11px}
+/* The scene fills the screen. Controls consume the shared status-bar inset once. */
+.home-island .home3d.h3-formal-home:not(.h3-playing) .h3-top{top:var(--chrome-top,0px);padding-top:12px}
+.home-island .home3d.h3-formal-home:not(.h3-playing) .h3-camera-tools{top:calc(var(--chrome-top,0px) + 90px)}
+.home-island .home3d.h3-formal-home:not(.h3-playing) .h3-history{top:calc(var(--chrome-top,0px) + 136px)}
+.home-island .home-quality-tip{box-sizing:border-box;width:min(360px,calc(100% - 32px));max-height:calc(100dvh - var(--chrome-top,0px) - var(--safe-bottom,0px) - 32px);overflow:auto;padding:24px;border:1px solid #e8dfc9;border-radius:24px;background:#fffdf5;color:#78542f;box-shadow:0 12px 50px #46351c22}
+.home-quality-tip::backdrop{background:#302c2559}
+.home-quality-tip h2{font-size:18px;margin:0 0 14px}.home-quality-tip p{font-size:13px;line-height:1.7;margin:12px 0}
+.home-quality-tip>div{display:flex;gap:10px;margin-top:20px}.home-quality-tip button{flex:1;min-height:44px;border:1px solid #e8dfc9;border-radius:14px;background:#fff;color:#78542f;font:inherit;font-size:13px;cursor:pointer}.home-quality-tip button:last-child{background:#268b72;color:#fff;border-color:#268b72}.home-quality-tip button:focus-visible{outline:3px solid #268b72;outline-offset:3px}
 /* Resident camera bookmarks share Animal Island's paper and accent tokens. */
-.home-island .h3-resident-rail{position:absolute;z-index:12;right:16px;top:max(82px,calc(env(safe-area-inset-top) + 70px));display:flex;flex-direction:column;gap:14px;max-height:calc(100% - 220px);overflow-y:auto;overflow-x:hidden;padding:3px 5px 12px;scrollbar-width:none;pointer-events:auto}
+.home-island .h3-resident-rail{position:absolute;z-index:12;right:16px;top:calc(var(--chrome-top,0px) + 82px);display:flex;flex-direction:column;gap:14px;max-height:calc(100% - 220px);overflow-y:auto;overflow-x:hidden;padding:3px 5px 12px;scrollbar-width:none;pointer-events:auto}
 .home-island .h3-resident-rail[hidden]{display:none}
 .home-island .h3-resident-rail button{position:relative;display:block;flex:none;width:48px;height:48px;padding:3px;border:1px solid var(--animal-border-color);border-radius:50%;background:var(--animal-bg-color);color:var(--animal-text-color);box-shadow:0 2px 6px #60472b12;cursor:pointer;transition:border-color .18s,transform .18s}
 .home-island .h3-resident-rail button:active{transform:scale(.94)}

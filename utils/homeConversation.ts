@@ -9,6 +9,7 @@ import type {HomeRecord,HomeScene} from '../apps/room3d/types';
 import {loadCharacterContextRange} from './chatContextRange';
 import {ChatPrompts} from './chatPrompts';
 import {DB} from './db';
+import type {SecretNoteOriginPromise} from './secretNote';
 import {homeSegmentMessage} from './homeContextSegments';
 import {homeRecords} from './homeRecords';
 import {hasUnansweredUserTurn,withChatContinuation} from './chatContinuation';
@@ -35,7 +36,7 @@ export async function buildHomeConversationPrompt(char:CharacterProfile,user:Use
  return parts.stable+parts.volatileState+buildHomeScenePrompt(user,scene)+parts.recencyTail;
 }
 export type HomeConversationContext = Pick<BuildChatPayloadInput,'realtimeConfig'|'musicSnapshot'> & Partial<Pick<BuildChatPayloadInput,'groups'|'emojis'|'categories'>>;
-export interface HomeReplyRequest {context?:HomeConversationContext;char:CharacterProfile;user:UserProfile;api:APIConfig;scene:HomeScene;records:HomeRecord[];signal:AbortSignal;regenerating?:boolean;initiative?:boolean;automatic?:boolean;onStage?:(stage:string)=>void}
+export interface HomeReplyRequest {secretOrigin?:SecretNoteOriginPromise;context?:HomeConversationContext;char:CharacterProfile;user:UserProfile;api:APIConfig;scene:HomeScene;records:HomeRecord[];signal:AbortSignal;regenerating?:boolean;initiative?:boolean;automatic?:boolean;onStage?:(stage:string)=>void}
 
 /** Same request builder as ChatApp; only the pending turn and app instructions differ. */
 async function buildHomeConversationRequest({char,user,api,scene,records,signal,regenerating,initiative,automatic,onStage,context}:HomeReplyRequest){
@@ -52,11 +53,13 @@ async function buildHomeConversationRequest({char,user,api,scene,records,signal,
  const range=await stage('读取聊天上下文',()=>loadCharacterContextRange(char,(stage,ms)=>timingLog.info(stage+'：'+ms+'ms')));
  const existing=range.messages.find(m=>m.metadata?.source==='home'&&(m.metadata?.homeRecordIds?.includes(input.id)
   ||(!Array.isArray(m.metadata.homeRecordIds)&&(m.metadata.homeRecordId===input.id||m.metadata.homeTurnId===input.id))));
- const stored=await stage('核对家园记录范围',()=>DB.getCharacter(char.id));
  // Only a genuinely new, not-yet-persisted input may be overlaid. A retry cannot
  // give an archived/excluded record a fabricated new ID to evade shared bounds.
- if(!existing&&(regenerating||homeRecords(stored?.home3D).some(record=>record.id===input.id)))
-  throw Error('这条家园记录已不在当前上下文范围内，请发送一条新消息');
+ if(!existing){
+  if(regenerating)throw Error('这条家园记录已不在当前上下文范围内，请发送一条新消息');
+  const stored=await stage('核对家园记录范围',()=>DB.getCharacter(char.id));
+  if(homeRecords(stored?.home3D).some(record=>record.id===input.id))throw Error('这条家园记录已不在当前上下文范围内，请发送一条新消息');
+ }
  const current=homeRecords(char.home3D);
  const inputAt=current.findIndex(record=>record.id===input.id);
  const historical=regenerating||(inputAt>=0&&inputAt<current.length-1);
@@ -87,6 +90,11 @@ async function buildHomeConversationRequest({char,user,api,scene,records,signal,
   char:requestChar,userProfile:user,groups,emojis,categories,signal,
   historyMsgs:rows,contextLimit:Math.max(1,rows.length),contextHighWaterMark:range.hwm,
   recallEntryPoint:'home_3d',realtimeConfig:context?.realtimeConfig,musicSnapshot:context?.musicSnapshot,
+  onPreparationStage:event=>{
+   const label={vision:'识图准备',memory:'记忆召回',prompt:'组装提示词',collaboration:'读取协同文件柜',tasks:'读取任务与回执'}[event.stage];
+   if(event.status==='start')onStage?.(label);
+   if(event.status==='end')timingLog.info(label+'：结束',{ms:event.ms});else timingLog.info(label+'：开始');
+  },
   innerState:regenerating?'':undefined,visionApiConfig:api.visionApi,
   appPrompt:{rules:'',scene:buildHomeScenePrompt(user,scene)+(initiative?'\n这是你主动发起的交谈：你现在在'+scene.roomName+'，刚经历了当前家园回合里的本地活动，现在有话想对'+(user.name?.trim()||'用户')+'说。'+(automatic?'你已被允许主动开口，'+(user.name?.trim()||'用户')+'没有提出问题。':(user.name?.trim()||'用户')+'只是点了听听，没有提出问题。')+'结合真实经历和情绪自然开口，并从当前 actions 选择适合的实际动作，不编造已经执行的行为。':'')},
  }));

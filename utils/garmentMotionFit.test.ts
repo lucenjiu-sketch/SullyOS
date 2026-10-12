@@ -2,7 +2,7 @@ import {afterEach,expect,it,vi} from 'vitest';
 import {readFileSync} from 'node:fs';
 import * as T from 'three';
 import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
-import {MeshBVH} from 'three-mesh-bvh';
+import {MeshBVH,StaticGeometryGenerator} from 'three-mesh-bvh';
 import {createBlankBody} from '../apps/room3d/chibi/blankBody';
 import {bindBlankBody} from '../apps/room3d/chibi/blankRig';
 import {dressApprovedWardrobe} from '../apps/room3d/chibi/approvedClothing';
@@ -45,4 +45,14 @@ it.each([['normal',0],['library-idle',.94],['sachi-idle',2.4],['sachi-speaking',
 it('skips transparent and textured outers',()=>{
  const {rig,dispose}=setup(),g=new T.BufferGeometry(),mat=new T.MeshStandardMaterial({transparent:true}),outer=new T.SkinnedMesh(g,mat);
  expect(createGarmentMotionFit(rig,[outer],[outer])).toBeUndefined();mat.transparent=false;mat.map=new T.Texture();expect(createGarmentMotionFit(rig,[outer],[outer])).toBeUndefined();mat.map.dispose();mat.dispose();g.dispose();dispose();
+});
+it('does not regenerate garment surfaces for whole-resident movement, while arm changes still refit',async()=>{
+ const {root,rig,dispose}=setup();
+ const outfit=await dressApprovedWardrobe(rig,{top:'stand-collar',outer:'slouch-cardigan'},{},{},true);
+ const generate=vi.spyOn(StaticGeometryGenerator.prototype,'generate');
+ outfit.updatePose();const count=generate.mock.calls.length;expect(count).toBeGreaterThan(0);
+ root.position.set(2,.3,-4);root.rotation.y=.9;root.scale.setScalar(.7);
+ root.updateMatrixWorld(true);outfit.updatePose();expect(generate.mock.calls.length).toBe(count);
+ rig.bones.L_upperArm.rotation.x=.45;root.updateMatrixWorld(true);outfit.updatePose();expect(generate.mock.calls.length).toBeGreaterThan(count);
+ outfit.dispose();dispose();
 });

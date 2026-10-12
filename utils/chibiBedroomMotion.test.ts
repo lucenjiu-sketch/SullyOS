@@ -1,4 +1,4 @@
-import {describe,it,expect} from 'vitest';
+import {describe,it,expect,vi} from 'vitest';
 import * as T from 'three';
 import {readFileSync} from 'node:fs';
 import {GLTFLoader} from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -14,6 +14,30 @@ import {bodyHeightY} from '../apps/room3d/chibi/bodyHeight';
 
 describe('Body 2 bedroom rest',()=>{
  const duration=seatChangeDuration('bed');
+ it('reuses held skin contact when the resident parent moves, rotates and scales',()=>{
+  const parent=new T.Group(),body=new T.Group(),hair=new T.Group(),geometry=createBlankBody('skin'),material=new T.MeshBasicMaterial();
+  parent.add(body);body.add(new T.Mesh(geometry,material),hair);
+  const rig=bindBlankBody(body.children[0] as T.Mesh,hair,true),animate=createBlankMotion(rig,body),pose={kind:'bed-rest' as const,hands:[],bedTime:3};
+  animate(3,'sleep','lying',pose);const supported=body.position.clone(),scan=vi.spyOn(rig.mesh,'getVertexPosition');
+  parent.position.set(5,7,-3);parent.rotation.y=1.2;parent.scale.setScalar(.42);
+  animate(3,'sleep','lying',pose);expect(body.position.distanceTo(supported)).toBeLessThan(1e-6);expect(scan).not.toHaveBeenCalled();
+  scan.mockRestore();animate(3,'idle','lying',{...pose,bedMode:'bed-phone'});expect(body.position.y).toBeLessThan(2);
+  body.updateWorldMatrix(true,true);body.updateMatrixWorld(true);rig.skeleton.update();
+  const p=new T.Vector3();let lowest=Infinity;
+  for(let i=0;i<geometry.attributes.position.count;i++){rig.mesh.getVertexPosition(i,p);rig.mesh.localToWorld(p);parent.worldToLocal(p);lowest=Math.min(lowest,p.y);}
+  expect(lowest).toBeGreaterThanOrEqual(-.005);
+  geometry.dispose();material.dispose();rig.skeleton.dispose();
+ });
+ it.each([.8,1,1.25])('keeps actual back/head skin above the mattress at height %s, including leisure poses',height=>{
+  const body=new T.Group(),hair=new T.Group(),geometry=createBlankBody('skin',{bodyHeight:height}),material=new T.MeshBasicMaterial(),mesh=new T.Mesh(geometry,material);body.add(mesh,hair);
+  const rig=bindBlankBody(mesh,hair,true),animate=createBlankMotion(rig,body),p=new T.Vector3();
+  for(const bedMode of [undefined,'bed-side','bed-talk','bed-phone'] as const){
+   animate(3,'sleep','lying',{kind:'bed-rest',hands:[],bedMode,bedTime:3});body.updateMatrixWorld(true);rig.skeleton.update();
+   let lowest=Infinity;for(let i=0;i<geometry.attributes.position.count;i++){rig.mesh.getVertexPosition(i,p);rig.mesh.localToWorld(p);lowest=Math.min(lowest,p.y);}
+   expect(lowest).toBeGreaterThanOrEqual(-.005);
+  }
+  geometry.dispose();material.dispose();rig.skeleton.dispose();
+ });
  it('places the edge on the shipped mattress surface rather than the hanging blanket bounds',async()=>{
   const bytes=readFileSync('public/room3d/show_bed.glb');
   const {scene}=await new GLTFLoader().parseAsync(bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength),'');scene.updateMatrixWorld(true);
@@ -33,8 +57,8 @@ describe('Body 2 bedroom rest',()=>{
    const original=seatTransform(room,catalog,selection)!,blank=body2BedTransform(seatTransform(room,catalog,selection,true),headToHip)!;
    expect(original.pose).toBe('chair');expect(blank.pose).toBe('bed');
    const angle=rotation*Math.PI/180,dx=blank.position[0]-item.x,dz=blank.position[2]-item.z;
-   expect(dx*Math.sin(angle)+dz*Math.cos(angle)-headToHip).toBeCloseTo(-1.62);
-   expect(dx*Math.cos(angle)-dz*Math.sin(angle)).toBeCloseTo(side==='0'?-.94:.94);
+   expect(dx*Math.sin(angle)+dz*Math.cos(angle)-headToHip).toBeCloseTo(-1.27);
+   expect(dx*Math.cos(angle)-dz*Math.sin(angle)).toBeCloseTo(side==='0'?-.70:.70);
    expect(blank.position[1]).toBe(original.position[1]);
   }
  });
@@ -98,7 +122,9 @@ describe('Body 2 bedroom rest',()=>{
     const f=bedChangeFrame(t,rising);animate(t,'sleep','lying',{kind:'bed-change',hands:[],bedWeight:f.weight,bedRecline:f.recline,bedLegLift:f.legLift});
     const hip=rig.bones.hips.getWorldPosition(new T.Vector3());
     if(f.recline===0){expect(hip.y).toBeCloseTo(T.MathUtils.lerp(bodyHeightY(.38*BLANK_SCALE,bodyHeight),.055*BLANK_SCALE,f.weight));expect(hip.z).toBeCloseTo(0);}
-    else{expect(hip.y).toBeGreaterThan(.1);expect(hip.y).toBeLessThan(.65);expect(Math.abs(hip.z)).toBeLessThan(1.5);}
+    // The pelvis must rise enough to support the large head/back; the previous
+    // fixed .65 ceiling encoded the penetrating pose rather than skin contact.
+    else{expect(hip.y).toBeGreaterThan(.1);expect(Number.isFinite(hip.y)).toBe(true);expect(Math.abs(hip.z)).toBeLessThan(1.5);}
     expect(rig.skeleton.bones.map(b=>b.position.length())).toEqual(lengths);
     expect(rig.skeleton.bones.every(b=>b.matrixWorld.elements.every(Number.isFinite))).toBe(true);
     // Once sitting on the mattress, knees and ankles stay above its plane

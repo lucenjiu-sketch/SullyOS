@@ -71,6 +71,7 @@ import {
 import { parseSARUserSurfaces, selectSARUserSurfaceTargets } from '../utils/vrWorld/sarUserSurface';
 import { isEmotionEvalSkipped } from '../utils/devDebug';
 import {prepareHomeSecretTask,failHomeSecretTask} from '../utils/homeSecrets';
+import type {SecretNoteOriginPromise} from '../utils/secretNote';
 import {
     computeContextRangeSnapshot,
     getMemoryPalaceHighWaterMarkForContext,
@@ -365,6 +366,7 @@ export async function evaluateEmotionBackground(
     apiMessages: Array<{ role: string; content: any }>,
     api: { baseUrl: string; apiKey: string; model: string; stream?: boolean },
     signal?: AbortSignal,
+    secretOrigin?: SecretNoteOriginPromise,
 ): Promise<string | null> {
     // 全局横幅「xx 正在感受…」（ChatBroadcast）。这里是所有本地评估路径的汇聚点
     // （主链路 fire & forget / OSContext 主动消息），在函数级
@@ -373,7 +375,7 @@ export async function evaluateEmotionBackground(
     let secretTask: Awaited<ReturnType<typeof prepareHomeSecretTask>> = undefined;
     try {
         if (signal?.aborted) return null;
-        try { secretTask = await prepareHomeSecretTask(charData, apiMessages); }
+        try { if (secretOrigin) secretTask = await prepareHomeSecretTask(charData, apiMessages); }
         catch (error) {
             console.warn('[Home secrets] Could not prepare task', error);
             announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {charId: charData.id, charName: charData.name, reason: '秘密任务准备失败，本轮继续正常情绪评估'});
@@ -445,7 +447,9 @@ export async function evaluateEmotionBackground(
             return null;
         }
         if (signal?.aborted) return null;
-        return await applyEmotionEvalRaw(raw, charData, secretTask?.id);
+        const origin = secretTask ? await secretOrigin : undefined;
+        if (signal?.aborted) return null;
+        return await applyEmotionEvalRaw(raw, charData, secretTask?.id, origin);
     } catch (e: any) {
         if (signal?.aborted) return null;
         console.warn('🎭 [Emotion] Evaluation failed:', e.message);
@@ -716,14 +720,16 @@ export const useChatAI = ({
         };
 
         try {
+            // Include SW readiness in send→API timing; it can be the first request's wait.
+            const perfSendT0 = performance.now();
             // 初始化失败也必须经过 finally 释放本轮占位。
             await replyStep(async () => KeepAlive.start());
+            const keepAliveMs = Math.round(performance.now() - perfSendT0);
             const baseUrl = effectiveApi.baseUrl.replace(/\/+$/, '');
             const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey || 'sk-none'}` };
 
             // ── 分段计时（从用户发送到 API 发出）──
-            const perfSendT0 = performance.now();
-            const perfStages: Record<string, number> = {};
+            const perfStages: Record<string, number> = { keepAlive: keepAliveMs };
             const stageT = async <T>(label: string, p: Promise<T>): Promise<T> => {
                 const t0 = performance.now();
                 try { return await replyStep(async () => p); }
@@ -922,6 +928,7 @@ export const useChatAI = ({
                 luckinChat: luckinChatOn ? luckinChatRef?.current : undefined,
                 timelyByWorker: instantChatRoute,
                 recallEntryPoint: 'chat_app',
+                onPreparationStage:event=>{if(event.status==='end')perfStages['payload.'+event.stage]=event.ms;},
             })));
             const systemPrompt = payload.systemPrompt;
             const cleanedApiMessages = payload.cleanedApiMessages;
@@ -975,7 +982,8 @@ export const useChatAI = ({
             // 上云模式不受影响：worker 那边自己安排评估的时机。
             const fireLocalEmotionEval = (emotionEvalEnabled && !instantChatRoute && emotionApi) ? () => {
                 setEmotionStatus('evaluating');
-                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi, replyRun.signal)
+                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi, replyRun.signal,
+                    replyRun.secretSourceIds.then(ids => ids.length ? {source: 'chat' as const, messageIds: ids} : undefined))
                     .then((innerState) => {
                         if (innerState) setEvolvedNarrative(innerState);
                     })
@@ -985,20 +993,16 @@ export const useChatAI = ({
             } : null;
             // 交给云端跑的那份评估配置（提示词模板 + 副 API 凭据），即时对话把它放进任务
             // metadata.amsgEmotionEval（那份走加密信封）。
-            const cloudSecretTask = (emotionEvalEnabled && instantChatRoute && emotionApi)
-                ? await prepareHomeSecretTask(charForGen, cleanedApiMessages).catch(error => {
-                    console.warn('[Home secrets] Could not prepare cloud task', error);
-                    announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {charId: charForGen.id, charName: charForGen.name, reason: '秘密任务准备失败，本轮继续正常聊天和情绪评估'});
-                    return undefined;
-                }) : undefined;
+            // Cloud callbacks cannot prove ownership of every local reply bubble yet.
+            // Do not generate unowned secrets; ordinary cloud emotion evaluation continues.
             const cloudEmotionEval = (emotionEvalEnabled && instantChatRoute && emotionApi)
                 ? {
                     // includeContext=false: 不嵌 system prompt + 对话历史 (worker 复用本次请求的 messages 作前文),
                     // 把 emotionEval 块压到最小, 不把上下文在请求体里重复一份.
                     prompt: buildEmotionEvalPrompt(
-                        charForGen, userProfile, systemPrompt, cleanedApiMessages, false, cloudSecretTask?.prompt
+                        charForGen, userProfile, systemPrompt, cleanedApiMessages, false
                     ),
-                    homeSecretRequestId: cloudSecretTask?.id,
+                    homeSecretRequestId: undefined,
                     api: { baseUrl: emotionApi.baseUrl, apiKey: emotionApi.apiKey, model: emotionApi.model },
                 }
                 : undefined;
@@ -2099,6 +2103,7 @@ export const useChatAI = ({
                 directives: [],
                 sarModuleSurface: assistantSurfaceMeta,
             }));
+            replyRun.markCompleted();
             // 最后一批正式消息已交给 setMessages；同一轮更新撤掉预览，不再逐条补弹。
             setStreamingBubbles([]);
             setStreamingThinking('');
