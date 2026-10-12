@@ -6,6 +6,7 @@ import { CharacterProfile, Message, EmojiCategory, DailySchedule, ScheduleSlot, 
 import ScheduleCard from '../schedule/ScheduleCard';
 import EmotionSettingsPanel from './EmotionSettingsPanel';
 import ChatInputSettings from './ChatInputSettings';
+import ChatSettingsSection from './ChatSettingsSection';
 import SecretNote from './SecretNote';
 import { DEFAULT_RP_PROMPT_TOGGLES, type RpPromptToggles } from '../../utils/rpPromptToggles';
 import type { ChatInputPreferences } from '../../utils/chatInputPreferences';
