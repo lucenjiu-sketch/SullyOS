@@ -6,7 +6,6 @@ import { getCachedUserHolidayReminder, type UserHolidayConfig } from './userHoli
 import { CharacterProfile, UserProfile, DailySchedule, MountedWorldbook } from '../types';
 import { normalizeUserImpression } from './impression';
 import {buildHomePetContext} from './homePetContext';
-import {buildHomeSecretsContext} from './homeSecrets';
 import { buildHomeDefinitionContext } from './homeDefinitionContext';
 import { isScheduleFeatureOn } from './scheduleFeature';
 import { buildScheduleInjection as buildScheduleInjectionText } from './scheduleInjection';
@@ -610,7 +609,6 @@ const renderCoreContext = async (
         // 家园背景由所有入口共用，未设置时不注入。
         context += buildHomeDefinitionContext(char.homeDefinition, user.name);
         context += buildHomePetContext(char.home3D);
-        context += await buildHomeSecretsContext(char.id);
 
         // 4. [NEW] 印象档案 (Private Impression)
         // 这是角色对用户的私密看法，只有角色知道

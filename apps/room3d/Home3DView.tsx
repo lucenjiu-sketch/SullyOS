@@ -26,6 +26,7 @@ import {resolveCharTimeZone} from '../../utils/timezone';
 import {useHomeSchedule} from './useHomeSchedule';
 import {HomePresenceBubbles,type HomeInitiativeRequest} from './HomePresenceBubbles';
 import HomeLifePanel from './HomeLifePanel';
+import HomeQualityTip from './HomeQualityTip';
 import {useHomeCompanion} from './useHomeCompanion';
 import {HomeSpeechBubble} from './HomeSpeechBubble';
 
@@ -74,8 +75,9 @@ export default function Home3DView({value,onChange,onBack,character,user,api,con
    .then(e=>{if(!e||cancelled)return;setEditor(e);onEditor?.(e);}).catch(e=>{if(!cancelled)setError(e.message)});
   return()=>{cancelled=true;controller.abort(homeDisposalReason())};
  },[]);
- return <div className={`home-island ${homely?'homely-scene':''} relative h-full w-full`} data-chat-open={homely&&lifePanel==='chat'} data-photo-active={photoActive} style={{paddingTop:'var(--chrome-top, 0px)',paddingBottom:'var(--safe-bottom, 0px)',background:'#fafafa'}}>
+ return <div className={`home-island ${homely?'homely-scene':''} relative h-full w-full`} data-chat-open={homely&&lifePanel==='chat'} data-photo-active={photoActive} style={{paddingBottom:'var(--safe-bottom, 0px)',background:'#fafafa'}}>
    <div ref={host} className="h-full w-full" />
+   {editor&&!homely&&<HomeQualityTip editor={editor} active={!suspended&&!lifePanel&&!phoneOpen&&!photoActive}/>}
    {editor&&!suspended&&<>{(!homely||lifePanel!=='chat')&&<HomeSpeechBubble editor={editor}/>}<HomePresenceBubbles editor={editor} character={character} enabled={mainReady&&!lifePanel&&!phoneOpen} canInvite={!!api&&!!user} onInitiative={setInitiative}/></>}
    {away&&!editor?.getHomeScene().present&&<p className="home-away-note" role="status">{character?.name}现在不在家哦……</p>}
    {editor&&!suspended&&!homely&&<><HomeSocialPanel targetId={interactionTarget} externalOpen={lifePanel==='interact'} onClose={()=>setLifePanel(null)} editor={editor} primary={{id:character?.id??'resident',label:character?.name??'小人'}} options={residents.filter(r=>r.id!==character?.id)} body={residentHair.bodyShape??'classic'} onBody={value=>{setMainReady(false);setBodyOverride(value);}} mainReady={mainReady} hair={residentHair}/></>}

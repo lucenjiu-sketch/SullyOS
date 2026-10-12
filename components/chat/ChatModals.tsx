@@ -6,7 +6,7 @@ import { CharacterProfile, Message, EmojiCategory, DailySchedule, ScheduleSlot, 
 import ScheduleCard from '../schedule/ScheduleCard';
 import EmotionSettingsPanel from './EmotionSettingsPanel';
 import ChatInputSettings from './ChatInputSettings';
-import ChatSettingsSection from './ChatSettingsSection';
+import SecretNote from './SecretNote';
 import { DEFAULT_RP_PROMPT_TOGGLES, type RpPromptToggles } from '../../utils/rpPromptToggles';
 import type { ChatInputPreferences } from '../../utils/chatInputPreferences';
 import { isTranslationLangPreset, normalizeTranslationLangLabel, TRANSLATION_LANG_MAX_LENGTH, TRANSLATION_LANG_PRESETS } from '../../utils/translationLang';
@@ -294,6 +294,8 @@ const ChatModals: React.FC<ChatModalsProps> = ({
         if (longPressTimerRef.current) window.clearTimeout(longPressTimerRef.current);
         longPressTimerRef.current = window.setTimeout(() => {
             longPressTriggeredRef.current = true;
+            // Paper notes already show their original text here; never expose them in normal chat.
+            if (allHistoryMessages.some(m => m.id === msgId && m.type === 'secret_note')) return;
             if (onJumpToMessageInChat) {
                 setModalType('none');
                 setHistoryPage(0);
@@ -885,7 +887,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                 footer={<><button onClick={() => onSetHistoryStart(undefined)} className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-2xl">清除用户断点</button><button onClick={() => { setModalType('none'); setHistoryPage(0); setHistorySearch(''); }} className="flex-1 py-3 bg-primary text-white font-bold rounded-2xl">完成</button></>}
             >
                 <div className="space-y-2 max-h-[50vh] overflow-y-auto no-scrollbar p-1">
-                    <p className="text-xs text-slate-400 text-center mb-2"><b>短按</b>消息 = 设置用户断点（只能缩小范围） · <b>长按</b>消息 = 跳转查看原文</p>
+                    <p className="text-xs text-slate-400 text-center mb-2"><b>短按</b>记录 = 设置用户断点（只能缩小范围） · <b>长按</b>普通消息 = 跳转查看原文。秘密小纸条在此查看，每张占一条上下文。</p>
                     <div className="grid gap-2 mb-2">
                         <div className="bg-violet-50 border border-violet-200 rounded-xl p-2.5 text-[11px] text-violet-800 leading-relaxed">
                             <b>紫色 · 记忆宫殿水位线</b>：此前消息已经处理，不会因调整上下文再次向量化。
@@ -978,8 +980,8 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                                     >
                                         <span className="text-slate-400 font-mono whitespace-nowrap pt-0.5">[{new Date(m.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}]</span>
                                         <div className="flex-1 min-w-0">
-                                            <div className="font-bold text-slate-600 mb-0.5">{m.role === 'user' ? '我' : activeCharacter.name}</div>
-                                            <div className="truncate">{renderHighlighted(m.content || '', query, contentClass)}</div>
+                                            <div className="font-bold text-slate-600 mb-0.5">{m.type === 'secret_note' ? `${activeCharacter.name} · ${m.metadata?.source === 'home' ? '3D 小屋' : '聊天'}` : m.role === 'user' ? '我' : activeCharacter.name}</div>
+                                            {m.type === 'secret_note' ? <SecretNote text={m.content}/> : <div className="truncate">{renderHighlighted(m.content || '', query, contentClass)}</div>}
                                         </div>
                                         <div className="flex flex-wrap justify-end gap-1 max-w-[42%]">
                                             {isWatermark && <span className="text-violet-600 font-bold text-[9px] bg-white px-1.5 rounded-full border border-violet-200">水位线</span>}

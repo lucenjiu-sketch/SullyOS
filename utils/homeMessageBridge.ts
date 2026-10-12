@@ -2,6 +2,7 @@ import type {CharacterProfile, Message} from '../types';
 import {assignHomeTurns} from './homeTurns';
 import {assignHomeContextSegments,homeSegmentMessages as homeTurnMessages} from './homeContextSegments';
 import {homeRecords} from './homeRecords';
+import {deleteLinkedSecretNotes, announceSecretNotesChanged, HOME_HISTORY_COMMITTED} from './secretNote';
 
 /** Persist the room journal and its shared-history projection atomically, as DateApp does for messages.
  * String input migrates only the stored character, never a stale React snapshot.
@@ -12,6 +13,7 @@ export function persistCharacterWithHomeMessages(db:IDBDatabase,input:CharacterP
   const characters=tx.objectStore('characters'),messages=tx.objectStore('messages');
   const id=typeof input==='string'?input:input.id;
   let firstInserted=Infinity;
+  let notesChanged=false;
   const request=characters.get(id);
   request.onsuccess=()=>{
    const previous=request.result as CharacterProfile|undefined;
@@ -34,7 +36,7 @@ export function persistCharacterWithHomeMessages(db:IDBDatabase,input:CharacterP
      const next=pending.get(key);if(JSON.stringify(before.get(key))===JSON.stringify(next))continue;
      const lookup=messages.index('charId_homeTurn').openCursor(IDBKeyRange.only([id,key]));let found=false;
      lookup.onsuccess=()=>{const cursor=lookup.result;
-      if(cursor){const row=cursor.value as Message;if(row.metadata?.source==='home'){if(next){cursor.update({...row,...next,metadata:{...row.metadata,...next.metadata}});found=true;}else cursor.delete();}cursor.continue();}
+      if(cursor){const row=cursor.value as Message;if(row.metadata?.source==='home' && row.type!=='secret_note'){if(row.metadata?.secretNoteIds?.length)notesChanged=true;deleteLinkedSecretNotes(messages,row);if(next){cursor.update({...row,...next,metadata:{...row.metadata,...next.metadata,secretNoteIds:[]}});found=true;}else cursor.delete();}cursor.continue();}
       else if(next&&!found)insert(next);
      };
     }
@@ -70,6 +72,8 @@ export function persistCharacterWithHomeMessages(db:IDBDatabase,input:CharacterP
    };
   };
   tx.oncomplete=()=>{
+   if(notesChanged)announceSecretNotesChanged(id);
+   if(typeof window!=='undefined')window.dispatchEvent(new CustomEvent(HOME_HISTORY_COMMITTED,{detail:{charId:id}}));
    if(Number.isFinite(firstInserted))try{
     const key=`mp_lastMsgId_${id}`;
     if(Number(localStorage.getItem(key))>=firstInserted)localStorage.removeItem(key);

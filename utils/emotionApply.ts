@@ -3,6 +3,7 @@ import {parseHomeEmotion} from './homeEmotion';
 import type { CharacterProfile, CharacterBuff } from '../types';
 import { CHAT_GEN_EVENTS } from './chatGenEvents';
 import {landHomeSecrets} from './homeSecrets';
+import type {SecretNoteOrigin} from './secretNote';
 import {homeSecretEvalRequestId} from './emotionEvalCore';
 
 // 情绪评估失败的用户可见信号（OSContext 监听弹 toast）。本函数是本地 / instant(worker)
@@ -379,6 +380,7 @@ export async function applyEmotionEvalRaw(
     rawText: string,
     charData: CharacterProfile,
     secretRequestId?: string,
+    secretOrigin?: SecretNoteOrigin,
 ): Promise<string | null> {
     try {
         const result = parseEmotionEvalOutput(rawText || '');
@@ -410,7 +412,7 @@ export async function applyEmotionEvalRaw(
 
         // Secrets are independent of changed/buffs; persist before the unchanged-emotion early return.
         try {
-            await landHomeSecrets(charData.id, result, secretRequestId || homeSecretEvalRequestId(rawText), rawText);
+            await landHomeSecrets(charData.id, result, secretRequestId || homeSecretEvalRequestId(rawText), rawText, secretOrigin);
         } catch (error) {
             announceEmotionFailed(charData, error instanceof Error ? error.message : '秘密保存失败');
         }
@@ -434,12 +436,7 @@ export async function applyEmotionEvalRaw(
         // buffs 缺失但 injection 在场 (抢救场景) → 保留旧 buffs, 只换 injection.
         const sanitizedBuffs = hasBuffArray ? sanitizeBuffs(result.buffs) : (charData.activeBuffs || []);
         const buffInjection = hasInjection ? result.injection! : (hasBuffArray ? '' : (charData.buffInjection || ''));
-        const updated: CharacterProfile = {
-            ...charData,
-            activeBuffs: sanitizedBuffs,
-            buffInjection,
-        };
-        await DB.saveCharacter(updated);
+        await DB.saveCharacterEmotion(charData.id, sanitizedBuffs, buffInjection);
 
         // detail 直接带上 buffs + buffInjection: 监听方 (Chat) 可直接落 OSContext, 不必重读 DB
         // —— 避开 saveCharacter 未等事务提交 / instant flush 下 DB 重读偶发拿旧值的竞态.

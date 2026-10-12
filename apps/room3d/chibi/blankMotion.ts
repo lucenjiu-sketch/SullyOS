@@ -14,15 +14,19 @@ import {createRoomWalkSampler,type RoomWalkClip} from './roomWalk';
 import {constrainForearmTwist} from '../../../experiments/chibi/forearmTwist';
 import {createMeshySampler,meshyMotions,type MeshyMotion} from './meshyMotions';
 import {createMotionSurfaceContact} from './motionSurfaceContact';
+import {createBedSurface} from './bedSurface';
 import {createMirrorGrooming,mirrorGroomFrame} from './mirrorGrooming';
 
-// Small FK poses in the rig's bind axes. Bone lengths and mesh data never change.
+// Small FK poses in the rig's bind axes. Bone lengths remain unchanged.
 // Seat contact is normalized here, rather than adding offsets to every furniture.
 export function createBlankMotion(rig:ReturnType<typeof bindBlankBody>,body:T.Group,options:{walk?:RoomWalkClip}={}){
  const entries=Object.entries(rig.bones),targets=Object.fromEntries(entries.map(([name])=>[name,new T.Quaternion()]));
  const targetRotations=Object.values(targets),euler=new T.Euler(),position=new T.Vector3(),rotation=new T.Quaternion();
  const floorContact=createFloorSeatContact(rig,body);
  const surfaceContact=createMotionSurfaceContact(rig,body);
+ const bedSurface=createBedSurface(rig,body);
+ const bedHeadPitch=new T.Quaternion().setFromAxisAngle(new T.Vector3(1,0,0),.6),bedHeadBlend=new T.Quaternion();
+ const supportBedHead=(mode:ActivityPose['bedMode'],recline:number)=>{if(mode!=='bed-side')rig.bones.head.quaternion.multiply(bedHeadBlend.identity().slerp(bedHeadPitch,T.MathUtils.smootherstep(recline,.45,1)));};
  const groom=createMirrorGrooming(rig,body);
  const bedLeisure=createBedLeisure(rig,body);
  const computerContact=createComputerContact(rig,body);
@@ -205,6 +209,7 @@ export function createBlankMotion(rig:ReturnType<typeof bindBlankBody>,body:T.Gr
   }
   const selected=activity?.clip??(bed&&(activity.bedRecline??1)>0?'sleep':['wave-alternate-1','wave-alternate-2','dress-once','yoga'].includes(motion)?motion:undefined);
   const imported=selected&&selected in samples?selected as MeshyMotion:undefined;
+  if(imported!=='sleep'||(activity?.bedRecline??1)<=0)bedSurface.reset();
   if(imported){
    const clip=meshyMotions[imported],hip=bodyHeightY(.38*BLANK_SCALE,rig.bodyHeight);
    for(const q of Object.values(importedPose))q.identity();
@@ -249,12 +254,19 @@ export function createBlankMotion(rig:ReturnType<typeof bindBlankBody>,body:T.Gr
    if(isBedLeisure(activity?.bedFrom)&&leisureTime<1.2){
     const base=entries.map(([,b])=>b.quaternion.clone());
     bedLeisure(Math.max(1.2,activity.bedFromTime??3),activity.bedFrom);
+    supportBedHead(activity.bedFrom,activity?.bedRecline??1);
     from=entries.map(([,b])=>b.quaternion.clone());
     entries.forEach(([,b],i)=>b.quaternion.copy(base[i]));body.updateWorldMatrix(true,true);
    }
    if(activity?.kind==='bed-rest'&&isBedLeisure(activity.bedMode))bedLeisure(leisureTime,activity.bedMode);
+   // The source has a human-sized skull. Let the chibi head rest with its chin
+   // gently tucked instead of lifting the back/legs to clear the larger occiput.
+   supportBedHead(activity?.bedMode,activity?.bedRecline??1);
    if(from){const mix=T.MathUtils.smootherstep(leisureTime,0,1.2);entries.forEach(([,b],i)=>b.quaternion.copy(from![i].slerp(b.quaternion,mix)));}
-   surfaceContact(.049*BLANK_SCALE);
+   const recline=activity?.bedRecline??1;
+   const settle=activity?.bedMode==='bed-side'?0:T.MathUtils.smootherstep(recline,.75,1)*(activity?.bedFrom==='bed-side'?T.MathUtils.smootherstep(leisureTime,0,1.2):1);
+   if(recline>0)bedSurface(.015*BLANK_SCALE,T.MathUtils.smootherstep(recline,0,.3),settle,activity?.bedFootSurface);
+   if(settle===0)surfaceContact(.049*BLANK_SCALE);
   }
   if(imported==='sit-alternate'&&activity?.seatHeight!==undefined)surfaceContact(-activity.seatHeight+.049*BLANK_SCALE);
   if(imported==='yoga'){

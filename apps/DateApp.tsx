@@ -659,6 +659,27 @@ const DateApp: React.FC = () => {
         trackEvent('打开见面记录');
     };
 
+    useAppShortcut(ShortcutAppID.Date, (intent, isCurrent) => {
+        setCameFromChat(false);
+        setMeetSurface(intent.entryId === 'story' ? 'story' : 'companion');
+        const target = characters.find(c => c.id === intent.characterId);
+        if (!target) { setMode('select'); return; }
+        setActiveCharacterId(target.id);
+        setPreviousMode('select');
+        if (intent.entryId === 'history') {
+            setHistoryMessages([]); setMode('history');
+            setHistoryView('encounter'); setHistorySortOrder('newest'); setHistoryLoadLimit(DATE_HISTORY_MESSAGE_LIMIT);
+            void DB.getRecentMessagesByCharIdAndSource(target.id, 'date', DATE_HISTORY_MESSAGE_LIMIT).then(msgs => {
+                if (isCurrent()) { setHistoryMessages(msgs); setHistoryReachedEnd(msgs.length < DATE_HISTORY_MESSAGE_LIMIT); }
+            }).catch(() => { if (isCurrent()) addToast('见面记录读取失败，请重试', 'error'); });
+        } else if (intent.entryId === 'settings') setMode('settings');
+        else {
+            // Opening a shortcut must not discard savedDateState or generate an opening.
+            clearDateResumeAttempt(); encounterIdRef.current = crypto.randomUUID();
+            setDateMessages([]); setPeekStatus(''); setHasSavedOpening(false); setMode('entry');
+        }
+    });
+
     const handleLoadMoreHistory = async () => {
         if (!char || historyBusy || historyReachedEnd) return;
         const nextLimit = historyLoadLimit + DATE_HISTORY_MESSAGE_LIMIT;
@@ -1251,3 +1272,5 @@ const DateApp: React.FC = () => {
 };
 
 export default DateApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

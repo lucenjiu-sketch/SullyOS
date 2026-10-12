@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {CaretDown, House, Palette, X, LockSimple, LockSimpleOpen, Phone, DeviceMobile, Heart, Check} from '@phosphor-icons/react';
 import {HOMELY_PALETTES, homelyPalette, homelyPaletteStyle} from './homelyPalette';
 import {resolveHomelyResident} from '../../utils/homelyResident';
@@ -17,6 +17,9 @@ export default function HomelyHome({onEditor}:{onEditor?:(editor:HomeEditor)=>vo
   const character = resolveHomelyResident(characters, activeCharacterId, theme.homelyLockedCharacterId);
   const pinned = !!character && character.id === theme.homelyLockedCharacterId;
   const [drawer, setDrawer] = useState<'apps' | 'residents' | 'palette' | null>(null);
+  const [appSearch, setAppSearch] = useState('');
+  useEffect(() => {if(drawer!=='apps')setAppSearch('');}, [drawer]);
+  const apps = INSTALLED_APPS.filter(app => app.id!==AppID.Launcher && app.name.toLocaleLowerCase().includes(appSearch.trim().toLocaleLowerCase()));
   const launchForResident = (app:AppID) => {
     if (!character) return;
     setActiveCharacterId(character.id);
@@ -47,11 +50,13 @@ export default function HomelyHome({onEditor}:{onEditor?:(editor:HomeEditor)=>vo
       </div>
     </nav>
     {drawer && <div className={`homely-drawer-backdrop ${drawer==='palette'?'homely-palette-backdrop':''}`} onClick={e => {if(e.target===e.currentTarget)setDrawer(null);}}>
-      <section className={`homely-drawer ${drawer==='palette'?'homely-palette-sheet':''}`} role="dialog" aria-modal="true" aria-label={drawer==='apps'?'全部应用':drawer==='palette'?'居家配色':'选择居家角色'} onKeyDown={e => {if(e.key==='Escape')setDrawer(null); if(e.key==='Tab'){const nodes=[...e.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];const first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}}}>
+      <section className={`homely-drawer ${drawer==='palette'?'homely-palette-sheet':''}`} role="dialog" aria-modal="true" aria-label={drawer==='apps'?'全部应用':drawer==='palette'?'居家配色':'选择居家角色'} onKeyDown={e => {if(e.key==='Escape')setDrawer(null); if(e.key==='Tab'){const nodes=[...e.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')];const first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}}}}>
         <header><h2>{drawer==='apps'?'全部应用':drawer==='palette'?'居家配色':'和谁一起待着？'}</h2><button autoFocus onClick={() => setDrawer(null)} aria-label="关闭"><X size={22}/></button></header>
         {drawer==='palette' ? <div className="homely-palette-options" role="group" aria-label="居家配色">{HOMELY_PALETTES.map(p=><button key={p.id} aria-pressed={homelyPalette(theme.homelyPalette).id===p.id} onClick={()=>void updateTheme({homelyPalette:p.id})}><span style={{background:`linear-gradient(135deg,${p.paper} 50%,${p.accent} 50%)`,color:p.ink}}>{homelyPalette(theme.homelyPalette).id===p.id&&<Check size={18} weight="bold"/>}</span><small>{p.name}</small></button>)}</div> : <>
         {drawer==='residents'&&character&&<button className="homely-resident-lock" aria-pressed={pinned} onClick={()=>void updateTheme({homelyLockedCharacterId:pinned?undefined:character.id})}>{pinned?<LockSimple size={22}/>:<LockSimpleOpen size={22}/>}<span><strong>{pinned?`已锁定 ${character.name}`:`锁定 ${character.name}`}</strong><small>{pinned?'去和别人聊天，回家仍然是 TA。':'锁定后，居家不随聊天对象切换。'}</small></span></button>}
-        <div className="homely-app-grid">{drawer==='apps' ? INSTALLED_APPS.filter(app => app.id!==AppID.Launcher).map(app => <AppIcon key={app.id} app={app} onClick={() => {setDrawer(null);openApp(app.id);}} size="sm"/>) : characters.map(c => <button key={c.id} aria-pressed={c.id===character?.id} onClick={() => {if(pinned)void updateTheme({homelyLockedCharacterId:c.id});else setActiveCharacterId(c.id);setDrawer(null);}}><span className="homely-person-icon"><TokenImg value={c.avatar}/></span><span>{c.name}</span></button>)}</div>
+        {drawer==='apps'&&<input className="homely-app-search" type="search" aria-label="搜索应用" placeholder="搜索应用" value={appSearch} onChange={e=>setAppSearch(e.target.value)}/>}
+        <div className="homely-app-grid">{drawer==='apps' ? apps.map(app => <AppIcon key={app.id} app={app} onClick={() => {setDrawer(null);openApp(app.id);}} size="sm"/>) : characters.map(c => <button key={c.id} aria-pressed={c.id===character?.id} onClick={() => {if(pinned)void updateTheme({homelyLockedCharacterId:c.id});else setActiveCharacterId(c.id);setDrawer(null);}}><span className="homely-person-icon"><TokenImg value={c.avatar}/></span><span>{c.name}</span></button>)}</div>
+        {drawer==='apps'&&!apps.length&&<p className="homely-search-empty">没有找到这个应用</p>}
         </>}
         {drawer==='residents'&&!characters.length&&<button onClick={() => openApp(AppID.Character)}>添加角色</button>}
       </section>

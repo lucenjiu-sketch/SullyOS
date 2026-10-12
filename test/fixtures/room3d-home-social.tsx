@@ -7,6 +7,7 @@ import {furnishShowroom,SHOWROOMS} from '../../apps/room3d/showrooms.js';
 import {testCharacter} from './room3d-test-character';
 const catalog=await fetch('/room3d/catalog.json').then(r=>r.json()),home=createHome(catalog);home.rooms[0].items=[];
 const query=new URLSearchParams(location.search),showroom=query.get('room');
+const chromeTop=Number(query.get('chromeTop'));if(Number.isFinite(chromeTop)&&chromeTop>=0&&chromeTop<=120)document.documentElement.style.setProperty('--chrome-top',`${chromeTop}px`);
 if(showroom&&showroom in SHOWROOMS)furnishShowroom(home.rooms[0],showroom,catalog);
 if(query.has('multi')){const original=home.rooms[0];addRoom(home,'right');setBoundary(home,original.id,'right',{kind:'wall_high',door:{kind:'oak',at:0,width:2.6}},catalog);home.activeRoomId=original.id;}
 const hair={bodyShape:query.get('body')==='blank'?'blank' as const:'classic' as const};

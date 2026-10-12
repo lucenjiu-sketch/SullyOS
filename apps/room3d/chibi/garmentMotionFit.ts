@@ -29,14 +29,31 @@ export function createGarmentMotionFit(rig:ReturnType<typeof bindBlankBody>,oute
  const generator=new StaticGeometryGenerator(opaque);generator.attributes=['position'];generator.applyWorldTransforms=false;generator.useGroups=false;
  // The generator caches unchanged meshes; transform a separate copy, never its output.
  const rawSurface=new T.BufferGeometry(),surface=new T.BufferGeometry();
+ // Only the bones weighted by these garments can change this contact. Head
+ // or finger animation without garment weights and whole-resident movement
+ // are irrelevant. A collar weighted to the head still updates when it turns.
+ const usedBones=new Set<number>();
+ for(const mesh of [...opaque,...inner]){
+  const {skinIndex,skinWeight}=mesh.geometry.attributes;
+  for(let i=0;i<skinIndex.count;i++)for(let j=0;j<4;j++)if(skinWeight.getComponent(i,j)>0)usedBones.add(skinIndex.getComponent(i,j));
+ }
+ const boneIds=[...usedBones],relative=new T.Matrix4(),inverseChest=new T.Matrix4();
  const frame=new T.Matrix4(),inverseFrame=new T.Matrix4(),weighted=new T.Matrix4(),skin=new T.Matrix4(),inverse=new T.Matrix4(),p=new T.Vector3();
  const ray=new T.Ray(),point=new T.Vector3();let previous=new Float32Array(0),tree:MeshBVH|undefined,disposed=false,initialized=false;
  function update(){
   if(disposed)return;
   rig.mesh.parent!.updateWorldMatrix(true,true);rig.skeleton.update();
   const matrices=rig.skeleton.boneMatrices!;
-  if(initialized&&previous.length===matrices.length&&previous.every((v,i)=>Math.abs(v-matrices[i])<1e-7))return;
-  initialized=true;if(previous.length!==matrices.length)previous=new Float32Array(matrices.length);previous.set(matrices);
+  inverseChest.fromArray(matrices,chestIndex*16).invert();
+  let changed=!initialized;
+  if(previous.length!==boneIds.length*16)previous=new Float32Array(boneIds.length*16);
+  for(let i=0;i<boneIds.length;i++){
+   relative.multiplyMatrices(inverseChest,skin.fromArray(matrices,boneIds[i]*16));
+   for(let j=0;j<16;j++)if(Math.abs(previous[i*16+j]-relative.elements[j])>1e-5)changed=true;
+  }
+  if(!changed)return;
+  initialized=true;
+  for(let i=0;i<boneIds.length;i++){relative.multiplyMatrices(inverseChest,skin.fromArray(matrices,boneIds[i]*16));previous.set(relative.elements,i*16);}
   frame.copy(rig.mesh.bindMatrixInverse).multiply(skin.fromArray(matrices,chestIndex*16)).multiply(rig.mesh.bindMatrix);inverseFrame.copy(frame).invert();
   generator.generate(rawSurface);
   if(!surface.index)surface.copy(rawSurface);
