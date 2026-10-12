@@ -16,6 +16,7 @@ import { expandHomeContextHistory } from './homeContextSegments';
 
 import type { CharacterProfile, UserProfile, GroupProfile, Emoji, EmojiCategory, Message, RealtimeConfig, TranslationConfig, VisionApiConfig } from '../types';
 import { ChatPrompts, detectChatModeTransition } from './chatPrompts';
+import { applyPromptToggles } from './promptToggles';
 import { ContextBuilder } from './context';
 import { injectMemoryPalace } from './memoryPalace/pipeline';
 import { renderLocalContextGuidance } from './memoryPalace/recallRouter';
@@ -426,11 +427,7 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     const thinkingActive = !input.appPrompt && !!thinkingChain?.enabled;
     if (thinkingActive) {
         const userName = (userProfile?.name && userProfile.name.trim()) || '用户';
-        // 项目自带的那篇引导可以单独关掉（心象面板里的子开关），只留用户自己写的要求。
-        // 读 char 而不是 thinkingChain 入参：这是角色级偏好，各调用方无需逐个透传。
-        if (char.thinkingChainPromptEnabled !== false) {
-            systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
-        }
+        systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
         const extra = (thinkingChain?.customPrompt || '').trim();
         if (extra) {
             systemPrompt += `\n\n## 用户对内心独白的额外要求\n${extra}`;
@@ -516,6 +513,12 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     // 注意：即时对话的 worker 端情绪评估把 messages[0] 当 system、messages[1..]
     // 展平为对话历史 —— 易变尾段会以「[系统]: …」行出现在历史末尾，信息不丢。
     if(input.homePhoneContext) volatileTail += `\n\n${input.homePhoneContext}`;
+    // ── 提示词开关（本仓库自有功能，不改上游文件）─────────────────
+    // 六个开关（五块角色扮演规范 + 内置思考引导）在这里统一生效：提示词已按上游
+    // 原样拼完整，这一步把角色关掉的那几段裁掉。全开（默认 / 旧数据）时原样返回。
+    // 实现与锚点见 utils/promptToggles/。
+    systemPrompt = applyPromptToggles(systemPrompt, char);
+    volatileTail = applyPromptToggles(volatileTail, char);
     let fullMessages: Array<{ role: string; content: any }> = [
         { role: 'system', content: systemPrompt },
         ...messagesWithWorldbookDepth,

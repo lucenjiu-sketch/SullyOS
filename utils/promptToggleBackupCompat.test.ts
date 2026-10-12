@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { BACKUP_FORMAT_VERSION, SUPPORTED_IMPORT_FORMAT_VERSIONS } from './backupFormat';
 import { resolveRpPromptToggles } from './rpPromptToggles';
 import { stripSensitiveCardFields } from './characterCard';
+import { stripPromptToggleFields } from './promptToggles';
 import type { CharacterProfile } from '../types';
 
 // 本次改动新增 6 个角色级可选字段（rp* 五个 + thinkingChainPromptEnabled）。
@@ -44,12 +45,16 @@ describe('备份互通性', () => {
     });
 
     it('角色卡分享会剥离这 6 个本机偏好 → 接收方拿到的是默认全开', () => {
-        const shared = stripSensitiveCardFields({
+        // 剥离现在是两步：上游的 stripSensitiveCardFields（凭据/美化/运行时状态）
+        // + 本仓库的 stripPromptToggleFields（六个开关）。
+        // 拆成两个函数是为了不改上游的 characterCard.ts，同步更新时不冲突；
+        // apps/Character.tsx 的导出与导入两处都按这个顺序组合调用。
+        const shared = stripPromptToggleFields(stripSensitiveCardFields({
             id: 'c1', name: '发出去的角色', avatar: '', systemPrompt: '人设',
             rpStyleEnabled: false, rpEmotionEnabled: false, rpListeningEnabled: false,
             rpSelfEnabled: false, rpAntiFillerEnabled: false,
             thinkingChainPromptEnabled: false,
-        } as CharacterProfile) as Partial<CharacterProfile>;
+        } as CharacterProfile)) as Partial<CharacterProfile>;
 
         for (const key of [
             'rpStyleEnabled', 'rpEmotionEnabled', 'rpListeningEnabled',

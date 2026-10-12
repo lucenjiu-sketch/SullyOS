@@ -1,15 +1,33 @@
 import { describe, it, expect } from 'vitest';
-import { ChatPrompts } from './chatPrompts';
-import type { CharacterProfile, UserProfile } from '../types';
+import { buildChatRequestPayload } from './chatRequestPayload';
+import type { BuildChatPayloadInput } from './chatRequestPayload';
+import type { CharacterProfile } from '../types';
 
-const user = { name: '久', bio: '' } as UserProfile;
+// 角色扮演规范五开关。
+//
+// 注意测试打在哪一层：开关的生效点是 buildChatRequestPayload 的出口
+// （见 utils/promptToggles/），不是 ChatPrompts.buildSystemPrompt。
+// 这是插件式重构后的结构 —— 提示词先按上游原样拼完整，最后在出口裁掉
+// 关掉的那几段，好处是上游那三个核心文件一个都不用改，同步更新不再冲突。
+// 所以这里走和线上一致的完整管线，断言最终发给模型的 systemPrompt。
+
+const user = { name: '久', bio: '' } as any;
 const baseChar = { id: 'c1', name: '陆珂', systemPrompt: '测试人设' } as CharacterProfile;
 
-const build = (overrides: Partial<CharacterProfile>) =>
-    ChatPrompts.buildSystemPrompt(
-        { ...baseChar, ...overrides } as CharacterProfile,
-        user, [], [], [], [],
-    );
+/** 走完整管线，拿最终 systemPrompt（含易变尾段，与发给模型的内容一致）。 */
+const build = async (overrides: Partial<CharacterProfile>) => {
+    const input: BuildChatPayloadInput = {
+        char: { ...baseChar, ...overrides } as any,
+        userProfile: user,
+        groups: [], emojis: [], categories: [],
+        historyMsgs: [
+            { id: 1, charId: 'c1', role: 'user', type: 'text', content: '在吗', timestamp: Date.now() },
+        ] as any[],
+        contextLimit: 20,
+    };
+    const out = await buildChatRequestPayload(input);
+    return out.systemPrompt;
+};
 
 // 关掉任何开关都不能动到这些：前端要靠它们解析标签 / 渲染气泡。
 const PROTOCOL_MARKERS = [
@@ -70,5 +88,12 @@ describe('角色扮演规范五开关', () => {
         const p = await build({ rpStyleEnabled: false });
         expect(p).toContain('2.5 **情绪回应**');
         expect(p).not.toContain('对话质量 (极其重要)');
+    });
+
+    it('style 与 emotion 一起关时不留空的小标题', async () => {
+        const p = await build({ rpStyleEnabled: false, rpEmotionEnabled: false });
+        expect(p).not.toContain('2.5 **情绪回应**');
+        expect(p).not.toContain('对话质量 (极其重要)');
+        expect(p).toContain('3. **格式要求**');
     });
 });

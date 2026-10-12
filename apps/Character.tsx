@@ -35,6 +35,7 @@ import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { COMMON_TIMEZONES } from '../utils/timezone';
 import { toMountedWorldbook } from '../utils/worldbook';
 import { stripSensitiveCardFields } from '../utils/characterCard';
+import { stripPromptToggleFields } from '../utils/promptToggles';
 import { shareOrDownloadFile } from '../utils/shareExport';
 import { readShareText } from '../utils/pngShare';
 import { confirmExportSafety } from '../utils/exportGuard';
@@ -1090,7 +1091,7 @@ ${isInitialGeneration ? `
 
       // 只导出「角色」本身：凭据 / 美化 / 语言偏好 / 运行时状态一律剥离，
       // 绝不把发卡人的 API 密钥等私密字段打包进卡里。清单见 utils/characterCard.ts。
-      const cardProps = stripSensitiveCardFields(rest);
+      const cardProps = stripPromptToggleFields(stripSensitiveCardFields(rest));
 
       const exportData: CharacterExportData = {
           ...cardProps,
@@ -1148,7 +1149,7 @@ ${isInitialGeneration ? `
           // 导入侧同样剥离凭据 / 美化 / 语言 / 运行时状态：即便对方给的是旧版
           // 角色卡（把 API 密钥等私密字段一起打包了），也不会被写进本地角色，
           // 不会用发卡人的 key / 主题 / 语言偏好覆盖你自己的。清单见 utils/characterCard.ts。
-          const safeData = stripSensitiveCardFields(data);
+          const safeData = stripPromptToggleFields(stripSensitiveCardFields(data));
 
           // Sync mounted worldbooks into the global worldbook app so they
           // appear under their original category (or the character's name

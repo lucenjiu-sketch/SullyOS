@@ -3,6 +3,7 @@ import { ContextBuilder } from '../../utils/context';
 import { buildChatRequestPayload } from '../../utils/chatRequestPayload';
 import { ChatPrompts } from '../../utils/chatPrompts';
 import { buildThinkingChainPrompt } from '../../utils/thinkingChainPrompt';
+import { applyPromptToggles } from '../../utils/promptToggles';
 import { MemoryNodeDB } from '../../utils/memoryPalace/db';
 import { injectMemoryPalace } from '../../utils/memoryPalace/pipeline';
 import type { MemoryNode } from '../../utils/memoryPalace/types';
@@ -33,13 +34,12 @@ format: docx
 const collaborationThinkingPrompt = (char: CharacterProfile, user: UserProfile): string => {
   if (!char.showThinkingChain) return '';
   const custom = (char.thinkingChainCustomPrompt || '').trim();
-  // 项目自带引导可在心象面板单独关掉；用户自己写的规则照常追加。
-  const builtin = char.thinkingChainPromptEnabled !== false
-    ? buildThinkingChainPrompt(char.name, user.name)
-    : '';
-  const customBlock = custom ? `\n\n### 用户追加的心象规则\n${custom}` : '';
-  if (!builtin && !customBlock) return '';
-  return `\n\n${builtin}${customBlock}`;
+  // 内置思考引导开关（本仓库自有功能）：照原样拼好，由 applyPromptToggles 在出口裁掉
+  // 内置那篇，用户自己写的心象规则照常保留。见 utils/promptToggles/。
+  return applyPromptToggles(
+    `\n\n${buildThinkingChainPrompt(char.name, user.name)}${custom ? `\n\n### 用户追加的心象规则\n${custom}` : ''}`,
+    char,
+  );
 };
 
 const collaborationRichOutputPrompt = (

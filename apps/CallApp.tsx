@@ -40,6 +40,7 @@ import { deleteAvatarModel, inspectAvatarFile, saveAvatarModel } from '../utils/
 import { getLive2DAIActions, prewarmLive2DModelSource, saveLive2DModelFromFiles, saveLive2DModelFromZip, upgradeLive2DAutoPermissions, type Live2DAvatarConfig } from '../utils/live2dModelStore';
 import { preloadLive2DRuntime } from '../utils/live2dCore';
 import { buildThinkingChainPrompt } from '../utils/thinkingChainPrompt';
+import { applyPromptToggles } from '../utils/promptToggles';
 import { parseCallAssistantMessage, stripCallTextFormatting, type ParsedCallReply } from '../utils/callReplyFormat';
 import { runCallMemoryPalacePostFlow } from '../utils/memoryPalace/callPostFlow';
 import {
@@ -1918,16 +1919,15 @@ ${sentencePlan}`;
       ? buildPendingAvatarTouchContext(pendingTouches, selectedChar.name, userName)
       : '';
     const messages = await buildHistoryMessages(input, skipDbId, touchContext);
+    // 内置思考引导开关（本仓库自有功能）：这一篇按原样拼好后，由 applyPromptToggles
+    // 在出口裁掉，用户自己写的追加要求不受影响。见 utils/promptToggles/。
     const thinkingPrompt = selectedChar?.showThinkingChain
-      ? [
-          // 项目自带引导可在心象面板单独关掉；用户自己写的要求照常追加。
-          selectedChar.thinkingChainPromptEnabled !== false
-            ? buildThinkingChainPrompt(selectedChar.name, userName)
-            : '',
+      ? applyPromptToggles([
+          buildThinkingChainPrompt(selectedChar.name, userName),
           selectedChar.thinkingChainCustomPrompt?.trim()
             ? `【用户追加的 THINKING 要求】\n${selectedChar.thinkingChainCustomPrompt.trim()}`
             : '',
-        ].filter(Boolean).join('\n\n')
+        ].filter(Boolean).join('\n\n'), selectedChar)
       : '';
     // 模型专属动作白名单：Live2D 用用户授权的 actions；VRM 用加载时枚举出的
     // 自定义表情（星星眼/黑脸这类，预设之外的全部可用）。

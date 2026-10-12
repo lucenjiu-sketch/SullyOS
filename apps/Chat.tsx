@@ -76,7 +76,7 @@ import {
 } from '../utils/ttsRouter';
 import { playVoiceAudio, primeVoiceAudio, stopVoiceAudio, voicePlaybackErrorMessage, shouldAutoGenerateVoice, shouldAutoPlayGeneratedVoice } from '../utils/voicePlayback';
 import { voiceLanguageAnalyticsValue, voiceLanguagePromptLabel } from '../utils/voiceLanguage';
-import { resolveRpPromptToggles } from '../utils/rpPromptToggles';
+import { resolveRpPromptToggles, RP_TOGGLE_FIELDS } from '../utils/promptToggles';
 import { fetchBlobForShare, shareOrDownloadBlob } from '../utils/shareExport';
 import { CollaborationStore } from '../features/collaboration/store';
 import { resolveTtsProvider } from '../utils/ttsProvider';
@@ -3838,16 +3838,11 @@ const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
                 setHtmlModeCustomPrompt={setSettingsHtmlModeCustomPrompt}
                 rpToggles={resolveRpPromptToggles(char)}
                 onToggleRpPrompt={(key) => {
-                    const fieldByKey = {
-                        style: 'rpStyleEnabled',
-                        emotion: 'rpEmotionEnabled',
-                        listening: 'rpListeningEnabled',
-                        self: 'rpSelfEnabled',
-                        antiFiller: 'rpAntiFillerEnabled',
-                    } as const;
-                    const field = fieldByKey[key];
+                    // 字段名映射收在 utils/promptToggles/，这里不再内联一份。
                     // 字段默认 undefined = 开，所以取反要先经 resolve 归一化成布尔值。
-                    updateCharacter(char.id, { [field]: !resolveRpPromptToggles(char)[key] });
+                    updateCharacter(char.id, {
+                        [RP_TOGGLE_FIELDS[key]]: !resolveRpPromptToggles(char)[key],
+                    });
                 }}
                 chatVoiceEnabled={!!char.chatVoiceEnabled}
                 onToggleChatVoice={() => updateCharacter(char.id, { chatVoiceEnabled: !char.chatVoiceEnabled })}
