@@ -904,11 +904,6 @@ export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
         `请求体总字符（不是 Token）：${fmt(capture.totalChars)}`,
         `消息数：${capture.messageCount}`,
         `分区数：${capture.sections.length}`,
-        '',
-        '===== 【临时诊断】内置思考引导开关 =====',
-        `调用方读到：${JSON.stringify((globalThis as any).__sullyThinkingToggleCaller ?? null)}`,
-        `函数内收到：${JSON.stringify((globalThis as any).__sullyThinkingToggleProbe ?? null)}`,
-        '（这一节是排查用的临时输出，修好后会删掉）',
         capture.binaryPlaceholders > 0
             ? `二进制占位：${capture.binaryPlaceholders} 个（图片/音频正文未保存，已保留原始长度）`
             : '二进制占位：0',
