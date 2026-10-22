@@ -836,6 +836,7 @@ export const buildFirePack = async (
     translationConfig: readChatTranslationConfig(char.id),
     htmlMode: { enabled: !!char.htmlModeEnabled, customPrompt: char.htmlModeCustomPrompt },
     thinkingChain: { enabled: !!char.showThinkingChain, customPrompt: char.thinkingChainCustomPrompt },
+    thinkingChainPromptEnabled: char.thinkingChainPromptEnabled,
   });
   const recentTranscript = templateStub ? '' : ChatPrompts.buildMessageHistory(
     recentMessages,

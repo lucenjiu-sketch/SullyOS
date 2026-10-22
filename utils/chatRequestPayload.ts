@@ -397,6 +397,7 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         charName: char.name,
         userName: userProfile?.name,
         ...(!input.appPrompt ? { translationConfig, htmlMode, thinkingChain, sarEnvelopeActive } : {}),
+        thinkingChainPromptEnabled: char.thinkingChainPromptEnabled,
     });
     systemPrompt += outputStylePrompt;
 
