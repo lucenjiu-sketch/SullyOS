@@ -2008,7 +2008,7 @@ ${sentencePlan}`;
       const snapshotHistory = prepareUserCameraSnapshot(messages, userCameraSnapshot);
       const characterContext = selectedChar ? (await ContextBuilder.buildCharacterContext({
         char: selectedChar, user: userProfile, history: snapshotHistory.messages,
-        timeOptions: { conversational: true },
+        timeOptions: { conversational: true, includeUserLocation: true },
         instructions: core => buildCallPrompt(userName, selectedChar.name, core, voiceLang || undefined, callMode, resolveCharTimeZone(selectedChar)),
       })) : null;
       const baseCallPrompt = characterContext?.coreContext

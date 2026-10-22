@@ -15,6 +15,10 @@ import { shareOrDownloadBlob } from '../utils/shareExport';
 import { bucketRetryCount, isAnalyticsConfigured, isAnalyticsEnabled, setAnalyticsEnabled, trackEvent } from '../utils/analytics';
 import Modal from '../components/os/Modal';
 import UserHolidaySettings from '../components/settings/UserHolidaySettings';
+import UserLocationSettings, { USER_LOCATION_PAGE_TITLES, getUserLocationParentPage, type UserLocationSettingsPage } from '../components/settings/UserLocationSettings';
+import { useLocalBackHandler } from '../hooks/useLocalBackHandler';
+import { loadUserLocationConfig, type UserLocationConfig } from '../utils/userLocationPrivacy';
+import { saveUserLocationConfig } from '../utils/userLocation';
 import { consumeHolidaySettings, hasHolidaySettingsRequest, type UserHolidayConfig } from '../utils/userHolidays';
 import { NotionManager, FeishuManager, RealtimeContextManager, fetchOwmWeather, fetchOpenMeteoWeather } from '../utils/realtimeContext';
 import { XhsMcpClient } from '../utils/xhsMcpClient';
@@ -676,6 +680,19 @@ const Settings: React.FC = () => {
 
   // 实时感知配置的本地状态
   const [rtWeatherEnabled, setRtWeatherEnabled] = useState(realtimeConfig.weatherEnabled);
+  const [rtUserLocation, setRtUserLocation] = useState<UserLocationConfig>(() => { try { return loadUserLocationConfig(); } catch { return { enabled: false, regions: [] }; } });
+  const [rtUserLocationPage, setRtUserLocationPage] = useState<UserLocationSettingsPage>('main');
+  const [rtUserLocationBusy, setRtUserLocationBusy] = useState(false);
+  useSettingsFocus('location', () => {
+      setRtUserLocationPage('location');
+      setShowRealtimeModal(true);
+  });
+  const closeRealtimePage = () => {
+      if (rtUserLocationBusy) return;
+      if (rtUserLocationPage !== 'main') setRtUserLocationPage(getUserLocationParentPage(rtUserLocationPage));
+      else setShowRealtimeModal(false);
+  };
+  useLocalBackHandler(() => { closeRealtimePage(); return true; }, 30, showRealtimeModal);
   const [rtUserHolidays, setRtUserHolidays] = useState<UserHolidayConfig>(() => ({ ...(realtimeConfig.userHolidays || { enabled: false, countryCode: '' }), ...(holidaySettingsFocus ? { enabled: true } : {}) }));
   const [rtWeatherKey, setRtWeatherKey] = useState(realtimeConfig.weatherApiKey);
   const [rtWeatherCity, setRtWeatherCity] = useState(realtimeConfig.weatherCity);
@@ -1092,9 +1109,15 @@ const Settings: React.FC = () => {
   // 删预设只是把这张「存档卡」扔掉：当前生效的配置是拷贝，不受影响。
   const deleteApiPreset = (id: string, name: string) => {
       cancelPresetDeleteHold();
+      const wasActive = activePresetId === id;
       removeApiPreset(id);
       setEditingPresetId(current => (current === id ? null : current));
-      addToast(`已删除预设: ${name}`, 'success');
+      addToast(
+          wasActive
+              ? `已删除预设: ${name}（当前生效配置未清空，如需停用请修改下方地址或密钥）`
+              : `已删除预设: ${name}`,
+          'success',
+      );
   };
 
   const beginPresetDeleteHold = (id: string, name: string) => {
@@ -1103,9 +1126,15 @@ const Settings: React.FC = () => {
       presetDeleteTimerRef.current = setTimeout(() => {
           presetDeleteTimerRef.current = null;
           setHoldingDeletePresetId(null);
+          const wasActive = activePresetId === id;
           removeApiPreset(id);
           setEditingPresetId(current => (current === id ? null : current));
-          addToast(`已删除预设: ${name}`, 'success');
+          addToast(
+              wasActive
+                  ? `已删除预设: ${name}（当前生效配置未清空，如需停用请修改下方地址或密钥）`
+                  : `已删除预设: ${name}`,
+              'success',
+          );
       }, 700);
   };
 
@@ -1818,8 +1847,13 @@ const Settings: React.FC = () => {
   };
 
   // 保存实时感知配置
+  const handleSaveUserLocation = () => {
+      try { saveUserLocationConfig(rtUserLocation); return true; }
+      catch (error: any) { addToast(error?.message || '定位配置未保存', 'error'); return false; }
+  };
   const handleSaveRealtimeConfig = () => {
       if (rtUserHolidays.enabled && !rtUserHolidays.countryCode) { addToast('请选择生活所在的国家／地区，或关闭节假日感知', 'error'); return; }
+      if (!handleSaveUserLocation()) return;
       const updates = {
           weatherEnabled: rtWeatherEnabled,
           userHolidays: { ...rtUserHolidays, introChoice: rtUserHolidays.enabled ? 'configured' as const : 'declined' as const },
@@ -2287,7 +2321,7 @@ const Settings: React.FC = () => {
                 </p>
                 {avatarModelInventory && avatarModelInventory.missingCount > 0 && (
                     <p className="mt-2 text-[10px] leading-relaxed text-rose-500">
-                        有 {avatarModelInventory.missingCount} 个角色只剩模型索引，本地二进制已经丢失，无法导出。
+                        有 {avatarModelInventory.missingCount} 个角色的模型文件已丢失，需重新导入模型后才能导出。
                     </p>
                 )}
             </div>
@@ -2864,7 +2898,7 @@ const Settings: React.FC = () => {
                     </select>
                     <p className="text-[11px] text-slate-400 mt-1 pl-1">
                         {localFishModel === 's2.1-pro-free'
-                            ? '免费版：和 s2.1-pro 同一个模型、$0，但不保证 TTFA / DPA，适合自用测试。选了立即生效。'
+                            ? '免费版：和 s2.1-pro 同一个模型、$0，但首字延迟和并发稳定性不作保证，适合自用测试。选了立即生效。'
                             : '切换立即生效。角色也可在「角色 → 语音」单独覆盖模型（留空则用这里的全局默认）。'}
                     </p>
                 </div>
@@ -4118,12 +4152,16 @@ const Settings: React.FC = () => {
       {/* 实时感知配置 Modal */}
       <Modal
           isOpen={showRealtimeModal}
-          title="实时感知配置"
-          onClose={() => setShowRealtimeModal(false)}
-          footer={<button onClick={handleSaveRealtimeConfig} className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl shadow-lg">保存配置</button>}
+          title={USER_LOCATION_PAGE_TITLES[rtUserLocationPage]}
+          onClose={closeRealtimePage}
+          footer={rtUserLocationPage === 'main'
+              ? <button disabled={rtUserLocationBusy} onClick={handleSaveRealtimeConfig} className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl shadow-lg disabled:opacity-40">保存配置</button>
+              : <button disabled={rtUserLocationBusy} onClick={() => { if (rtUserLocationPage === 'about' || handleSaveUserLocation()) setRtUserLocationPage(getUserLocationParentPage(rtUserLocationPage)); }} className="w-full py-3 bg-sky-700 text-white font-bold rounded-2xl disabled:opacity-40">{rtUserLocationPage === 'about' ? '返回真实定位' : '保存并返回'}</button>}
       >
           <div className="space-y-5 max-h-[60vh] overflow-y-auto no-scrollbar">
-              <UserHolidaySettings value={rtUserHolidays} onChange={setRtUserHolidays} />
+              {rtUserLocationPage === 'main' && <UserHolidaySettings value={rtUserHolidays} onChange={setRtUserHolidays} />}
+              <UserLocationSettings value={rtUserLocation} onChange={setRtUserLocation} onSave={handleSaveUserLocation} page={rtUserLocationPage} onNavigate={setRtUserLocationPage} onBusyChange={setRtUserLocationBusy} userName={userProfile.name} />
+              {rtUserLocationPage === 'main' && <>
               {/* 天气配置 */}
               <div className="bg-emerald-50/50 p-4 rounded-2xl space-y-3">
                   <div className="flex items-center justify-between">
@@ -4555,7 +4593,7 @@ const Settings: React.FC = () => {
                       </div>
                   )}
               </div>
-
+              </>}
           </div>
       </Modal>
 

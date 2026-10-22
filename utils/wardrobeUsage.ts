@@ -1,3 +1,5 @@
+import {validateCollaborationAppearance,type CollaborationAppearance} from '../features/collaboration/appearance';
+import {targetAvatarFrameCss} from './avatarFrameTarget';
 import type {CharacterProfile, OSTheme, ChatTheme} from '../types';
 import {LAYOUT_DEFAULTS, pickDecorationLayout, resolveDecorationTheme} from './chatDecoration';
 import {mergeChatFineTune} from './chatFineTuneCss';
@@ -18,7 +20,7 @@ const psyche = (v: any) => ({styleId:v.styleId,customCss:css(v.customCss || ''),
 
 /** Resolve local asset representations only. Never download an author's remote images
  * just to add a badge. Cache reads for the selected character and visible cards. */
-export function createWardrobeUsageReader(theme: OSTheme, char: CharacterProfile | undefined, activeBubble: ChatTheme, icons: Record<string,string>, normalizeAsset?: (value:string)=>Promise<string>): WardrobeUsageReader {
+export function createWardrobeUsageReader(theme: OSTheme, char: CharacterProfile | undefined, activeBubble: ChatTheme, icons: Record<string,string>, normalizeAsset?: (value:string)=>Promise<string>, collaborationAppearance?:CollaborationAppearance): WardrobeUsageReader {
  const strings = new Map<string,Promise<string>>();
  const normalizeString = (value:string):Promise<string> => {
   if (!strings.has(value)) strings.set(value,(async()=>{
@@ -47,6 +49,7 @@ export function createWardrobeUsageReader(theme: OSTheme, char: CharacterProfile
   sound:sound(resolveActiveSound(char?.chromeCustomCss,char?.chatSound,effective.chatChromeCustomCss,theme.chatSound)),
   css:[effective.chatChromeCustomCss,char?.chromeCustomCss].filter(Boolean).join('\n'),
   psyche:psyche(resolvePsycheAppearance(theme,char)),date:app(char?.dateAppearance,'none'),story:app(theme.storyAppearance,'none'),
+  ...(collaborationAppearance?{collaboration:validateCollaborationAppearance(collaborationAppearance)}:{}),
   schedule:app(theme.scheduleCardAppearance,'original'),journal:app(theme.journalAppearance,'original'),
  };
  const results=new WeakMap<object,Promise<WardrobeUsage>>();
@@ -57,6 +60,7 @@ export function createWardrobeUsageReader(theme: OSTheme, char: CharacterProfile
    for(const [key,value] of Object.entries(pack.parts)){
     if(!(key in current))continue;
     let expected:any=value,actual=current[key];
+    if(key==='collaboration'){expected=validateCollaborationAppearance(value);expected={...expected,customCss:css(expected.customCss)};actual={...actual,customCss:css(actual.customCss)};}
     if(key==='layout')expected={...LAYOUT_DEFAULTS,...value as object};
     if(key==='bubbles')expected=bubble(value);
     if(key==='sound')expected=sound(value);
@@ -66,7 +70,7 @@ export function createWardrobeUsageReader(theme: OSTheme, char: CharacterProfile
      const source=String(value||'');
      const blocks=[...source.matchAll(/\/\* sully-composer:(avatar|background) \*\/\n?([\s\S]*?)\/\* end-sully-composer:\1 \*\//g)];
      if(blocks.length&&!source.replace(workshopBlock('avatar'),'').replace(workshopBlock('background'),'').trim()){
-      for(const block of blocks){const installed=[...String(actual).matchAll(workshopBlock(block[1] as 'avatar'|'background'))].map(m=>m[1]).join('\n');matches.push(await equal(css(block[2]),css(installed)));}
+      for(const block of blocks){const installed=[...String(actual).matchAll(workshopBlock(block[1] as 'avatar'|'background'))].map(m=>m[1]).join('\n');matches.push(await equal(targetAvatarFrameCss(css(block[2]),'both').trim(),targetAvatarFrameCss(css(installed),'both').trim()));}
       continue;
      }
      expected=css(source);actual=css(actual);
