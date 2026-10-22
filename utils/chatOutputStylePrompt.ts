@@ -10,6 +10,8 @@ export function buildChatOutputStylePrompt(input: {
     htmlMode?: { enabled: boolean; customPrompt?: string };
     thinkingChain?: { enabled: boolean; customPrompt?: string };
     sarEnvelopeActive?: boolean;
+    /** 项目自带的那篇思考引导是否注入。缺失即视为开启，保持旧数据行为不变。 */
+    thinkingChainPromptEnabled?: boolean;
 }) {
     const { translationConfig, htmlMode, thinkingChain, sarEnvelopeActive } = input;
     const char = { name: input.charName };
@@ -57,7 +59,20 @@ export function buildChatOutputStylePrompt(input: {
     const thinkingActive = !!thinkingChain?.enabled;
     if (thinkingActive) {
         const userName = (userProfile?.name && userProfile.name.trim()) || '用户';
-        prompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
+        // 【临时诊断，确认后删除】把真实运行时读到的开关值挂到 window 上，
+        // 供「本次发送统计」显示，用来区分「值传丢了」与「判断没走到」。
+        try {
+            (globalThis as any).__sullyThinkingToggleProbe = {
+                received: input.thinkingChainPromptEnabled,
+                receivedType: typeof input.thinkingChainPromptEnabled,
+                willInject: input.thinkingChainPromptEnabled !== false,
+                at: new Date().toISOString(),
+            };
+        } catch { /* 诊断用，失败不影响发送 */ }
+        // 项目自带的那篇引导可以单独关掉（心象面板里的子开关），只留用户自己写的要求。
+        if (input.thinkingChainPromptEnabled !== false) {
+            prompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
+        }
         const extra = (thinkingChain?.customPrompt || '').trim();
         if (extra) {
             prompt += `\n\n## 用户对内心独白的额外要求\n${extra}`;

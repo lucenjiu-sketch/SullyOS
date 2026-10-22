@@ -392,11 +392,24 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         ? ContextBuilder.buildSARModuleContext(char, userProfile, input.appPrompt ? 'home' : 'chat')
         : '';
     const sarEnvelopeActive = sarModulePlan?.requiresEnvelope === true;
-
+    // 【临时诊断，确认后删除】记录调用方这一侧的原始角色字段，
+    // 与函数内侧的接收值对照，定位是「角色数据里就没有」还是「传递途中丢了」。
+    try {
+        (globalThis as any).__sullyThinkingToggleCaller = {
+            fromChar: char.thinkingChainPromptEnabled,
+            fromCharType: typeof char.thinkingChainPromptEnabled,
+            fromInputChar: (input.char as any)?.thinkingChainPromptEnabled,
+            hasOwnKey: Object.prototype.hasOwnProperty.call(char, 'thinkingChainPromptEnabled'),
+            charName: char.name,
+            appPrompt: !!input.appPrompt,
+            thinkingEnabled: !!thinkingChain?.enabled,
+        };
+    } catch { /* 诊断用，失败不影响发送 */ }
     const { prompt: outputStylePrompt, bilingualActive, htmlActive, thinkingActive } = buildChatOutputStylePrompt({
         charName: char.name,
         userName: userProfile?.name,
         ...(!input.appPrompt ? { translationConfig, htmlMode, thinkingChain, sarEnvelopeActive } : {}),
+        thinkingChainPromptEnabled: char.thinkingChainPromptEnabled,
     });
     systemPrompt += outputStylePrompt;
 
