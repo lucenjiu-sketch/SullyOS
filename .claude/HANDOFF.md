@@ -54,6 +54,44 @@
 然后 `git checkout upstream/master -- <文件>` 取上游原版，只把她那几行加回去。
 结果应该是「几乎等于上游版本」。CallApp.tsx 最后相对上游只差 4 行。
 
+**8. 她说「开关没反应」时，先排缓存，再查代码。**
+2026-10-22 补的，这条排在最前面做，因为它最便宜。
+
+这个项目有 Service Worker（构建末尾那行
+`Static cache: 19 shell files / 1191 versioned resources` 就是它）。
+手机浏览器会把 JS 存在本地，**换预览链接也躲不开**——两个域名共用同一个注册。
+结果是：Vercel 显示 Ready、你点新链接进去，跑的仍可能是上一版代码。
+
+那次我因此判断「合并引入了回归」，连查三轮代码、一路读到协同和云端通道，
+全程方向错的。真相是开关从合并完就是好的；我推诊断代码那次顺手改了文件名
+（main-CiMP0sdh.js → main-7bpaQ9l4.js），缓存失效、她才下载到真的新版本。
+不是我修好的，是我把她的缓存撞掉了。
+
+所以她报「开关没反应」时，第一句先问：
+**页面彻底关掉重开过吗？**（关标签页，不是切后台）
+在她确认之前，不要开始读代码，更不要改代码。
+
+**9. 删临时代码不要用 git revert。**
+同一天的第二个教训，比第一个更险。
+
+我加诊断时在同一个位置既插了日志、又碰了功能代码（那行 `if` 判断），
+两样进了同一个提交。`git revert` 把整块撤掉——开关的判断跟着没了。
+构建照样通过，测试抓到了（2 条失败），我才发现。
+
+要是当时只看构建成功就推给她，她会在我说「已经修好了」之后，
+再一次真机发现开关坏掉。这正是第 6 条那句话的另一种死法。
+
+所以：
+- 临时诊断代码单独提交，不要和功能改动混在一起
+- 删它用 edit_file 手工删，删完 `grep` 确认，再跑一次相关测试
+- revert 之后必须跑测试，不能只跑构建
+
+**10. 加诊断前先确认那段代码真的在跑。**
+我第一次把日志加进 `apiCallLog.ts` 的 `formatCaptureAsText`，
+推上去了才发现——那个函数全项目没有任何调用方，是死代码。
+她白等了一次部署。加之前 grep 一下谁在用。
+
+
 **另外：规矩只写在这份文件里。**
 作者的 `CLAUDE.md` / `AGENTS.md` 一个字都不要碰——她明确要求过，
 我们的东西全部收在 `.claude/` 里。碰了就是给以后的同步添冲突。
@@ -201,10 +239,87 @@ git diff --name-only origin/master HEAD
 ```
 两边有交集 = 有冲突，逐文件看；无交集 = 安全，直接 merge。
 
-## ✅ 上游同步已完成（2026-10-12）
+## ✅ 上游同步已完成（2026-10-22）
 
-master 到 `b9eeb9d6`，PR #3 已合并。上游 33 个提交全部合进来了，
-六个开关保留，线上生效。这一节记的是最终形态，前面那些方案都作废了。
+分支 `sync/upstream-20261022`，PR #5。上游 30 个提交 256 个文件，
+真冲突只有 1 个文件。六个开关保留，她真机验过了。
+
+### 这次冲突长什么样
+
+| 文件 | 冲突性质 | 怎么解 |
+|---|---|---|
+| `utils/chatRequestPayload.ts` | 上游把三段提示词抽成新函数搬走了 | 取上游原版，开关判断加进新函数 |
+
+上游新建了 `utils/chatOutputStylePrompt.ts`，把双语 / HTML 卡片 / 思考链
+这三段从 `chatRequestPayload.ts` 里搬进去，开关判断原来就在那块代码里。
+
+解法：`git checkout upstream/master -- utils/chatRequestPayload.ts`，
+然后给新函数加一个可选参数 `thinkingChainPromptEnabled`，
+两个调用方（`chatRequestPayload.ts` / `activeMsgClient.ts`）各传一行。
+结果 `chatRequestPayload.ts` 相对上游**零差异**。
+
+顺带修好一处旧漏：定时主动消息以前走另一套装配，这个开关管不到，
+现在两边共用同一个函数，开关对两条路都生效。
+
+### 已知失败的测试（不是回归，别去修）
+
+`utils/rpPromptToggles.test.ts` 的「五块全关后功能协议完整保留」会失败，
+断言 `[[RECALL:` 应该在提示词里，但它不在。
+
+**合并前就是失败的**——我用 `git worktree add /tmp/x 8ef9e3e9` 在合并前
+的版本上跑过同一个测试，一样红。上游早先给那段加了
+`char.hideMonthlyRecallPrompt === false` 条件，测试断言没跟上。
+
+下次看到它红，别慌，也别改。想确认就再 worktree 跑一次对照。
+
+### 依赖要装一次
+
+上游把 `@rei-standard/amsg-client` 升到 `2.10.0-next.0`，本地 node_modules
+还是旧的，不装 `npx vite build` 会直接失败（报 `classifyClientStateWrite`
+is not exported）。那不是代码问题。
+
+```bash
+cd ~/push && timeout 900 npx pnpm install --frozen-lockfile 2>&1 | tail -20
+```
+
+最后会报一个 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`（amsg-server 发布
+不满 24 小时被策略拦下）。**不影响**，需要的包已经装进去了，构建能跑。
+Vercel 那边自己按 lock 装，不受这个影响。
+
+另外 `npx tsc --noEmit` 在这个环境会 OOM（堆内存不够），跑不完是正常的，
+别当成代码错误。验证一律用 `npx vite build`。
+
+### 下次同步上游的流程
+
+```bash
+cd ~/push
+GIT_TERMINAL_PROMPT=0 timeout 240 git --no-pager fetch upstream master 2>&1 | tail -20
+GIT_TERMINAL_PROMPT=0 timeout 240 git --no-pager fetch origin master 2>&1 | tail -5
+
+# 注意：本地 master 分支可能是旧的！以 origin/master 的 FETCH_HEAD 为基点开分支
+git log --oneline -1 FETCH_HEAD
+git checkout -b sync/upstream-<日期> <那个 sha>
+
+# 先预检，不落地
+git merge-tree --write-tree <基点> upstream/master | grep CONFLICT
+
+git merge upstream/master
+# 冲突按第 7 条处理：取上游原版，只加回她那几行
+
+timeout 900 npx pnpm install --frozen-lockfile 2>&1 | tail -5   # 上游升依赖时要
+timeout 600 npx vite build 2>&1 | tail -4                        # 必跑，约 1 分 35 秒
+npx vitest run utils/thinkingChainPromptToggle.test.ts utils/promptToggleBackupCompat.test.ts utils/rpPromptToggles.test.ts
+
+git push -u origin sync/upstream-<日期>
+# 她真机测（提醒她关页面重开，见第 8 条）→ 她说可以 → 开 PR → 等她点头才合 master
+```
+
+**本地 master 不等于线上 master。** 这次本地 master 停在 `d9607d14`，
+而线上实际是 `8ef9e3e9`。开分支前先 fetch origin 确认，别从本地 master 开。
+
+## 上一次同步（2026-10-12，已归档）
+
+master 到 `b9eeb9d6`，PR #3。上游 33 个提交 299 个文件，冲突 3 个。
 
 ### 开关现在是怎么实现的（主分支这套是好的，别重构）
 
@@ -216,7 +331,9 @@ master 到 `b9eeb9d6`，PR #3 已合并。上游 33 个提交全部合进来了�
 - `utils/characterCard.ts` —— 六个字段进 `CARD_STRIPPED_FIELDS`，不随角色卡分享
   （久确认过：导出角色卡时按默认全开就行）
 - `apps/Chat.tsx` / `components/chat/ChatModals.tsx` —— UI 接线
-- `apps/CallApp.tsx` —— 只有思考引导那一处判断（相对上游仅 4 行）
+- `apps/CallApp.tsx` —— 语音通话那一处判断
+- `features/collaboration/context.ts` —— 协同窗口那一处判断
+- `utils/chatOutputStylePrompt.ts` —— 聊天与定时主动消息共用（2026-10-22 迁来）
 
 **这套写法本身是对的**：判断和文案在同一个文件里，开关要么生效要么编译报错，
 不会静默失效。作者改文案时 git 能正常合并。
@@ -233,19 +350,7 @@ master 到 `b9eeb9d6`，PR #3 已合并。上游 33 个提交全部合进来了�
 
 那个分支还在远端，没删。别去修它，也别参考它的思路。
 
-### 这次合并的冲突长什么样（下次同步可以照着看）
-
-33 个提交 299 个文件，只冲突 3 个：
-
-| 文件 | 冲突性质 | 怎么解 |
-|---|---|---|
-| `components/chat/ChatModals.tsx` | 两边各加一行 import | 都保留 |
-| `utils/characterCard.ts` | 两边各往剥离列表加字段 | 都保留 |
-| `apps/CallApp.tsx` | 上游重构了整个函数 | 取上游原版，只加回那 4 行 |
-
-前两个是纯加行，第三个要按上面「第 7 条」的做法处理。
-
-### 上游这次带进来的新东西（久问过，不是 bug）
+### 上游带进来的新东西（久问过，不是 bug）
 
 **语音同步字幕条**（`components/voice/StreamingVoiceBar.tsx`）：
 ElevenLabs 流式朗读时在聊天区上方出一个绿框条，边播边把台词逐字点亮
@@ -257,20 +362,6 @@ ElevenLabs 流式朗读时在聊天区上方出一个绿框条，边播边把台
 
 她要是想关：建议换 TTS 服务商，不建议改代码——改 Chat.tsx:4148 那一行能藏掉，
 但那是在上游文件里多加一个改动点。她当时选了先放着用。
-
-### 下次同步上游的流程
-
-```bash
-cd ~/push
-GIT_TERMINAL_PROMPT=0 timeout 240 git --no-pager fetch upstream master 2>&1 | tail -20
-git merge upstream/master
-# 有冲突：按上面那张表的性质分别处理
-timeout 400 npx vite build 2>&1 | tail -8     # 必跑，约 1 分 40 秒
-git push origin <分支>
-# 她真机测 → 她说可以 → 开 PR 合 master
-```
-
-不要直接在 master 上合完就推。先推分支让她测，合 master 要她点头。
 
 ## Vercel 流程（她会问）
 
