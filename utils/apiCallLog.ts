@@ -159,6 +159,46 @@ export interface ApiRequestCapture {
     messageCount: number;
     binaryPlaceholders: number;
     sections: ApiRequestCaptureSection[];
+    /** 同一次调用的响应侧原文；响应回来后回填，旧记录没有这一档。 */
+    response?: ApiResponseCapture;
+}
+
+/**
+ * 同一次抓包的响应侧。请求侧只能证明「我们发了什么」，排查「模型到底回了什么」
+ * （空正文 / 思考链被吞 / 工具调用没下来 / 被换了后端）必须看响应原文。
+ *
+ * 取的是全局 fetch 拦截器 clone 出来的**原始响应文本**，不是上层拼装后的对象——
+ * 拼装环节自己出错时，拼装后的结果看不出问题所在。
+ * 只跟着一次性抓包走，永远只有一条，新的覆盖旧的。
+ */
+export interface ApiResponseCapture {
+    capturedAt: number;
+    ok: boolean;
+    status?: number;
+    durationMs?: number;
+    /** 响应体形态：整包 JSON / SSE 流 / 两者都不是（HTML 错误页等） */
+    shape: 'json' | 'sse' | 'other';
+    /** 原始响应文本，超长时截断（truncated 标记） */
+    rawText: string;
+    /** 截断前的真实字符数 */
+    rawChars: number;
+    truncated: boolean;
+    /** 从响应里拼出的正文（SSE 分片已按顺序接好），超长时截断 */
+    content: string;
+    contentChars: number;
+    contentTruncated: boolean;
+    /** 思考链正文（reasoning_content / reasoning / thinking 三种方言都收） */
+    reasoning: string;
+    reasoningChars: number;
+    reasoningTruncated: boolean;
+    /** 本次响应里出现过的工具调用函数名；空数组 = 模型没要求调工具 */
+    toolCallNames: string[];
+    finishReason?: string;
+    /** 响应自报的模型（实际服务这次请求的后端身份） */
+    backendModel?: string;
+    usage?: unknown;
+    /** SSE 流里 delta 实际出现过的字段名，排查「思考链去哪了」直接看这个名单 */
+    deltaKeys: string[];
 }
 
 export const API_REQUEST_CAPTURE_EVENT = 'sully-api-request-capture-change';
@@ -336,6 +376,159 @@ export function scanSseForLog(text: string): { model?: string; usage?: unknown }
         if (chunk?.usage && typeof chunk.usage === 'object') usage = chunk.usage;
     }
     return { model, usage };
+}
+
+// ── 响应原文抓包（一次性，跟着请求侧抓包走） ──────────────────────────
+
+/** 单段文本上限。响应原文整包落库很容易撞 IndexedDB 配额，超了截断并标注。 */
+const RESPONSE_CAPTURE_TEXT_LIMIT = 200_000;
+
+function clampCaptureText(text: string, limit = RESPONSE_CAPTURE_TEXT_LIMIT): {
+    text: string;
+    chars: number;
+    truncated: boolean;
+} {
+    const chars = text.length;
+    if (chars <= limit) return { text, chars, truncated: false };
+    return {
+        text: `${text.slice(0, limit)}\n\n…（后续 ${(chars - limit).toLocaleString('en-US')} 字符未保存）`,
+        chars,
+        truncated: true,
+    };
+}
+
+/** 从一个 message / delta 对象里取思考链文本。三种方言都认，口径同 SseAssembler。 */
+function pickReasoningText(node: any): string {
+    const direct = node?.reasoning_content ?? node?.reasoning ?? node?.thinking;
+    if (typeof direct === 'string') return direct;
+    // Anthropic 透传形态：content 是分块数组，thinking 混在里面
+    if (Array.isArray(node?.content)) {
+        return node.content
+            .map((block: any) => (block?.type === 'thinking' && typeof block.thinking === 'string' ? block.thinking : ''))
+            .filter(Boolean)
+            .join('');
+    }
+    return '';
+}
+
+/** 从一个 message / delta 对象里取正文。字符串与分块数组两种形态都认。 */
+function pickContentText(node: any): string {
+    const c = node?.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) {
+        return c
+            .map((block: any) => {
+                if (typeof block === 'string') return block;
+                if (block?.type === 'text' && typeof block.text === 'string') return block.text;
+                return '';
+            })
+            .filter(Boolean)
+            .join('');
+    }
+    return '';
+}
+
+/**
+ * 把一次响应的原始文本解析成可读的抓包结构。
+ *
+ * 整包 JSON 与 SSE 两条路都走这里，判定只看文本本身，不依赖调用方是否开了流式——
+ * 「代理无视 stream 参数」是这个项目反复撞到的情况，按参数猜会猜错。
+ * 解析只为展示，任何异常都退化成「原文照存」，绝不让抓包影响主链路。
+ */
+export function buildApiResponseCapture(input: {
+    rawText: string;
+    ok: boolean;
+    status?: number;
+    durationMs?: number;
+}): ApiResponseCapture {
+    const rawText = typeof input.rawText === 'string' ? input.rawText : '';
+    const raw = clampCaptureText(rawText);
+    const base: ApiResponseCapture = {
+        capturedAt: Date.now(),
+        ok: input.ok,
+        status: input.status,
+        durationMs: input.durationMs,
+        shape: 'other',
+        rawText: raw.text,
+        rawChars: raw.chars,
+        truncated: raw.truncated,
+        content: '',
+        contentChars: 0,
+        contentTruncated: false,
+        reasoning: '',
+        reasoningChars: 0,
+        reasoningTruncated: false,
+        toolCallNames: [],
+        deltaKeys: [],
+    };
+
+    let content = '';
+    let reasoning = '';
+    const toolCallNames: string[] = [];
+    const deltaKeys = new Set<string>();
+
+    try {
+        const trimmed = rawText.trimStart();
+        if (trimmed.startsWith('data:')) {
+            base.shape = 'sse';
+            for (const line of rawText.split(/\r?\n/)) {
+                if (!line.startsWith('data:')) continue;
+                const payload = line.slice(5).trim();
+                if (!payload || payload === '[DONE]') continue;
+                let chunk: any;
+                try { chunk = JSON.parse(payload); } catch { continue; }
+                if (!base.backendModel && typeof chunk?.model === 'string' && chunk.model) base.backendModel = chunk.model;
+                if (chunk?.usage && typeof chunk.usage === 'object') base.usage = chunk.usage;
+                const choice = chunk?.choices?.[0];
+                if (!choice) continue;
+                const node = choice.delta || choice.message;
+                if (choice.delta) for (const key of Object.keys(choice.delta)) deltaKeys.add(key);
+                if (node) {
+                    content += pickContentText(node);
+                    reasoning += pickReasoningText(node);
+                    if (Array.isArray(node.tool_calls)) {
+                        for (const frag of node.tool_calls) {
+                            const name = frag?.function?.name;
+                            if (typeof name === 'string' && name && !toolCallNames.includes(name)) toolCallNames.push(name);
+                        }
+                    }
+                }
+                if (choice.finish_reason) base.finishReason = choice.finish_reason;
+            }
+        } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            const parsed = JSON.parse(rawText);
+            base.shape = 'json';
+            if (typeof parsed?.model === 'string' && parsed.model) base.backendModel = parsed.model;
+            if (parsed?.usage && typeof parsed.usage === 'object') base.usage = parsed.usage;
+            const choice = parsed?.choices?.[0];
+            const node = choice?.message || choice?.delta;
+            if (node) {
+                content = pickContentText(node);
+                reasoning = pickReasoningText(node);
+                if (Array.isArray(node.tool_calls)) {
+                    for (const frag of node.tool_calls) {
+                        const name = frag?.function?.name;
+                        if (typeof name === 'string' && name && !toolCallNames.includes(name)) toolCallNames.push(name);
+                    }
+                }
+            }
+            if (choice?.finish_reason) base.finishReason = choice.finish_reason;
+        }
+    } catch {
+        // 解析不了就只留原文：原文本身才是排查依据，解析结果是附加便利。
+    }
+
+    const contentClamped = clampCaptureText(content);
+    const reasoningClamped = clampCaptureText(reasoning);
+    base.content = contentClamped.text;
+    base.contentChars = contentClamped.chars;
+    base.contentTruncated = contentClamped.truncated;
+    base.reasoning = reasoningClamped.text;
+    base.reasoningChars = reasoningClamped.chars;
+    base.reasoningTruncated = reasoningClamped.truncated;
+    base.toolCallNames = toolCallNames;
+    base.deltaKeys = [...deltaKeys];
+    return base;
 }
 
 // ── 输入构成统计（promptBreakdown） ──────────────────────────────────────
@@ -856,6 +1049,50 @@ export function summarizeApiRequestCaptureDuplicates(
     };
 }
 
+/** 响应抓包渲染成 txt 片段；没抓到响应时说明原因，不留空白让人以为功能坏了。 */
+function formatApiResponseCaptureTxt(capture: ApiRequestCapture): string[] {
+    const fmt = (value: number) => value.toLocaleString('en-US');
+    const response = capture.response;
+    if (!response) {
+        return [
+            '===== 模型响应原文 =====',
+            capture.usageStatus === 'pending'
+                ? '响应还没回来（或这条是旧记录，抓取时还没有响应原文功能）。'
+                : '这次没有取到响应原文。可能是请求失败在网络层，或浏览器无法复制响应流。',
+            '',
+        ];
+    }
+    const shapeLabel = response.shape === 'sse'
+        ? '流式 SSE（逐片返回）'
+        : response.shape === 'json'
+            ? '整包 JSON'
+            : '既不是 JSON 也不是 SSE（多为中转的错误页）';
+    return [
+        '===== 模型响应原文 =====',
+        `HTTP 状态：${response.status ?? '—'}${response.ok ? '' : '（请求失败）'}`,
+        `响应形态：${shapeLabel}`,
+        `耗时：${response.durationMs != null ? `${fmt(response.durationMs)} ms` : '—'}`,
+        `响应自报模型：${response.backendModel || '—（响应里没有 model 字段）'}`,
+        `正文长度：${fmt(response.contentChars)} 字符${response.contentChars === 0 ? '  ← 正文为空' : ''}`,
+        `思考链长度：${fmt(response.reasoningChars)} 字符${response.reasoningChars === 0 ? '  ← 没有思考链内容' : ''}`,
+        `工具调用：${response.toolCallNames.length ? response.toolCallNames.join(', ') : '无'}`,
+        `结束原因（finish_reason）：${response.finishReason || '—'}`,
+        `usage：${response.usage ? JSON.stringify(response.usage) : '接口未返回'}`,
+        response.deltaKeys.length ? `流里出现过的字段：${response.deltaKeys.join(', ')}` : '',
+        response.truncated ? `⚠ 原文超长已截断，完整长度 ${fmt(response.rawChars)} 字符` : '',
+        '',
+        '----- 响应正文（已接好分片） -----',
+        response.content || '（空）',
+        '',
+        '----- 响应思考链 -----',
+        response.reasoning || '（空）',
+        '',
+        '----- 完整响应原文（未经任何加工） -----',
+        response.rawText || '（空）',
+        '',
+    ].filter(line => line !== '');
+}
+
 /** 生成适合用户直接发给开发者排查的可读 TXT；不额外落库，只在复制/下载时即时拼装。 */
 export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
     const fmt = (value: number) => value.toLocaleString('en-US');
@@ -898,6 +1135,9 @@ export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
         `角色：${capture.meta.charName || '—'}`,
         `API：${capture.presetName || capture.baseUrl || '—'}`,
         `模型：${capture.model || '—'}`,
+        capture.response?.backendModel && !isSameCoreModel(capture.model, capture.response.backendModel)
+            ? `⚠ 响应自报模型与请求不一致：${capture.response.backendModel}`
+            : '',
         `输入 Token（模型响应自报）：${capture.promptTokens != null ? fmt(capture.promptTokens) : capture.usageStatus === 'pending' ? '等待响应' : capture.usageStatus === 'failed' ? '请求失败，无法取得' : '接口未返回 usage'}`,
         `输出 Token：${capture.completionTokens != null ? fmt(capture.completionTokens) : '—'}`,
         `总 Token：${capture.totalTokens != null ? fmt(capture.totalTokens) : '—'}`,
@@ -922,6 +1162,7 @@ export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
         '===== 完整原始请求 JSON =====',
         JSON.stringify(capture.payload, null, 2),
         '',
+        ...formatApiResponseCaptureTxt(capture),
         '提示：内容可能包含聊天、记忆和角色隐私，分享前请检查。',
     ].join('\n');
 }
@@ -946,12 +1187,16 @@ export function captureApiRequestOnce(input: { url: string; body?: unknown; meta
     }
 }
 
-/** 响应完整读完后，把同一次请求的真实 usage 回填到一次性抓包。 */
+/** 响应完整读完后，把同一次请求的真实 usage 与响应原文回填到一次性抓包。 */
 export function updateApiRequestCaptureUsage(input: {
     captureId: string | null;
     ok: boolean;
     response?: unknown;
     responseText?: string;
+    /** 原始响应文本（拦截器 clone 读出的那份），有就连带存下响应原文抓包。 */
+    rawResponseText?: string;
+    status?: number;
+    durationMs?: number;
 }): void {
     if (!input.captureId) return;
     try {
@@ -967,6 +1212,25 @@ export function updateApiRequestCaptureUsage(input: {
             totalTokens: usage.total,
             usageStatus: !input.ok ? 'failed' : usage.prompt != null ? 'reported' : 'not-reported',
         };
+        // 响应原文：优先用拦截器读到的原始文本，没有就退回已解析对象重新序列化。
+        // 响应侧抓包失败不能连带把 usage 回填也拖掉，所以单独 try。
+        try {
+            const rawText = typeof input.rawResponseText === 'string'
+                ? input.rawResponseText
+                : input.response !== undefined
+                    ? JSON.stringify(input.response)
+                    : typeof input.responseText === 'string'
+                        ? input.responseText
+                        : undefined;
+            if (rawText != null) {
+                patch.response = buildApiResponseCapture({
+                    rawText,
+                    ok: input.ok,
+                    status: input.status,
+                    durationMs: input.durationMs,
+                });
+            }
+        } catch { /* 响应原文可选，失败就只回填 usage */ }
         const pending = captureSaveInFlight?.id === input.captureId
             ? captureSaveInFlight.promise.catch(() => {})
             : Promise.resolve();
