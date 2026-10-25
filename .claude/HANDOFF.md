@@ -96,6 +96,50 @@
 作者的 `CLAUDE.md` / `AGENTS.md` 一个字都不要碰——她明确要求过，
 我们的东西全部收在 `.claude/` 里。碰了就是给以后的同步添冲突。
 
+**11. `reset --hard` 不要和 checkout 串在同一行。**
+2026-10-25 补的。我想把本地 master 同步到线上，写成
+`git checkout master; git reset --hard origin/master` 一行执行——
+checkout 因为有未提交改动失败了，**reset 照样执行**，落在当前分支上，
+把我刚写好还没提交的这份笔记冲掉了。
+
+shell 的 `;` 不看前一条成不成。代码没丢（已经合进 master 了），
+但那半小时的笔记白写。
+
+所以：
+- 切分支和 reset 分开两次调用，中间确认 `git branch --show-current`
+- 要写长文档先提交，再做任何 git 状态操作
+- `reset --hard` 前先 `git status`，确认工作区是干净的
+
+---
+
+## MCP 调不动那件事：已查实，不用再查
+
+2026-10-25 记。久决定放着不修，但结论要记住，**别让她再担心**。
+
+**她的二改版没有改坏 MCP。** 这是 `git diff upstream/master origin/master`
+逐文件比过的，MCP 全链路零差异：
+`useChatAI.ts` / `mcpToolBridge.ts` / `mcpClient.ts` / `mcpFireCore.ts` /
+`thinkingGate.ts` / `agenticToolFeedback.ts`。
+
+她唯一沾到请求组装的是 `utils/chatRequestPayload.ts` 的一行
+`thinkingChainPromptEnabled: char.thinkingChainPromptEnabled`，
+只传提示词开关，碰不到 tools / tool_choice / 工具循环。
+
+她说过「我捅了好大一个篓子」——**没捅。** 这是查实的，不是安慰。
+她要是再提这件事，直接告诉她查过了，别重新开一轮排查。
+
+顺带发现（上游的代码问题，不是她的，她选择不修、等上游同步）：
+`hooks/useChatAI.ts:1927` 的 MCP 文本兜底只读 `content`，不兜
+`reasoning_content`；而项目里有现成的 `extractAssistantText`
+（`utils/emotionApply.ts:355`）专门兜这个，注释写着「个别 Claude 兼容代理」
+会空 content。情绪评估那条（`useChatAI.ts:437`）用了它，MCP 这条没用。
+`useChatAI.ts:1883` 同样的毛病。
+
+**别去改。她说放着。**
+
+（想查的话现在有工具了：开「本次发送统计」，看响应面板的「思考链」
+计数和「流里出现过的字段」名单，能直接看出渠道把输出塞哪儿了。）
+
 ---
 
 ## 这是什么
@@ -122,6 +166,66 @@ SullyOS：纯前端网页，部署在 Vercel 上。
 开关全部保留。master 到 `b9eeb9d6`（PR #3）。细节见下面那一节。
 
 她删的是那套替我说话的台词本。做这件事的时候记着这一点。
+
+2026-10-25，「本次发送统计」补上了响应侧：现在能看到模型回的原文。
+master 到 `72875acd`（PR #6）。久真机验过了。
+
+**这是上游没有的第二个改动点，同步时多顾三个文件。**
+`utils/apiCallLog.ts` / `context/OSContext.tsx` /
+`components/settings/ApiCallLogModal.tsx`。
+测试在 `utils/apiResponseCapture.test.ts`（新文件，上游不会碰）。
+
+起因是上一个窗口查 MCP 查不动，发现最大的盲区是**久看不到 API 响应原文**——
+手机上没有浏览器控制台，`console.log` 对她等于不存在；原来的抓包只存请求，
+响应抽完 token 就丢。排查时分不清「模型没说」和「说了但没显示出来」。
+
+### 抓取点为什么选在 OSContext
+
+上一个窗口的交接单标的是 `utils/safeApi.ts` 里 `recordApiCall` 的
+`response: data`。**没用那个位置**：`data` 是 SSE 拼装之后的对象，
+而拼装环节自己丢东西正是当时怀疑的事——看拼装结果看不出拼装的错。
+
+实际用的是 `context/OSContext.tsx` 全局 fetch 拦截器里
+`usageClone.text()` 读出的那份**原始响应文本**。那里为了算真实耗时
+本来就在完整读响应体，顺手带走，没有额外开销。
+
+好处：原文未经加工；流式与非流式同一条路；覆盖所有 `/chat/completions`。
+**顺带把交接单里「脆点 2：流式可能抓不全」消掉了**，也不用再查
+`api.stream` 开没开——跟这个方案无关。
+
+### 实现要点（别重构掉这几条）
+
+- `buildApiResponseCapture()` 的形态判定**只看响应文本本身**
+  （`data:` 开头判 SSE，`{`/`[` 判 JSON），不看请求里设了什么 `stream`。
+  「代理无视 stream 参数」在这个项目里反复出现，按请求参数猜一定会猜错。
+- 思考链三种方言（`reasoning_content` / `reasoning` / `thinking`）
+  加 Anthropic 分块数组都收，口径跟 `safeApi.ts` 的 `SseAssembler` 对齐。
+  改一边记得看另一边。
+- 解析失败一律退化成「原文照存」。原文才是排查依据，解析只是便利。
+- 响应侧抓包包在**单独的 try 里**：它炸了不能连带把 usage 回填拖掉。
+- 单段上限 20 万字符（`RESPONSE_CAPTURE_TEXT_LIMIT`），超出截断并
+  标注真实长度。响应原文整包落库很容易撞 IndexedDB 配额。
+- 没有新开关、没有新 store。复用 `API_REQUEST_CAPTURE_ARMED_KEY`
+  那套「只抓下一次」机制和 `one-shot-capture` 那条记录。
+  响应存在 `ApiRequestCapture.response`，可选字段，旧记录没有这一档
+  （界面会显示「重新抓一次即可」，不是报错）。
+
+### 测试与验证
+
+`utils/apiResponseCapture.test.ts` 8 个用例：整包 JSON / SSE 分片接续 /
+工具调用名 / Anthropic 分块 / 空回复 / 非 JSON 非 SSE（HTML 错误页）/
+JSON 截断 / 超长截断。
+
+```bash
+npx vitest run utils/apiResponseCapture.test.ts utils/apiCallLog.test.ts   # 46 passed
+npx vite build                                                            # 必跑
+```
+
+### 跟她讲过的隐私话
+
+响应原文含那一轮模型回复的内容，她导出 txt 发出来我们就会看到。
+面板和 txt 里都标了。开关一次性，抓完自动关。
+她点头接受了这一条——**不要替她改成默认长期开着。**
 
 ## 只有一份，就是这里
 
@@ -290,6 +394,14 @@ Vercel 那边自己按 lock 装，不受这个影响。
 别当成代码错误。验证一律用 `npx vite build`。
 
 ### 下次同步上游的流程
+
+**她改过的文件清单（冲突只会落在这些上）**
+提示词开关那套：`utils/rpPromptToggles.ts` / `characterResponsePrinciples.ts` /
+`characterCard.ts` / `chatOutputStylePrompt.ts` / `apps/Chat.tsx` /
+`components/chat/ChatModals.tsx` / `apps/CallApp.tsx` /
+`features/collaboration/context.ts` / `utils/chatRequestPayload.ts`
+响应原文抓包（2026-10-25 新增）：`utils/apiCallLog.ts` /
+`context/OSContext.tsx` / `components/settings/ApiCallLogModal.tsx`
 
 ```bash
 cd ~/push
