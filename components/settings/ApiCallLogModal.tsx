@@ -520,7 +520,7 @@ const OneShotCapturePanel: React.FC<{
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[9px] font-semibold text-slate-400">一次后自动关闭</span>
                     </div>
                     <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-                        开启后，完整记录下一次发给 LLM 的内容，用来查是哪段记忆、提示词或历史撑大了上下文。
+                        开启后，完整记录下一次发给 LLM 的内容和它回来的响应原文，用来查上下文被谁撑大、以及模型到底回了什么。
                     </p>
                 </div>
                 <button
@@ -593,7 +593,7 @@ const OneShotCapturePanel: React.FC<{
                         )}
 
                         <p className="mt-2 text-[10px] leading-relaxed text-amber-700/80">
-                            内容仅保存在本机，可能含聊天和记忆隐私。发给别人排查前请先检查。
+                            内容仅保存在本机，包含这一轮的提示词和模型回复原文，可能含聊天和记忆隐私。发给别人排查前请先检查。
                             {capture.binaryPlaceholders > 0 && ` ${capture.binaryPlaceholders} 个图片/音频二进制只保留了类型和原始长度。`}
                         </p>
 
@@ -707,6 +707,8 @@ const OneShotCapturePanel: React.FC<{
                             </div>
                         </div>
 
+                        <CaptureResponseView capture={capture} onCopy={copy} />
+
                         <div className="mt-3 flex items-center justify-between gap-3">
                             <span className="text-[10px] font-semibold text-primary">{copyNotice}</span>
                             <button type="button" onClick={onClear} className="ml-auto text-[10px] font-semibold text-rose-500">清除本次详情</button>
@@ -715,6 +717,144 @@ const OneShotCapturePanel: React.FC<{
                 )}
             </div>
         </section>
+    );
+};
+
+/**
+ * 响应侧面板：模型到底回了什么。
+ *
+ * 排在请求分区之后，默认收起几个大块——面板本身要能一眼回答
+ * 「正文是不是空的 / 思考链有没有来 / 工具调没调 / 是不是被换了后端」，
+ * 细看原文再展开。
+ */
+const CaptureResponseView: React.FC<{
+    capture: ApiRequestCapture;
+    onCopy: (value: string, notice: string) => void;
+}> = ({ capture, onCopy }) => {
+    const [openBlock, setOpenBlock] = useState<'content' | 'reasoning' | 'raw' | null>(null);
+    const response = capture.response;
+    const fmt = (n: number) => n.toLocaleString('en-US');
+
+    if (!response) {
+        return (
+            <div className="mt-4 border-t border-slate-200/70 pt-3">
+                <h4 className="text-[11px] font-bold text-slate-600">模型响应原文</h4>
+                <p className="mt-1 text-[10px] leading-relaxed text-slate-400">
+                    {capture.usageStatus === 'pending'
+                        ? '响应还没回来，稍后重新打开这个页面就能看到。'
+                        : '这次没有取到响应原文。如果这条抓包是更新前留下的，重新抓一次即可。'}
+                </p>
+            </div>
+        );
+    }
+
+    const shapeLabel = response.shape === 'sse'
+        ? '流式返回'
+        : response.shape === 'json'
+            ? '整包返回'
+            : '非标准响应';
+    const modelMismatch = !!response.backendModel && !isSameCoreModel(capture.model, response.backendModel);
+    const toggle = (block: 'content' | 'reasoning' | 'raw') =>
+        setOpenBlock(current => (current === block ? null : block));
+
+    const block = (
+        key: 'content' | 'reasoning' | 'raw',
+        badge: string,
+        badgeClass: string,
+        title: string,
+        body: string,
+        mono?: boolean,
+    ) => (
+        <div className="overflow-hidden rounded-xl border border-slate-200/70 bg-white/80">
+            <button
+                type="button"
+                onClick={() => toggle(key)}
+                className="flex w-full items-center gap-2 px-3 py-2 text-left"
+            >
+                <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[9px] font-semibold ${badgeClass}`}>{badge}</span>
+                <span className="min-w-0 flex-1 truncate text-[10px] text-slate-600">{title}</span>
+                <span className="shrink-0 text-[9px] text-slate-300">{openBlock === key ? '▲' : '▼'}</span>
+            </button>
+            {openBlock === key && (
+                <CaptureSectionContent
+                    content={body}
+                    mono={mono}
+                    onCopy={value => onCopy(value, '本区已复制')}
+                />
+            )}
+        </div>
+    );
+
+    return (
+        <div className="mt-4 border-t border-slate-200/70 pt-3">
+            <div className="mb-2">
+                <h4 className="text-[11px] font-bold text-slate-600">模型响应原文</h4>
+                <p className="mt-0.5 text-[9px] leading-relaxed text-slate-400">
+                    这一次模型实际回了什么。取的是未经加工的原始响应，用来分辨「模型没说」和「说了但没显示出来」。
+                </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[10px]">
+                <Field label="状态" value={response.ok ? `${response.status ?? 200} 成功` : `${response.status ?? '—'} 失败`} accent={!response.ok} />
+                <Field label="形态" value={shapeLabel} />
+                <Field label="耗时" value={response.durationMs != null ? `${fmt(response.durationMs)} ms` : '—'} />
+                <Field label="结束原因" value={response.finishReason || '—'} mono />
+                <div className="col-span-2">
+                    <Field
+                        label="自报模型"
+                        value={response.backendModel || '响应未带 model'}
+                        mono
+                        wrap
+                        accent={modelMismatch}
+                    />
+                </div>
+            </div>
+
+            {modelMismatch && (
+                <p className="mt-2 border-l-2 border-amber-400 py-1 pl-2.5 text-[9px] leading-relaxed text-amber-700">
+                    响应自报的模型和你请求的不是同一个，可能被中转换了后端。
+                </p>
+            )}
+
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+                <div className={`rounded-xl border px-2 py-2 ${response.contentChars === 0 ? 'border-rose-200 bg-rose-50/60' : 'border-slate-200/70 bg-white/70'}`}>
+                    <div className="text-[9px] font-semibold text-slate-400">正文</div>
+                    <div className={`mt-0.5 text-sm font-bold ${response.contentChars === 0 ? 'text-rose-600' : 'text-slate-700'}`}>
+                        {fmt(response.contentChars)}
+                    </div>
+                    <div className="text-[8px] text-slate-400">{response.contentChars === 0 ? '空回复' : '字符'}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200/70 bg-white/70 px-2 py-2">
+                    <div className="text-[9px] font-semibold text-slate-400">思考链</div>
+                    <div className="mt-0.5 text-sm font-bold text-slate-700">{fmt(response.reasoningChars)}</div>
+                    <div className="text-[8px] text-slate-400">{response.reasoningChars === 0 ? '没有' : '字符'}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200/70 bg-white/70 px-2 py-2">
+                    <div className="text-[9px] font-semibold text-slate-400">工具调用</div>
+                    <div className="mt-0.5 text-sm font-bold text-slate-700">{response.toolCallNames.length}</div>
+                    <div className="truncate text-[8px] text-slate-400" title={response.toolCallNames.join(', ')}>
+                        {response.toolCallNames.length ? response.toolCallNames.join(', ') : '无'}
+                    </div>
+                </div>
+            </div>
+
+            {response.deltaKeys.length > 0 && (
+                <p className="mt-2 break-words text-[9px] leading-relaxed text-slate-400">
+                    流里出现过的字段：<span className="font-mono">{response.deltaKeys.join(', ')}</span>
+                </p>
+            )}
+            {response.truncated && (
+                <p className="mt-2 text-[9px] leading-relaxed text-amber-700/80">
+                    原文过长已截断保存，完整长度 {fmt(response.rawChars)} 字符。
+                </p>
+            )}
+
+            <div className="mt-2.5 space-y-1.5">
+                {block('content', '正文', 'bg-emerald-50 text-emerald-600', '模型回复正文（分片已接好）', response.content || '（空）')}
+                {block('reasoning', '思考', 'bg-violet-50 text-violet-500', '思考链内容', response.reasoning || '（空）')}
+                {block('raw', '原始', 'bg-slate-800 text-white', '完整响应原文（未经加工）', response.rawText || '（空）', true)}
+            </div>
+        </div>
     );
 };
 

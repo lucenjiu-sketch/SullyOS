@@ -1297,16 +1297,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                           if (ok) recentSuccessfulFetches.set(requestComparisonKey, { timestamp: Date.now(), status });
                           let parsed: any = undefined;
                           try { parsed = JSON.parse(t); } catch { /* 流式/非 JSON：把原始文本交给 recordApiCall 的 SSE 兜底解析 */ }
-                          updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok, response: parsed, responseText: parsed === undefined ? t : undefined });
+                          updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok, response: parsed, responseText: parsed === undefined ? t : undefined, rawResponseText: t, status, durationMs });
                           recordApiCall({ requestId, url: urlStr, body, status, ok, response: parsed, responseText: parsed === undefined ? t : undefined, meta, durationMs });
                       }).catch(() => {
-                          updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok });
+                          updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok, status, durationMs: Date.now() - fetchStartedAt });
                           recordApiCall({ requestId, url: urlStr, body, status, ok, meta, durationMs: Date.now() - fetchStartedAt });
                       });
                   } else {
                       // clone 失败时，只有已经在上面完整拼装过的升级流才能确认正文收完。
                       if (ok && streamUpgraded) recentSuccessfulFetches.set(requestComparisonKey, { timestamp: Date.now(), status });
-                      updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok });
+                      updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok, status, durationMs: Date.now() - fetchStartedAt });
                       recordApiCall({ requestId, url: urlStr, body, status, ok, meta, durationMs: Date.now() - fetchStartedAt });
                   }
               }
