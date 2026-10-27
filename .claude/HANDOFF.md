@@ -161,6 +161,7 @@ SullyOS：纯前端网页，部署在 Vercel 上。
 六个开关：rpStyle / rpEmotion / rpListening / rpSelf / rpAntiFiller / thinkingChainPrompt
 字段可选，缺失即视为开启，旧数据导入行为不变。
 已合并进 master（PR #1，master 到 611efb4），线上生效。
+（2026-10-27 又加了第七个 rpOnlineState，见下面。）
 
 2026-10-12，跟上游同步了一次：33 个提交 299 个文件合进来，
 开关全部保留。master 到 `b9eeb9d6`（PR #3）。细节见下面那一节。
@@ -169,6 +170,17 @@ SullyOS：纯前端网页，部署在 Vercel 上。
 
 2026-10-25，「本次发送统计」补上了响应侧：现在能看到模型回的原文。
 master 到 `72875acd`（PR #6）。久真机验过了。
+
+2026-10-27，又多一个开关：**「线上聊天状态」**（`rpOnlineState`）。
+master 到 `d68efc23`（PR #7）。
+
+关掉后，「你正在手机聊天……请不要输出你的行为」那段不再注入，
+角色可以在聊天里做动作描写（`*走过去抱住你*` 这类）。久要的就是这个。
+位置在聊天设置 → 角色扮演规范，五个开关下面第六个。
+
+**这一处在作者的 `utils/chatPrompts.ts` 里**，是她的第三个改动点，
+同步上游时要多顾这个文件（清单已更新）。那段话全仓只有这一处，
+通话和约会那边没有。
 
 **这是上游没有的第二个改动点，同步时多顾三个文件。**
 `utils/apiCallLog.ts` / `context/OSContext.tsx` /
@@ -403,6 +415,9 @@ Vercel 那边自己按 lock 装，不受这个影响。
 `features/collaboration/context.ts` / `utils/chatRequestPayload.ts`
 响应原文抓包（2026-10-25 新增）：`utils/apiCallLog.ts` /
 `context/OSContext.tsx` / `components/settings/ApiCallLogModal.tsx`
+线上聊天状态开关（2026-10-27 新增）：`utils/chatPrompts.ts`
+（第 674 行附近那段「请不要输出你的行为」套了 `rpToggles.onlineState` 三元；
+作者如果改动那块，取上游原版再把三元加回去，别手工拼——见第 7 条）
 
 ```bash
 cd ~/push
@@ -436,17 +451,25 @@ master 到 `b9eeb9d6`，PR #3。上游 33 个提交 299 个文件，冲突 3 个
 
 ### 开关现在是怎么实现的（主分支这套是好的，别重构）
 
-六个开关：rpStyle / rpEmotion / rpListening / rpSelf / rpAntiFiller / thinkingChainPrompt
+七个开关：rpStyle / rpEmotion / rpListening / rpSelf / rpAntiFiller /
+rpOnlineState（2026-10-27 加） / thinkingChainPrompt
 字段可选，缺失即视为开启，旧数据导入行为不变。
 
 - `utils/rpPromptToggles.ts` —— 读开关（`char.rpXxxEnabled !== false`）
 - `utils/characterResponsePrinciples.ts` —— 文案分函数放，外面 `toggles.x ? fn() : ''`
-- `utils/characterCard.ts` —— 六个字段进 `CARD_STRIPPED_FIELDS`，不随角色卡分享
+- `utils/characterCard.ts` —— 这些字段进 `CARD_STRIPPED_FIELDS`，不随角色卡分享
   （久确认过：导出角色卡时按默认全开就行）
 - `apps/Chat.tsx` / `components/chat/ChatModals.tsx` —— UI 接线
 - `apps/CallApp.tsx` —— 语音通话那一处判断
 - `features/collaboration/context.ts` —— 协同窗口那一处判断
 - `utils/chatOutputStylePrompt.ts` —— 聊天与定时主动消息共用（2026-10-22 迁来）
+- `utils/chatPrompts.ts` —— onlineState 那一处（2026-10-27 加，只此一处）
+
+加第 N 个开关要碰的地方，照 PR #7 走就行：
+`rpPromptToggles.ts`（字段 + resolve）/ 文案所在文件套三元 / `types.ts` /
+`characterCard.ts` / `Chat.tsx` 的 fieldByKey / `ChatModals.tsx` 的列表项，
+再同步 `rpPromptToggles.test.ts` 和 `promptToggleBackupCompat.test.ts`
+——这两个测试里写死了开关数量和 `toEqual` 全字段，不改会红。
 
 **这套写法本身是对的**：判断和文案在同一个文件里，开关要么生效要么编译报错，
 不会静默失效。作者改文案时 git 能正常合并。
