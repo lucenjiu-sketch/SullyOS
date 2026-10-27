@@ -317,7 +317,8 @@ git merge upstream/master          # 冲突只会落在她真改过的文件上
 
 - 她看不懂代码，所以结论要前置：好了还是没好，一句话说清
 - 改完要她去 Vercel 测，教她的时候拆到点哪个按钮
-- Vercel 部署非 master 分支要去 Settings → Git → Production Branch 改
+- Vercel 的 Production Branch 在 Environments → Production → Branch Tracking
+  （**不在** Settings → Git，2026-10-27 查实更正）。完整流程见最后那节
 - 她会截图，看截图比问她更快
 - 她做决定，我们铺路。别替她拍板合并进 master
 
@@ -477,13 +478,49 @@ ElevenLabs 流式朗读时在聊天区上方出一个绿框条，边播边把台
 
 ## Vercel 流程（她会问）
 
-1. 改动推到分支
-2. Settings → Git → Production Branch 改成那个分支 → Save
-3. Deployments → ⋯ → Redeploy
-4. 等 2-4 分钟，她测
-5. 她说没问题，再合进 master，Production Branch 改回 master
+**2026-10-27 更正：下面这套是查实过的新路径。笔记原来写的
+「Settings → Git → Production Branch」已经不存在了，Vercel 把它搬走了，
+照老路径讲会把她带到一个找不到那个设置的页面——她为此来回问过两次。**
+
+### 让一个新分支上线
+
+全新分支在 Vercel 没有任何历史部署，所以**不能点 Redeploy**
+（会爆红：没东西可以「重新」部署）。要用新建：
+
+1. Deployments 页面右上角 `⋯` → **Create Deployment**
+2. Branch / Git Reference 里填分支名
+3. 弹窗会显示分支和提交号 → 跟本地 `git log --oneline -1` 核一下
+4. 点右下角橙色 **Deploy to Production**
+
+没有那个橙色按钮、只能建 Preview 的话，先改生产分支（见下），再回来重做。
+
+### 改生产分支（Production Branch 现在在这里）
+
+左边菜单 **Environments** → **Production** → **Branch Tracking** → 改分支名 → Save
+
+不是 Settings → Git。那个页面里没有这一项。
+手机上左侧菜单会被挤出屏幕，可以直接把地址栏末尾的 `/deployments`
+换成 `/settings/environments`。
+
+### 为什么新分支不会自动出现在列表里
+
+两层原因，她两次都卡在这儿：
+- Deployments 页面顶上挂着过滤器，默认带 **Environment: Production**。
+  新分支算 Preview，被过滤掉了 → 先把那个过滤器点掉再看；
+- 这个仓库连上 Vercel 之后只构建过 master，新分支多半压根没自动构建。
+  所以「列表里没有」不等于「没推上去」。**先用 `git ls-remote --heads origin`
+  或 github 包的 get_file_content 核实远端有没有，再去怀疑 Vercel。**
+
+### 测完之后
+
+1. 她说没问题 → 合进 master
+2. Environments → Production → Branch Tracking 改回 `master` → Save
+3. 让她再 Redeploy 一次（这时 master 有历史部署，Redeploy 可用）
 
 出事了有 Instant Rollback，一键退回，告诉她不用怕。
+
+**提醒她：每次部完都要把页面彻底关掉重开**（关标签页，不是切后台），
+不然 Service Worker 会让她看到旧版本。见第 8 条。
 
 ---
 

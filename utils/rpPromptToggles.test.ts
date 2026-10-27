@@ -21,8 +21,8 @@ const PROTOCOL_MARKERS = [
     '每行渲染为一个气泡',
 ];
 
-describe('角色扮演规范五开关', () => {
-    it('默认（字段全缺）注入五块全部内容', async () => {
+describe('角色扮演规范六开关', () => {
+    it('默认（字段全缺）注入六块全部内容', async () => {
         const p = await build({});
         expect(p).toContain('保持角色扮演');          // style
         expect(p).toContain('用细节代替概括');        // style
@@ -30,20 +30,23 @@ describe('角色扮演规范五开关', () => {
         expect(p).toContain('关于对方的表达');        // listening
         expect(p).toContain('最后，回到你自己');      // self
         expect(p).toContain('表达底线 (Anti-Filler)'); // antiFiller
+        expect(p).toContain('已经处于线上聊天状态了'); // onlineState
     });
 
-    it('五块各自独立：关一块只少那一块', async () => {
+    it('六块各自独立：关一块只少那一块', async () => {
         const cases: [Partial<CharacterProfile>, string, string[]][] = [
             [{ rpStyleEnabled: false }, '用细节代替概括',
-                ['情绪感知要先于对方的表达', '关于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)']],
+                ['情绪感知要先于对方的表达', '关于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)', '已经处于线上聊天状态了']],
             [{ rpEmotionEnabled: false }, '情绪感知要先于对方的表达',
-                ['用细节代替概括', '关于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)']],
+                ['用细节代替概括', '关于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)', '已经处于线上聊天状态了']],
             [{ rpListeningEnabled: false }, '关于对方的表达',
-                ['用细节代替概括', '情绪感知要先于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)']],
+                ['用细节代替概括', '情绪感知要先于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)', '已经处于线上聊天状态了']],
             [{ rpSelfEnabled: false }, '最后，回到你自己',
-                ['用细节代替概括', '情绪感知要先于对方的表达', '关于对方的表达', '表达底线 (Anti-Filler)']],
+                ['用细节代替概括', '情绪感知要先于对方的表达', '关于对方的表达', '表达底线 (Anti-Filler)', '已经处于线上聊天状态了']],
             [{ rpAntiFillerEnabled: false }, '表达底线 (Anti-Filler)',
-                ['用细节代替概括', '情绪感知要先于对方的表达', '关于对方的表达', '最后，回到你自己']],
+                ['用细节代替概括', '情绪感知要先于对方的表达', '关于对方的表达', '最后，回到你自己', '已经处于线上聊天状态了']],
+            [{ rpOnlineStateEnabled: false }, '已经处于线上聊天状态了',
+                ['用细节代替概括', '情绪感知要先于对方的表达', '关于对方的表达', '最后，回到你自己', '表达底线 (Anti-Filler)']],
         ];
         for (const [overrides, gone, kept] of cases) {
             const p = await build(overrides);
@@ -54,10 +57,10 @@ describe('角色扮演规范五开关', () => {
         }
     });
 
-    it('五块全关后功能协议完整保留', async () => {
+    it('六块全关后功能协议完整保留', async () => {
         const p = await build({
             rpStyleEnabled: false, rpEmotionEnabled: false, rpListeningEnabled: false,
-            rpSelfEnabled: false, rpAntiFillerEnabled: false,
+            rpSelfEnabled: false, rpAntiFillerEnabled: false, rpOnlineStateEnabled: false,
         });
         for (const marker of PROTOCOL_MARKERS) {
             expect(p, `全关后仍须保留：${marker}`).toContain(marker);

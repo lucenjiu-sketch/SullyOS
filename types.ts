@@ -3048,7 +3048,7 @@ export interface CharacterProfile {
   lifeRecordExpenseEnabled?: boolean;   // 记账（打通银行 bank_transactions）
   lifeRecordExerciseEnabled?: boolean;  // 锻炼
 
-  // 角色扮演规范开关（五块，各自独立，默认全开：!== false 即开）。
+  // 角色扮演规范开关（六块，各自独立，默认全开：!== false 即开）。
   // 只管「怎么扮演 / 怎么说话」这类风格与心态提示词；聊天气泡格式、模式切换格式、
   // 语音格式，以及表情 [[SEND_EMOJI]]、引用 [[QUOTE]]、动作 [[ACTION:...]] 等
   // 功能协议一律不受这些开关影响（关掉会让前端解析不到标签，功能直接失效）。
@@ -3057,6 +3057,9 @@ export interface CharacterProfile {
   rpListeningEnabled?: boolean;  // 倾听与反馈规则：尊重用户明确表达的感受，并让用户反馈影响后续回应
   rpSelfEnabled?: boolean;       // 回到你自己：语言即经历的沉淀，不刻意找「符合人设」的话
   rpAntiFillerEnabled?: boolean; // 表达底线：没话说时不用空泛感慨与万能句式填充
+  // 线上聊天状态：强调「当前在手机上打字、不要输出行为描写」那一段。
+  // 关掉后角色可以在聊天里带动作描写（*走过去抱住你* 这类）；气泡格式仍由 TOP 1 那行约束。
+  rpOnlineStateEnabled?: boolean;
 
   // Chat & Date voice TTS settings
   chatVoiceEnabled?: boolean;
