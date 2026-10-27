@@ -110,6 +110,17 @@ shell 的 `;` 不看前一条成不成。代码没丢（已经合进 master 了�
 - 要写长文档先提交，再做任何 git 状态操作
 - `reset --hard` 前先 `git status`，确认工作区是干净的
 
+**12. 在 master 上推送要写全 `git push origin master`。**
+2026-10-27 补的。本地 master 的上游追踪指着 **upstream（作者仓库）**，
+裸 `git push` 会推到 `qegj567-cloud/SullyOS`，报
+`Permission to qegj567-cloud/SullyOS.git denied` + 403。
+
+提交本身没事，重推一次就好，但那一下容易让人以为是 token 失效
+（上面「踩过的坑」第 3 条），白排查一轮。分支上没这个问题——
+`git push -u origin <分支>` 当时就把追踪设对了。
+
+所以：**推送一律写全远端和分支名。**
+
 ---
 
 ## MCP 调不动那件事：已查实，不用再查
