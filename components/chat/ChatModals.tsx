@@ -422,6 +422,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                             { key: 'listening', label: '倾听与反馈规则', desc: '尊重用户明确表达的感受，并让用户反馈影响后续回应' },
                             { key: 'self', label: '回到你自己', desc: '说话方式是经历的沉淀，不刻意去找「符合人设」的话' },
                             { key: 'antiFiller', label: '表达底线', desc: '没话说时不用空泛感慨、万能句式或华丽排比填充' },
+                            { key: 'onlineState', label: '线上聊天状态', desc: '强调当前是在手机上打字、不要输出行为描写。关掉后角色可以在聊天里带动作' },
                         ] as { key: keyof RpPromptToggles; label: string; desc: string }[]).map(item => (
                             <div key={item.key} className="pt-2 border-t border-slate-100">
                                 <button

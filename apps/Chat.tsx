@@ -3944,6 +3944,7 @@ const Chat: React.FC<{homePhone?:HomePhoneChatProps}> = ({homePhone}) => {
                         listening: 'rpListeningEnabled',
                         self: 'rpSelfEnabled',
                         antiFiller: 'rpAntiFillerEnabled',
+                        onlineState: 'rpOnlineStateEnabled',
                     } as const;
                     const field = fieldByKey[key];
                     // 字段默认 undefined = 开，所以取反要先经 resolve 归一化成布尔值。

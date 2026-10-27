@@ -1,5 +1,5 @@
 /**
- * 角色扮演规范开关 —— 五块风格类提示词的注入判定。
+ * 角色扮演规范开关 —— 六块风格类提示词的注入判定。
  *
  * 背景：聊天 system prompt 里混着两类内容。
  * - 风格/心态类（「保持角色扮演」「用细节代替概括」「你就是 XXX」…）：影响语气和表达，
@@ -23,13 +23,16 @@ export interface RpPromptToggles {
     self: boolean;
     /** 表达底线：没话说时不用空泛感慨与万能句式填充 */
     antiFiller: boolean;
+    /** 线上聊天状态：强调此刻在手机上打字、不要输出行为描写。关掉即允许动作描写 */
+    onlineState: boolean;
 }
 
 export const DEFAULT_RP_PROMPT_TOGGLES: RpPromptToggles = {
     style: true, emotion: true, listening: true, self: true, antiFiller: true,
+    onlineState: true,
 };
 
-/** 从角色档案读出五个开关。char 缺失（部分旧调用路径）时按全开处理。 */
+/** 从角色档案读出六个开关。char 缺失（部分旧调用路径）时按全开处理。 */
 export function resolveRpPromptToggles(char?: Partial<CharacterProfile> | null): RpPromptToggles {
     if (!char) return { ...DEFAULT_RP_PROMPT_TOGGLES };
     return {
@@ -38,5 +41,6 @@ export function resolveRpPromptToggles(char?: Partial<CharacterProfile> | null):
         listening: char.rpListeningEnabled !== false,
         self: char.rpSelfEnabled !== false,
         antiFiller: char.rpAntiFillerEnabled !== false,
+        onlineState: char.rpOnlineStateEnabled !== false,
     };
 }
