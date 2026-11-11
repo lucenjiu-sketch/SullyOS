@@ -9,9 +9,8 @@ export function buildChatOutputStylePrompt(input: {
     translationConfig?: { enabled: boolean; sourceLang: string; targetLang: string };
     htmlMode?: { enabled: boolean; customPrompt?: string };
     thinkingChain?: { enabled: boolean; customPrompt?: string };
-    sarEnvelopeActive?: boolean;
-    /** 项目自带的那篇思考引导是否注入。缺失即视为开启，保持旧数据行为不变。 */
     thinkingChainPromptEnabled?: boolean;
+    sarEnvelopeActive?: boolean;
 }) {
     const { translationConfig, htmlMode, thinkingChain, sarEnvelopeActive } = input;
     const char = { name: input.charName };

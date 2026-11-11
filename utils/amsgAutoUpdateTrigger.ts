@@ -78,7 +78,7 @@ export const pickStartupUpdateAction = (
  * 冷启动那一下调一次。返回值只为单测与日志：
  *   - 'updated' / 'update-failed'：版本对不上，直接更新了一次（成没成看返回值）；
  *   - 'requested'：版本对得上，敲了门让它按指纹自查（worker 收没收下看它自己）；
- *   - 'skipped'：探不到版本、或版本对得上但它没自更新能力，什么都没做；
+ *   - 'skipped'：探不到版本、Worker 比 App 还新（App 是缓存的旧构建）、或版本对得上但它没自更新能力，什么都没做；
  *   - 'throttled'：构建没换、也没到时候；
  *   - 'worker-unset'：没配 Worker 或还没连上过，一个请求都不发。
  *
@@ -102,7 +102,7 @@ export const requestStartupUpdateCheck = async (
   const action = pickStartupUpdateAction(probe);
   if (action === 'self-update') {
     // 跟设置页那颗按钮走的是同一个端点。这里不弹提示、不接着重连：换上的新代码下一跳会
-    // 自己把表补齐（见 worker 的 ensureSchemaOnce），设置页从 /config-check 能看到结果。
+    // 自己把表补齐（见 worker 的 ensureSchemaOnce）；selfUpdateWorker 会自动复查能力。
     const result = await ActiveMsgClient.selfUpdateWorker();
     if (result.ok) {
       console.info(`[ActiveMsg] 冷启动时把后端更新到了 ${probe.expected}（${result.bundleHash ?? ''}）`);

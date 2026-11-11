@@ -1,6 +1,11 @@
 import { INSTANT_INPUT_NAMESPACE, INSTANT_INPUT_TTL_DAYS, parseInstantInputEnvelope, parseInstantInputRef } from './instantInput';
+import { installAnthropicFetch } from '../../../utils/anthropicApi';
+
+// Stateless endpoint adapter also covers the upstream SDK's private LLM transport.
+// No request/tenant credentials are retained in the isolate.
+installAnthropicFetch(false);
 import { resolveSullyCloudOwnership } from './cloudDataOwnership';
-import { reconcileStoppedReplies, stoppedReplyKey } from '../../../utils/amsgStoppedReply';
+import { pickStaleStoppedReplyKeys, reconcileStoppedReplies, stoppedReplyKey } from '../../../utils/amsgStoppedReply';
 /**
  * SullyOS 主动消息 2.0（amsg2）— 单用户 Cloudflare Worker 入口。
  *
@@ -38,12 +43,14 @@ import {
   summarizeErrorCause,
 } from '@rei-standard/amsg-server/cloudflare';
 import { stripReasoningTags } from '@rei-standard/amsg-shared';
+import { settleReproduction, traceDiagnosticTransport, writeDiagnosticStage } from './reproduction';
+import { DIAGNOSTIC_NAMESPACE, DIAGNOSTIC_RETENTION_DAYS, diagnosticRunId } from '../../../utils/amsgReproduction';
 import { AMSG_BUNDLE_VERSION } from '../../../utils/amsgBundleVersion';
 // 「上一次推送被判订阅失效」的形状，跟前端体检共用一个类型定义（那份是零依赖纯叶子；
 // 往里加任何浏览器依赖都会连累这个 bundle）。这里只产出事实，红绿灯和文案归前端。
 import type { AmsgPushGoneFailure } from '../../../utils/amsgDiagnostics';
 import type { UserProfile } from '../../../types';
-import { AMSG_JOB_NAMESPACE, AMSG_JOB_TTL_DAYS } from '../../../utils/amsgTaskKinds';
+import { AMSG_JOB_NAMESPACE, AMSG_JOB_TTL_DAYS, classifyTaskRow } from '../../../utils/amsgTaskKinds';
 import {
   FIRE_KIND_HANDLERS,
   getKindFireStash,
@@ -115,9 +122,14 @@ import {
   parseFireScheduleArgs,
   resolveFireTargetTask,
   buildTaskInstruction,
+  AMSG_AWAY_DELAY_META,
+  AMSG_AWAY_MESSAGE_META,
+  AMSG_DATE_LEAVE_META,
+  AMSG_DATE_LEAVE_DELAY_META,
 } from '../../../utils/amsgFireSchedule';
 import {
   AMSG_CHAT_PRESENCE_KEY,
+  chattedDuringFire,
   isFreshChatPresence,
   parseAmsgChatPresence,
 } from '../../../utils/amsgChatPresence';
@@ -150,6 +162,7 @@ import {
   type McpSessionState,
 } from '../../../utils/mcpFireCore';
 import { dispatchAgenticTool, type AgenticToolChar, type AgenticToolCtx } from '../../../utils/agenticTools';
+import { buildReplyScopeRule } from '../../../utils/replyScope';
 import {
   buildDuplicateToolMessage,
   buildToolResultMessage,
@@ -325,6 +338,8 @@ type ScheduleTask = (options: {
   firstSendTime: string;
   recurrenceType?: string;
   messageType?: string;
+  /** 不传就继承当前任务的。 */
+  messageSubtype?: string;
   metadata?: Record<string, unknown>;
   taskInput?: Record<string, unknown>;
   uuid?: string;
@@ -366,6 +381,7 @@ interface SessionCtx {
   avatarUrl?: string;
   metadata: Record<string, unknown>;
   scratch?: Record<string, unknown>;
+  readState: (namespace: string, options?: { key: string }) => Promise<Array<{ key: string; value: string }>>;
   writeState?: WriteState;
   storeAttachment?: StoreAttachment;
   scheduleTask?: ScheduleTask;
@@ -515,6 +531,11 @@ interface FireStash {
   /** 这条任务是不是即时对话（用户刚发完消息在等回复）；决定要不要写 outbox。 */
   instant: boolean;
   /**
+   * 推送前复查「生成期间用户开口没有」要的基准：开场时看到的最近一条真实用户消息。
+   * 只有让路型（expire）的定时任务才有；即时对话和到点必发的任务是 null，不复查。
+   */
+  overlapGuard: { lastUserMessageAt: number | null } | null;
+  /**
    * 一次性即时对话任务绑定的 `amsg:instant-input` 键（定时任务的兜底输入不在这里清）。
    * 本轮即时对话落定（送达 / skip / 取消 / 终态失败）后即刻删掉，避免每轮聊天在 D1 里
    * 留下一份 300KB~500KB 的分块历史快照等 30 天才过期，撑爆云端数据管理清单。
@@ -532,6 +553,8 @@ interface FireStash {
    * 标记。收尾时（amsgFireSettled）据此把迟到的结果写进旁路存储，客户端轮询补落。
    */
   emotionLatePending: boolean;
+  /** 本轮可顺手清理的过期或超量 `chat_stop:<uuid>` 键。 */
+  staleStoppedKeys?: string[];
 }
 
 const getFireStash = (scratch: Record<string, unknown> | undefined): FireStash | undefined =>
@@ -545,6 +568,12 @@ const getFireStash = (scratch: Record<string, unknown> | undefined): FireStash |
  * 取整一分钟的话，下一跳来的时候还差几秒没到期，白白多等一整跳。
  */
 const REPLY_IN_FLIGHT_DEFER_MS = 45_000;
+/** 离开后消息到点时离真正该来的时刻差不到这么多就照发（cron 一分钟一跳）。 */
+const AWAY_DUE_TOLERANCE_MS = 60_000;
+/** 上游 defer 的上限是 24 小时。 */
+const AWAY_MAX_DEFER_MS = 24 * 60 * 60_000;
+// 见面离开提醒的等待时长最短 1 分钟，人还在见面里时剩余时间可能只有十几秒，容差要比上面小得多。
+const DATE_LEAVE_DUE_TOLERANCE_MS = 5_000;
 
 /** 两个时间戳取较新的那个；两个都没有为 null。 */
 const laterOf = (a: number | null, b: number | null): number | null =>
@@ -1086,6 +1115,7 @@ export const amsgFireSettled = async (
     writeState: WriteState;
   },
 ): Promise<void> => {
+  if (await settleReproduction(info)) return;
   const stash = getFireStash(info.scratch);
   if (!stash) return;   // onBeforeFire 没走到挂 stash 那步（比如取 fire_pack 就失败了）
 
@@ -1097,7 +1127,7 @@ export const amsgFireSettled = async (
   const delivered = committed || (info.sentCount ?? 0) > 0;
 
   // 这一轮往云端回写的条目攒在一起，收尾一次写完。
-  const stateWrites: Array<{ key: string; value: string }> = [];
+  const stateWrites: Array<{ key: string; value: string | null }> = [];
 
   // 每日计数：定时触发发出去了记一次（多段气泡也只算一次），调了几次模型另记——失败、
   // 判空没发的那几次同样花了钱。即时对话是正常聊天，两样都不记。
@@ -1210,6 +1240,14 @@ export const amsgFireSettled = async (
     stash.selfLogDirty = false;
     stateWrites.push({ key: AMSG_SELF_LOG_KEY, value: JSON.stringify(stash.selfLog) });
   }
+  if (stash.staleStoppedKeys && stash.staleStoppedKeys.length > 0) {
+    const staleKeys = stash.staleStoppedKeys;
+    stash.staleStoppedKeys = [];
+    for (const key of staleKeys) {
+      if (stateWrites.length >= 190) break;
+      stateWrites.push({ key, value: null });
+    }
+  }
   if (stateWrites.length > 0) {
     try {
       await info.writeState(amsgStateNamespace(stash.charId), stateWrites);
@@ -1281,6 +1319,11 @@ export const amsgStaleSkip = async (
     console.log('[amsg:stale-skip] 后台任务过期跳过，不写 last_skip', {
       taskId: task?.id ?? null, kind: taskKind, action: info.action,
     });
+    // 诊断任务过期跳过也要留一条收尾记录，否则报告只能说「证据不足」。
+    const diagnosticRun = diagnosticRunId(meta);
+    if (diagnosticRun) {
+      await writeDiagnosticStage(info.writeState, diagnosticRun, 'fire-settled', { status: 'skipped', reason: info.reason, staleAction: info.action });
+    }
     return;
   }
 
@@ -1542,6 +1585,9 @@ export const runFireScheduleTool = async (
       ...(stash.scheduledTaskInput ? { taskInput: stash.scheduledTaskInput } : {}),
       recurrenceType: parsed.recurrence,
       messageType: parsed.mode,
+      // 不写的话上游会继承当前任务的 subtype：即时对话里排的后续会带上 'instant-chat'，
+      // 列表投影里就被 classifyTaskRow 当成即时对话——前端看不见、取消不了它。
+      messageSubtype: 'chat',
       uuid,
       // 角色自排的循环任务也按角色所在时区的墙钟推进，跟用户在面板排的同一套。
       tzId: stash.tz.tzId,
@@ -1922,6 +1968,11 @@ export const amsgHooks = {
     const taskPolicy = typeof taskMeta.amsgExpirePolicy === 'string'
       ? taskMeta.amsgExpirePolicy : undefined;
     const selfScheduled = taskMeta.amsgSelfScheduled === true;
+    // 离开后消息：到点必发、计入连发上限，对方又开过口就原地推迟（见 docs/away-message.md）。
+    const away = taskMeta[AMSG_AWAY_MESSAGE_META] === true;
+    // 见面离开提醒：到点必发，不受连发和每日上限拦，这一轮不给排程工具（见 docs/date-leave-reminder.md）。
+    // 原因：一次离开只发一条，生成时又排不了后续，没有离开后消息那条「越排越多」的链要拦。
+    const dateLeave = taskMeta[AMSG_DATE_LEAVE_META] === true;
     const recurring = ctx.task.recurrenceType === 'daily' || ctx.task.recurrenceType === 'weekly';
 
     // 副 API 凭据落地即取走：这一份 metadata 对象上游还要按引用往下传（onLLMOutput 的
@@ -1990,7 +2041,9 @@ export const amsgHooks = {
     const presence = parseAmsgChatPresence(
       charRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value,
     );
-    if (!instant && policy === 'expire' && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
+    // 见面中的租约不在这里推迟，交给下面的 in-person 闸作废（那里才拿得到任务概要）。
+    const inPerson = presence?.scene === 'date' && isFreshChatPresence(presence, charId, ctx.now.getTime());
+    if (!instant && policy === 'expire' && !inPerson && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
       console.log('[amsg:defer]', {
         taskId: ctx.task.id,
         reason: 'reply-in-flight',
@@ -2105,6 +2158,35 @@ export const amsgHooks = {
       });
     }
 
+    // 见面离开提醒：按「见面中」租约最后一次续上的时刻算该什么时候发。人还在见面里（或刚走开）
+    // 就推迟到「最后一次见到人 + 等待时长」，不消费任务、不占重试、不留痕。租约行被私聊那边
+    // 盖成了聊天场景，说明走开之后已经在私聊里开过口，这次离开就结束了：按取消处理，不留回执
+    // （客户端开口时会先取消它，这里兜住取消没发出去的情况）。
+    if (!instant && dateLeave && presence?.charId === charId) {
+      if (presence.scene !== 'date') {
+        console.log('[amsg:date-leave-returned]', { taskId: ctx.task.id, charId, presenceActiveAt: presence.activeAt });
+        return { skip: true } as const;
+      }
+      const dueAt = presence.activeAt + Number(taskMeta[AMSG_DATE_LEAVE_DELAY_META]) * 60_000;
+      const waitMs = Number.isFinite(dueAt) ? dueAt - ctx.now.getTime() : 0;
+      if (waitMs > DATE_LEAVE_DUE_TOLERANCE_MS) {
+        console.log('[amsg:defer]', { taskId: ctx.task.id, reason: 'date-leave-not-due', dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } } as const;
+      }
+    }
+
+    // 离开后消息按「对方最后一次开口 + 等待时长」触发。客户端只在排期差得多时才去改期，
+    // 差的那点在这里补：对方在等待时长内说过话，就推迟到该来的时候，不消费任务、不占重试。
+    if (!instant && away) {
+      const delayMs = Number(taskMeta[AMSG_AWAY_DELAY_META]) * 60_000;
+      const dueAt = lastUserMessageAt != null && delayMs > 0 ? lastUserMessageAt + delayMs : null;
+      const waitMs = dueAt == null ? 0 : dueAt - ctx.now.getTime();
+      if (waitMs > AWAY_DUE_TOLERANCE_MS) {
+        console.log('[amsg:defer]', { taskId: ctx.task.id, reason: 'away-not-due', dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } } as const;
+      }
+    }
+
     // 任务指令缺失（开发期旧格式任务）：不能用默认 auto 指令凑一个渲染——那会把
     // prompted 任务的方向偷换掉，发出去的内容和用户当初排的不是一回事。
     // 即时对话没有「本次任务」这回事，方向就是回用户刚说的那句话。
@@ -2154,7 +2236,14 @@ export const amsgHooks = {
       }
       return { skip: true } as const;
     }
-    const storedSelfLog = reconcileStoppedReplies(parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? ''), charRows);
+    const rawSelfLog = parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? '');
+    const storedSelfLog = reconcileStoppedReplies(rawSelfLog, charRows);
+    const selfLogReconciled = storedSelfLog !== rawSelfLog;
+    const staleStoppedKeys = pickStaleStoppedReplyKeys(
+      charRows,
+      ctx.now.getTime(),
+      typeof ctx.task.uuid === 'string' && ctx.task.uuid ? stoppedReplyKey(ctx.task.uuid) : null,
+    );
     const selfLog = reconcileSelfLogWithPack(storedSelfLog, pack, lastUserMessageAt);
     // 这条任务的概要：到点被拦下时随「这次没发」一起送回客户端。
     const taskBrief = findTaskBrief([...pack.pendingTasks, ...selfLog.tasks], ctx.task.uuid);
@@ -2181,8 +2270,19 @@ export const amsgHooks = {
       return { skip: true } as const;
     }
 
+    // 用户正在和这个角色见面：人就在面前，这时候弹手机消息会穿帮。直接作废、不推迟——
+    // 推迟到见面结束再发，角色每次都得编个「刚才忘了说」来圆。回执送回客户端，见面的
+    // 下一轮当成可提可不提的小事交给角色。到点必发（force）的照发。
+    if (!instant && policy === 'expire' && inPerson) {
+      console.log('[amsg:in-person-skip]', { taskId: ctx.task.id, charId });
+      await recordSkip(ctx, charId, 'in-person', occurrenceMs, taskBrief);
+      return { skip: true } as const;
+    }
+
     const maxUnansweredSends = limits.maxUnansweredSends;
-    if (!instant && selfScheduled
+    // 离开后消息也归它管：它发出去就算一次「没回时找你」，后面角色自排的接着往上数。
+    // 原因：它这一轮能顺手再排下一条，不放进同一个计数，用户不回时会一路排下去。
+    if (!instant && (selfScheduled || away)
       && countUnansweredSends(selfLog) >= maxUnansweredSends) {
       console.log('[amsg:unanswered-limit-skip]', {
         taskId: ctx.task.id,
@@ -2230,7 +2330,7 @@ export const amsgHooks = {
     const dailyDay = dayKeyInZone(nowMs, pack.userTzId);
     const dailySends = parseDailySends(charRows.find((r) => r.key === AMSG_DAILY_SENDS_KEY)?.value);
     const sentToday = sendsOnDay(dailySends, dailyDay);
-    if (!instant && sentToday >= limits.dailySendCap) {
+    if (!instant && !dateLeave && sentToday >= limits.dailySendCap) {
       console.log('[amsg:daily-limit-skip]', {
         taskId: ctx.task.id, charId, day: dailyDay, sentToday, cap: limits.dailySendCap,
       });
@@ -2252,7 +2352,7 @@ export const amsgHooks = {
         for (const row of page.tasks) {
           const meta = row.metadata ?? {};
           if ((row.charId ?? meta.charId) !== charId || row.status !== 'pending' || !row.uuid || !row.nextSendAt
-            || meta.amsgInstantChat === true || meta.amsgKind || row.messageSubtype === 'instant-chat') continue;
+            || classifyTaskRow(row) !== 'scheduled') continue;
           const old = known.get(row.uuid);
           live.push({
             ...old,
@@ -2281,7 +2381,8 @@ export const amsgHooks = {
     // amsg2ToolsInjected——用户显式关掉的功能不能被云端聊天轮绕开重排任务。
     // 必填字段（parseFirePack 把关），不做缺省——这道闸缺省放行就是 fail-open。
     // limits 那份更新得更快（关 2.0 时第一个写的就是它），任一说关就是关。
-    const selfScheduleAllowed = !scheduleOff;
+    // 见面离开提醒这一轮也不给：见上面 dateLeave 处的说明。
+    const selfScheduleAllowed = !scheduleOff && !dateLeave;
 
     // 老 worker 部署（amsg-server < 2.6.0-next.9）没有这个口子。教了也排不成，
     // 只会让角色说「我等下再找你」然后没有下文——干脆不教。
@@ -2310,7 +2411,8 @@ export const amsgHooks = {
       xhsCookie,
       occurrenceMs,
       selfLog,
-      selfLogDirty: false,
+      selfLogDirty: selfLogReconciled && staleStoppedKeys.length > 0,
+      staleStoppedKeys,
       mcpResolve,
       maxToolIterations,
       fireToolNames: new Set(),
@@ -2344,6 +2446,8 @@ export const amsgHooks = {
       // （resolveFireSceneSong 与 renderFireSceneBlock 共用判定），冻的必然是正文里那首。
       sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz),
       instant,
+      // 见面离开提醒也查：生成期间回到见面或开了口，人已经回来了，这条就不发。
+      overlapGuard: !instant && (policy === 'expire' || dateLeave) ? { lastUserMessageAt } : null,
       instantInputKey,
       // 下面即时对话那一支起跑（要等请求消息拼完才知道给评估喂什么）。
       emotionEvalPromise: null,
@@ -2380,6 +2484,7 @@ export const amsgHooks = {
     // 「外面的世界此刻什么样」：今日节日 + 实时天气 + 热搜，到点现拉现填。
     // 拉不到 / 超时都只是返回空串，那一段整个消失，这次触发照常往下走。
     const worldArgs = {
+      charId,
       toolConfig,
       userName: pack.targetName,
       timeAwarenessEnabled: toolPack.timeAwarenessEnabled,
@@ -2402,7 +2507,7 @@ export const amsgHooks = {
     // 不然一边声明成 tools、一边教语法，模型会两种都写一遍。
     // 时间上下文让 send_at 的示例是「明天这个点」的裸墙钟，别再教模型写 offset。
     //
-    // 块尾接「用户给你定的规矩」：还能再排几条、最早排到几点、今天还剩几条。额度摆在它
+    // 块尾接「用户给你定的规矩」：连发、今天、任务名额各报「已用/上限」，外加最早排到几点。额度摆在它
     // 面前，比让它排了再被打回省一轮；真超了照样由排程工具打回。
     const limitsBrief = canSelfSchedule
       ? buildLimitsBrief({
@@ -2436,6 +2541,10 @@ export const amsgHooks = {
         ? [buildFireCancelTool(), buildFireRenewTool({ nowMs: ctx.now.getTime(), tz })]
         : []),
     ];
+    // 带工具时说清「这次回复」从哪儿算起：即时对话是用户那条消息，定时触发是这份说明本身。
+    const replyScopeBlock = fireTools.length > 0 || mcpBlock || scheduleBlock
+      ? `\n${buildReplyScopeRule(instant ? 'user' : 'scheduled')}\n`
+      : '';
     // 非 MCP 的声明名单独留一份给 onLLMOutput 认领 native 调用用（见 FireStash.fireToolNames）。
     stash.fireToolNames = new Set(fireTools
       .map((t) => t?.function?.name)
@@ -2469,9 +2578,16 @@ export const amsgHooks = {
         blocks: [
           realtimeWorldBlock,
           renderSelfLogBlock(selfLog, ctx.now.getTime(), tz, maxUnansweredSends),
-          taskListBlock, mcpBlock, scheduleBlock,
+          taskListBlock, mcpBlock, scheduleBlock, replyScopeBlock,
         ],
       });
+      const chatMessages = pack.chat!.messages;
+      // 时效块（排程清单/额度/时钟等）插在本地「实时状态」段前面，与本地路径同位；
+      // 旧前端没给下标或下标越界时追加到末尾。
+      const insertAt = pack.chat!.timelyInsertAt;
+      const timelyAt = Number.isInteger(insertAt) && insertAt! >= 1 && insertAt! <= chatMessages.length
+        ? insertAt!
+        : chatMessages.length;
       const instantMessages = [
         // content 原样透传，一个字都不动：带图片的消息本地就是结构化分段
         // （`[{type:'text'},{type:'image_url'}]`），上游把这个数组整个丢进
@@ -2479,8 +2595,9 @@ export const amsgHooks = {
         // `messages: llmMessages`，不看 content 的类型）。这里但凡 String() 一下，
         // 模型收到的就是「[object Object]」而不是那张图。
         // 每条重新包一层对象只是不把 pack 上那份交出去，content 仍是同一个引用。
-        ...pack.chat!.messages.map((m) => ({ role: m.role, content: m.content })),
+        ...chatMessages.slice(0, timelyAt).map((m) => ({ role: m.role, content: m.content })),
         ...(timelyBlock ? [{ role: 'system' as const, content: timelyBlock }] : []),
+        ...chatMessages.slice(timelyAt).map((m) => ({ role: m.role, content: m.content })),
       ];
       if (userHoliday) {
         const profileMessage = instantMessages.find(m => m.role === 'system' && typeof m.content === 'string' && m.content.includes('### 互动对象 (User)\n'));
@@ -2542,7 +2659,8 @@ export const amsgHooks = {
       // 「此刻在做什么」里的钟点跟今日节日同一个开关：关掉时间感知的角色不该从日程块
       // 读到「23:00」——那正是这个开关要挡的东西。日程内容本身照给。
       includeClock: toolPack.timeAwarenessEnabled,
-    }), userHoliday) + mcpBlock + scheduleBlock;
+      mustSpeak: away || dateLeave,
+    }), userHoliday) + mcpBlock + scheduleBlock + replyScopeBlock;
     return {
       messages: [{ role: 'user' as const, content: prompt }],
       ...common,
@@ -2677,6 +2795,43 @@ export const amsgHooks = {
         sessionId: ctx.sessionId,
         pushes: decision.decision === 'finish' ? decision.pushPayloads.length : 0,
       });
+    }
+
+    // 开场那道门只查过一次，生成要几十秒：这期间用户在本地聊上的话，这句没看到新对话，
+    // 跟本地那轮回复会同时落到聊天里各说各的。推送前再看一眼，聊上了就不发，给角色留回执。
+    if (decision.decision === 'finish' && stash.overlapGuard) {
+      const presenceRows = await ctx.readState(amsgStateNamespace(stash.charId), { key: AMSG_CHAT_PRESENCE_KEY });
+      const presence = parseAmsgChatPresence(presenceRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value);
+      if (chattedDuringFire(presence, stash.charId, Date.now(), stash.overlapGuard.lastUserMessageAt)) {
+        // 生成期间用户进了见面：跟开场那道 in-person 闸同一个原因，回执才会带进见面。
+        const overlapReason = presence?.scene === 'date' ? 'in-person' as const : 'chat-overlap' as const;
+        // shortcut: 这一轮已经用工具改过任务的照常发出——跳过的话客户端收不到这批改动、认领不到新任务；
+        // 真撞上再改成拦下时单独 emitResult 送任务改动。
+        if (stash.scheduledTasks.length || stash.cancelledTasks.length || stash.renewedTasks.length) {
+          console.warn('[amsg:chat-overlap] 生成期间用户开口了，但这轮改过任务，照常发出', { taskId });
+        } else {
+          console.log('[amsg:chat-overlap] 生成期间用户开口了，这条不发', {
+            taskId,
+            seenLastUserMessageAt: stash.overlapGuard.lastUserMessageAt,
+            presenceLastUserMessageAt: presence?.lastUserMessageAt ?? null,
+          });
+          await writeLastSkip(ctx.writeState, stash.charId, {
+            v: 1,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            skippedAt: Date.now(),
+          });
+          await emitFireSkip(ctx.emitResult, {
+            charId: stash.charId,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            task: findTaskBrief(stash.pendingTasks, stash.taskUuid),
+          });
+          return { decision: 'skip-push' as const };
+        }
+      }
     }
 
     if (decision.decision === 'skip-push' && decision.sideEffects) {
@@ -3051,12 +3206,17 @@ export const buildWorkerConfig = (env: Env) => {
     privateKey: env.VAPID_PRIVATE_KEY,
   };
   const nativeFcmReady = isFcmConfigured(env);
-  // 上游在进入发送器前会检查 VAPID 字段非空；纯 FCM 部署用内部占位值通过该检查。
-  // 普通 Web Push endpoint 仍只会走真实 VAPID，没配真实值时配置自检会明确提示。
-  const effectiveVapid = nativeFcmReady && (!vapid.publicKey?.trim() || !vapid.privateKey?.trim())
-    ? { email: vapid.email, publicKey: 'native-fcm', privateKey: 'native-fcm' }
-    : vapid;
-  const webpush = createHybridPushTransport(env, createWebCryptoWebPush(effectiveVapid));
+  const hasRealVapid = Boolean(vapid.publicKey?.trim() && vapid.privateKey?.trim());
+  // 上游在进入发送器前会检查 VAPID 字段非空；纯 FCM 或第三方推送（WxPusher/Bark/MeoW）
+  // 部署用内部占位值通过该检查，而普通 Web Push 仍走真实 vapid。
+  const effectiveVapid = hasRealVapid
+    ? vapid
+    : {
+      email: vapid.email,
+      publicKey: nativeFcmReady ? 'native-fcm' : 'third-party-push',
+      privateKey: nativeFcmReady ? 'native-fcm' : 'third-party-push',
+    };
+  const webpush = traceDiagnosticTransport(createHybridPushTransport(env, createWebCryptoWebPush(vapid)), env);
   // 即时对话终态失败的直发通道拿同一份 transport（见 sendInstantErrorPush）。
   configureInstantErrorPush(env.DB && env.AMSG_MASTER_KEY
     ? { webpush, db: env.DB as unknown as InstantErrorPushDeps['db'], masterKey: env.AMSG_MASTER_KEY }
@@ -3078,7 +3238,7 @@ export const buildWorkerConfig = (env: Env) => {
     // 命名空间下超过天数没更新的条目清掉。角色状态那个命名空间（amsg:char:<id>，
     // 装 fire_pack / tool_pack）不配 TTL——那些是要长期留着的，配了就等于定时把
     // 角色的云端状态抹掉。判据是行本来就有的 updated_at 列，不加列、不动表结构。
-    clientStateTtl: { [INSTANT_INPUT_NAMESPACE]: INSTANT_INPUT_TTL_DAYS, [AMSG_JOB_NAMESPACE]: AMSG_JOB_TTL_DAYS },
+    clientStateTtl: { [INSTANT_INPUT_NAMESPACE]: INSTANT_INPUT_TTL_DAYS, [AMSG_JOB_NAMESPACE]: AMSG_JOB_TTL_DAYS, [DIAGNOSTIC_NAMESPACE]: DIAGNOSTIC_RETENTION_DAYS },
     cloudData: { resolveOwner: resolveSullyCloudOwnership },
     // 满血 fire-time hooks（onBeforeFire 现场填槽 + onLLMOutput 分类 +
     // executeToolCalls 服务端工具循环）；总超时用库默认 240s，轮数由 onBeforeFire 按
@@ -3088,7 +3248,7 @@ export const buildWorkerConfig = (env: Env) => {
     // 用户主动触发的即时对话：生成失败本轮就结束，由用户决定是否重发。
     // 策略由上游在 onBeforeFire 前解析，读取上下文失败也覆盖；整批入箱后仍可补推原文。
     maxGenerationRetries: (task: { metadata?: Record<string, unknown> | null }) =>
-      isInstantChatTask(task.metadata) ? 0 : undefined,
+      isInstantChatTask(task.metadata) || readTaskKind(task.metadata) === 'diagnostic' ? 0 : undefined,
     // 取消通过租约心跳通知执行中的 Worker；1 秒检测一次，TTL 仍由上游管理。
     // 收尾回执 + 过期跳过回执（config 级 hook）。
     // onFireSettled: 无论这次 fire 是发出去了、跳过了还是抛错了都会调一次，self_log
@@ -3636,6 +3796,7 @@ export default {
         data: {
           ...inspectWorkerEnv(env),
           instantChat: true,
+          anthropicMessages: true,
           instantTick: !!env.INSTANT_TICK,
           // 这份代码认不认识「后台任务」（metadata.amsgKind → handler，见 fireKinds.ts）。
           // 老 bundle 没有这个字段，前端据此不去建那种任务——老 worker 会把它当聊天任务
@@ -3643,6 +3804,8 @@ export default {
           // 正常，而门牌永远不更新。报的是**这份代码有没有**，不是版本号：自更新永远由
           // 旧代码执行，版本号对上了不代表新逻辑真的在跑。
           backgroundJobs: true,
+          thirdPartyPush: true,
+          diagnosticReproduction: 1,
           workerVersion: AMSG_BUNDLE_VERSION,
           // 自动更新：有没有这个能力（配没配 CF_API_TOKEN，不回值）+ 最近一次检查的结果。
           // 读的是诊断表，D1 没绑上时读不到就是 null，不影响上面那些照常回答。
@@ -3829,6 +3992,83 @@ export default {
         });
       }
       return handleInstantChat({ request, env, upstream, json: jsonWithCors });
+    }
+
+    // 推送测试：读取当前用户在 push_subscriptions 里登记的订阅（Web Push 或第三方推送 App），
+    // 直接发一条测试通知验证通道是否畅通。
+    if (pathname.endsWith('/test-push')) {
+      if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+      if (method !== 'POST') {
+        return jsonWithCors(405, {
+          success: false,
+          error: { code: 'METHOD_NOT_ALLOWED', message: '/test-push 只接受 POST' },
+        });
+      }
+      const token = env.AMSG_SERVER_TOKEN?.trim() ?? '';
+      const clientToken = request.headers.get('X-Client-Token') ?? '';
+      if (token && (!clientToken || !(await constantTimeEqual(clientToken, token)))) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: 'INVALID_CLIENT_TOKEN', message: '共享密钥无效或缺失' },
+        });
+      }
+      try {
+        const reqUserId = request.headers.get('X-User-Id')?.trim() || '';
+        const db = env.DB as unknown as InstantErrorPushDeps['db'];
+        const row = reqUserId
+          ? await db.prepare('SELECT user_id, subscription FROM push_subscriptions WHERE user_id = ? LIMIT 1').bind(reqUserId).first()
+          : await db.prepare('SELECT user_id, subscription FROM push_subscriptions LIMIT 1').first();
+        const stored = row?.subscription;
+        const userId = row?.user_id;
+        if (typeof stored !== 'string' || !stored || typeof userId !== 'string' || !userId) {
+          return jsonWithCors(404, {
+            success: false,
+            error: { code: 'SUBSCRIPTION_NOT_FOUND', message: '云端还没有登记推送订阅，请先保存或登记推送配置。' },
+          });
+        }
+        let subscription: unknown;
+        try {
+          const userKey = await deriveUserEncryptionKey(userId, env.AMSG_MASTER_KEY.trim());
+          subscription = JSON.parse(await decryptFromStorage(stored, userKey));
+        } catch {
+          subscription = JSON.parse(stored);
+        }
+        const payload = {
+          messageKind: 'test-push',
+          messageType: 'instant',
+          messageId: `test_${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          contactName: 'SullyOS 推送测试',
+          message: '如果你在手机通知栏看到这条消息，说明主动消息推送通道已经接通！',
+          notification: {
+            title: 'SullyOS 推送测试',
+            body: '如果你在手机通知栏看到这条消息，说明主动消息推送通道已经接通！',
+            show: 'always',
+            tag: 'sullyos-test-push',
+            renotify: true,
+          },
+        };
+        const cfg = buildWorkerConfig(env);
+        await cfg.webpush.sendNotification(subscription, JSON.stringify(payload));
+        return jsonWithCors(200, {
+          success: true,
+          data: { sent: true },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonWithCors(502, {
+          success: false,
+          error: { code: 'TEST_PUSH_FAILED', message },
+        });
+      }
+    }
+
+    if (pathname.endsWith('/vapid-public-key') && (!env.VAPID_PUBLIC_KEY?.trim() || !env.VAPID_PRIVATE_KEY?.trim())) {
+      if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return jsonWithCors(503, {
+        success: false,
+        error: { code: 'VAPID_NOT_CONFIGURED', message: 'Worker 未配置 VAPID 密钥对，浏览器 Web Push 不可用（可使用第三方推送 App）。' },
+      });
     }
 
     return upstream.fetch(request, env);

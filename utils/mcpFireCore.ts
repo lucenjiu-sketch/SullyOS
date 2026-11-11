@@ -548,6 +548,21 @@ const postCore = async (
     }
 };
 
+const formatMcpRpcError = (err: { code?: number; message?: string; data?: any }): string => {
+    const code = err?.code !== undefined ? `[${err.code}]: ` : '';
+    const message = err?.message || '未知错误';
+    let dataText = '';
+    if (err?.data !== undefined && err?.data !== null && err?.data !== '') {
+        if (typeof err.data === 'string') {
+            dataText = err.data.trim();
+        } else {
+            try { dataText = JSON.stringify(err.data); } catch { dataText = String(err.data); }
+        }
+    }
+    const suffix = dataText && !message.includes(dataText) ? `（${dataText}）` : '';
+    return `${code}${message}${suffix}`;
+};
+
 const initializeCore = async (
     target: McpTransportTarget,
     session: McpSessionState,
@@ -559,7 +574,7 @@ const initializeCore = async (
         clientInfo: { name: 'sullyos', title: 'SullyOS', version: '1.0.0' },
     });
     const { response } = await postCore(target, session, initReq, timeoutMs);
-    if (response?.error) throw new Error(`Initialize 失败: ${response.error.message}`);
+    if (response?.error) throw new Error(`Initialize 失败 ${formatMcpRpcError(response.error)}`);
 
     const negotiated = String(
         response?.result?.protocolVersion || MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION,
@@ -612,7 +627,7 @@ export const discoverMcpToolsCore = async (
     await ensureInitializedCore(target, session, timeoutMs);
     opts.onStage?.('tools');
     const { response } = await postCore(target, session, buildRpcRequest(session, 'tools/list'), timeoutMs);
-    if (response?.error) throw new Error(`tools/list 失败: ${response.error.message}`);
+    if (response?.error) throw new Error(`tools/list 失败 ${formatMcpRpcError(response.error)}`);
     const tools = response?.result?.tools;
     if (!Array.isArray(tools)) return [];
     return tools.map((t: any) => ({
@@ -770,7 +785,7 @@ export const callMcpToolCore = async (
             }
         }
         if (!response) return finish({ success: false, error: '空响应' });
-        if (response.error) return finish({ success: false, error: `MCP 错误 [${response.error.code}]: ${response.error.message}` });
+        if (response.error) return finish({ success: false, error: `MCP 错误 ${formatMcpRpcError(response.error)}` });
 
         const result = response.result;
         if (result?.resultType === 'input_required') {
@@ -910,7 +925,7 @@ export const buildMcpFireBlock = <S extends McpFireServer>(
         howTo,
         '纪律：不需要就别硬调；没收到系统返回前不要声称工具成功，也不要编造结果；工具失败就换个方式或如实带过；结果只挑相关部分用角色语气转述，别复读 JSON。',
         '多步任务：先做必要检查，随后立刻调用能推进目标的动作工具；不要反复读取同一份说明或状态。执行动作后可以再次检查新状态，并继续到目标完成或工具明确失败。',
-        `副作用操作：${userName} 本轮已经明确要求执行的视为已确认；没有明确要求时才先确认。`,
+        `副作用操作：${userName} 在最新消息里已经明确要求执行的视为已确认；没有明确要求时才先确认。`,
         '可用工具：',
         ...lines,
         '---',

@@ -17,12 +17,15 @@ import { CharacterProfile } from '../types';
  *  4) 运行时状态：buff、宫殿注入、见面/小屋存档、查手机数据等发卡人当下状态残留。
  */
 export const CARD_STRIPPED_FIELDS = [
+  'userPersona',
   // 1) 凭据（含 apiKey，灾难级泄漏）
   'dialogueApi',
   'emotionConfig',
   'embeddingConfig',
-  'proactiveConfig',
+  'proactiveConfig',         // 已下线的主动消息 1.0，旧数据里可能还带着副 API 凭据
   'activeMsg2Config',
+  'awayMessage',             // 离开后消息：发卡人本机的提醒偏好
+  'dateLeaveReminder',       // 见面离开提醒：同上
 
   // 2) 美化
   'embeddedTheme',           // CharacterExportData 上的内嵌主题（导入侧一并剥离）

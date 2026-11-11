@@ -54,7 +54,8 @@ const { storeState } = vi.hoisted(() => ({
     markedNotices: [] as Array<{ charId: string; ids: string[] }>,
   },
 }));
-vi.mock('./activeMsgStore', () => ({
+vi.mock('./activeMsgStore', async () => ({
+  isInstantChatSwitchedOn: (await vi.importActual<typeof import('./activeMsgStore')>('./activeMsgStore')).isInstantChatSwitchedOn,
   ActiveMsgStore: {
     ensureUserId: async () => TEST_USER_ID,
     getGlobalConfig: async () => {
@@ -700,6 +701,18 @@ describe('开关', () => {
     expect(await resolveInstantChatReadiness()).toEqual({ ready: false, reason: 'disabled' });
   });
 
+  // 很多人配好了 2.0 却没看懂这个开关、一直没开：没点过的，Worker 连上过就默认开。
+  it('没点过开关、Worker 连接验证成功过 → 默认走云端', async () => {
+    storeState.config = { ...storeState.config, instantChatEnabled: undefined, initializedAt: 1 };
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true });
+  });
+
+  // 只填了地址的那种上云会发一条挂一条，又不退回本地，不能默认开。
+  it('没点过开关、只填了地址没连上过 → 不走', async () => {
+    storeState.config = { ...storeState.config, instantChatEnabled: undefined, initializedAt: undefined };
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: false, reason: 'disabled' });
+  });
+
   it('地址空着 → 不走', async () => {
     storeState.config = { ...storeState.config, workerUrl: '  ' };
     expect(await isInstantChatReady()).toBe(false);
@@ -791,6 +804,11 @@ describe('开关', () => {
     expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: false });
     storeState.config = { ...storeState.config, workerBundleVersion: null };
     expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: false });
+  });
+
+  it('存量版本比当前 bundle 新（App 是缓存的旧构建）→ workerBundleCurrent: true，SAR 回合照常上云', async () => {
+    storeState.config = { ...storeState.config, instantChatSupported: true, workerBundleVersion: '2999-01-01.2' };
+    expect(await resolveInstantChatReadiness()).toEqual({ ready: true, workerBundleCurrent: true });
   });
 
   it('从没探过版本（undefined）→ 不给结论，调用方放行', async () => {
@@ -1020,6 +1038,19 @@ describe('推送丢了的补收（服务端账本）', () => {
   const stubOutbox = (entries: any[]) => {
     vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue(entries as any);
   };
+
+  it('keeps another users reply in the global inbox without reading this users history or acknowledging it', async () => {
+    localStorage.setItem('sully_user_spaces_v1', JSON.stringify([{ id: 'default', name: 'A' }, { id: 'u_other', name: 'B' }]));
+    vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([CHAR] as any);
+    const history = vi.spyOn(DB, 'findPersistedActiveMessageIds');
+    const push = outboxPush('other-space-reply', { metadata: { charId: 'other-char' } });
+    stubOutbox([entry('other-space-reply', push)]);
+    const result = await drainOutbox();
+    expect(history).not.toHaveBeenCalled();
+    expect(result.written).toBe(1); expect(result.ackNow).toEqual([]);
+    expect(storeState.saved[0].charId).toBe('other-char');
+    localStorage.removeItem('sully_user_spaces_v1');
+  });
 
   // 有旧接管标记时也走同一条补收和去重链。
   beforeEach(() => {
@@ -1333,15 +1364,15 @@ describe('探测顺手记下 bundle 版本（workerBundleVersion）', () => {
   beforeEach(() => { (ActiveMsgStore.saveGlobalConfig as any).mockClear(); });
 
   it('probeInstantChatSupportDetailed：问到答案就记版本', async () => {
-    configCheck(200, { instantTick: true, workerVersion: '2099-01-01' });
+    configCheck(200, { instantTick: true, workerVersion: '2099-01-01', anthropicMessages: true });
     await ActiveMsgClient.probeInstantChatSupportDetailed();
-    expect(versionWrites()).toContainEqual({ workerBundleVersion: '2099-01-01' });
+    expect(versionWrites()).toContainEqual({ workerBundleVersion: '2099-01-01', anthropicMessagesSupported: true, anthropicMessagesWorkerUrl: (await ActiveMsgStore.getGlobalConfig()).workerUrl });
   });
 
   it('probeWorkerVersion：老 bundle 不报版本 → 记 null（问到了，确实旧）', async () => {
     configCheck(200, { instantTick: true });
     await ActiveMsgClient.probeWorkerVersion();
-    expect(versionWrites()).toContainEqual({ workerBundleVersion: null });
+    expect(versionWrites()).toContainEqual({ workerBundleVersion: null, anthropicMessagesSupported: false, anthropicMessagesWorkerUrl: (await ActiveMsgStore.getGlobalConfig()).workerUrl });
   });
 
   it('没问到答案（5xx）→ 一个字都不写，存量保持原样', async () => {
@@ -1395,4 +1426,27 @@ it('停止待收轮立即解除占位；云端取消失败也只保留已显示�
     expect((await DB.getMessagesByCharId(charId)).map(message => message.content)).toEqual(['已经显示']);
     expect(write).toHaveBeenCalledWith(`amsg:char:${charId}`, `chat_stop:${uuid}`, JSON.stringify({ text: '已经显示' }));
   } finally { cancel.mockRestore(); write.mockRestore(); }
+});
+
+describe('AI 复现排程', () => {
+  it('使用本次 API 的加密任务、不登记或修复推送订阅，并保留延迟时间', async () => {
+    const runId = '55555555-5555-4555-8555-555555555555';
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ success: true, data: url.endsWith('/config-check') ? { diagnosticReproduction: 1 } : { uuid: runId } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    const before = Date.now();
+    const result = await ActiveMsgClient.scheduleReproduction(runId, { ...API, apiKey: 'cheap-only', model: 'cheap-model' }, 120);
+    const request = calls.find(c => c.url.endsWith('/schedule-message'))!;
+    const task = JSON.parse(JSON.parse(String(request.init.body)).encryptedData);
+    expect(task).toMatchObject({ uuid: runId, apiKey: 'cheap-only', primaryModel: 'cheap-model', apiUrl: 'https://api.example.com/v1/chat/completions' });
+    expect(result.dueAt).toBeGreaterThanOrEqual(before + 120000);
+    expect(calls.some(c => /push-subscription|llm-credentials/.test(c.url))).toBe(false);
+  });
+  it('旧 Worker 不认识诊断协议时不创建任务、不烧模型额度', async () => {
+    const calls = mockInstantChatFetch(200, { success: true, data: { backgroundJobs: true } });
+    await expect(ActiveMsgClient.scheduleReproduction('55555555-5555-4555-8555-555555555555', API, 60)).rejects.toThrow('更新');
+    expect(calls.some(c => c.url.endsWith('/schedule-message'))).toBe(false);
+  });
 });

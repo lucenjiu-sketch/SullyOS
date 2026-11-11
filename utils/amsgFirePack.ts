@@ -207,6 +207,8 @@ export const LAST_SKIP_REASONS = [
   'min-gap',
   'recurring-unanswered',
   'daily-limit',
+  'chat-overlap',
+  'in-person',
 ] as const;
 
 export interface AmsgLastSkip {
@@ -225,6 +227,8 @@ export interface AmsgLastSkip {
    * min-gap               角色自排的任务到点时，离它上一条主动消息还没隔够用户设的间隔
    * recurring-unanswered  重复的任务到点时，用户已经连续几次没回它了（回话后恢复）
    * daily-limit           今天主动发的次数已到用户设的每日上限
+   * chat-overlap          写到一半用户开口聊上了，这句没看到新对话，推送前拦下
+   * in-person             到点时用户正在和这个角色见面，人就在面前，不发手机消息
    */
   reason: (typeof LAST_SKIP_REASONS)[number];
   skippedAt: number;
@@ -291,6 +295,10 @@ export const describeLastSkip = (skip: AmsgLastSkip, formatTime: (ms: number) =>
       return `${when} 那条重复消息这次没发——你已经连续几次没回它了，先停一停；你回一句话，它就照常恢复。`;
     case 'daily-limit':
       return `${when} 那次主动消息没发——今天 ta 主动找你的次数已经到了你设的每日上限，跳过的这次不会补发，明天重新计数。`;
+    case 'chat-overlap':
+      return `${when} 那次主动消息没发——ta 写好的时候你们正好聊上了，那句话没看到你刚说的，就没发出去。`;
+    case 'in-person':
+      return `${when} 那次主动消息没发——当时你们正在见面，人就在面前，就没再发消息；这次不会补发。`;
   }
 };
 
@@ -409,6 +417,12 @@ export interface AmsgFirePackChat {
   messages: { role: string; content: AmsgFirePackChatContent }[];
   /** 这份对话消息打包的时刻（epoch ms）。 */
   builtAt: number;
+  /**
+   * worker 时效块（时钟、实时世界、排程清单等）插在 messages 的这个下标前，
+   * 即本地「实时状态」段所在的位置，和本地路径一样把「回到你自己」留在最后。
+   * 缺省或越界时追加到末尾。
+   */
+  timelyInsertAt?: number;
 }
 
 export interface AmsgFirePack {
@@ -907,6 +921,8 @@ export const renderFirePack = (
      * 传进来；不传用包里那份。
      */
     lastUserMessageAt?: number | null;
+    /** 到点必发、不给角色选择不说（离开后消息）：模板里【开口之前】那段整个拿掉。 */
+    mustSpeak?: boolean;
   },
 ): string => {
   const tz: AmsgTzRef = { tzId: pack.tzId };
@@ -921,6 +937,7 @@ export const renderFirePack = (
   const awayHint = buildAwayHint(pack.targetName, timeSinceUser);
 
   let out = pack.template;
+  if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join('\n')}\n`).join('');
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   // 对方那边的钟：跟上面那行是两个主体各自的时间，文案里各自写清主语（见 buildUserClockHint）。
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
@@ -951,14 +968,8 @@ export const renderFirePack = (
  */
 export const FIRE_PACK_VERSION = 7;
 
-/**
- * 即时对话任务行的 messageSubtype 标签。上游只当自由文本原样透传；客户端两处都认它：
- * 排程时写（activeMsgClient.sendInstantChat）、面板对账时滤（amsg2Tasks 的
- * reconcileTasksWithRemote——即时对话的行不补进任务清单，不然用户正等着的一轮会显示
- * 成「待触发」，还可能被「取消全部」顺手掐掉）。写读两侧靠这一个常量绑死：它是
- * GET /messages 明文投影里唯一可查的即时对话标记，producer 改个说法 filter 就瞎了。
- */
-export const AMSG_INSTANT_CHAT_SUBTYPE = 'instant-chat';
+/** 即时对话任务行的 messageSubtype；定义和分类规则在 amsgTaskKinds。 */
+export { AMSG_INSTANT_CHAT_SUBTYPE } from './amsgTaskKinds';
 
 /**
  * 解析失败时给人看的一句原因。
@@ -975,7 +986,7 @@ export const describeFirePackVersion = (value: string): string => {
     return `包是 v${v}、worker 要 v${FIRE_PACK_VERSION} —— 前端比 worker 旧，打开一次网页让它重新上传`;
   }
   if (typeof v === 'number') {
-    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去设置页重新粘贴部署`;
+    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去「设置 → 主动消息 2.0」点一下「更新 Worker」`;
   }
   return '包里没有版本号（数据损坏）';
 };
@@ -997,8 +1008,9 @@ const chatContentOk = (content: unknown): boolean => {
 const chatFieldOk = (chat: unknown): boolean => {
   if (chat === undefined) return true;
   if (!chat || typeof chat !== 'object' || Array.isArray(chat)) return false;
-  const { messages, builtAt } = chat as Partial<AmsgFirePackChat>;
+  const { messages, builtAt, timelyInsertAt } = chat as Partial<AmsgFirePackChat>;
   return typeof builtAt === 'number'
+    && (timelyInsertAt === undefined || Number.isInteger(timelyInsertAt))
     && Array.isArray(messages) && messages.length > 0
     && messages.every((m) => !!m && typeof m === 'object'
       && typeof (m as { role?: unknown }).role === 'string'
