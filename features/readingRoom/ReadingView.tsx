@@ -1,24 +1,22 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical } from '@phosphor-icons/react';
-import {
-  pageAtOffset,
-  nextPage,
-  previousPage,
-  progressPercent,
-  type ReadingPage,
-} from './paginate';
+import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
+import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
 import { splitParagraphs, verticalChapterRange } from './layout';
 import type { ReadingBook } from './types';
 
 /**
  * 沉浸式阅读视图。
  *
- * 没有常驻顶栏：屏幕上只有正文和左上角一行很小的章节名。
- * 点屏幕中间那一块才弹出菜单（返回 / 目录 / 字号 / 翻页方式）。
+ * 没有常驻顶栏，屏幕上只有正文和左上角一行很淡的章节名。
  *
- * 两种翻页方式：
- * - 横翻：手指左右滑动整页翻。一章读完底部留白，再翻一页进下一章。
- * - 竖滑：连续滚动，只渲染当前章前后几章，长篇不会把 DOM 撑爆。
+ * 左右滑模式：每页**刚好一屏**，用隐藏容器真实测量出这一屏装得下多少字
+ * （见 measure.ts）。整页不可滚动——需要上下滚才能看完一页，说明分页错了。
+ * 竖滑模式：连续滚动，只渲染当前章前后几章。
+ *
+ * 唤出菜单的手势按模式分开，避免和翻页手势抢：
+ * - 左右滑模式：左右滑翻页，**往下滑**唤菜单
+ * - 竖滑模式：上下滚动阅读，**往右滑**唤菜单
  */
 
 export type ReadingFlipMode = 'horizontal' | 'vertical';
@@ -28,23 +26,19 @@ export const READING_FONT_SIZES = [16, 18, 20, 22, 24, 26] as const;
 interface ReadingViewProps {
   book: ReadingBook;
   content: string;
-  /** 打开时的阅读位置（字符偏移）。 */
   initialOffset: number;
   fontSize: number;
   flipMode: ReadingFlipMode;
   onChangeFontSize: (size: number) => void;
   onChangeFlipMode: (mode: ReadingFlipMode) => void;
-  /** 位置变化时回调，由上层落库。 */
   onOffsetChange: (offset: number) => void;
   onExit: () => void;
 }
 
-/** 滑动多远才算一次翻页。太小会让轻微的手抖翻页，太大会觉得滑不动。 */
-const SWIPE_THRESHOLD = 48;
-/** 纵向位移超过这个值就认为用户想滚动或选字，放弃本次翻页。 */
-const SWIPE_VERTICAL_TOLERANCE = 70;
-/** 翻页动画时长，和下面 inline transition 保持一致。 */
-const FLIP_ANIMATION_MS = 180;
+/** 滑动多远算一次手势。太小会被手抖触发，太大会觉得滑不动。 */
+const SWIPE_THRESHOLD = 45;
+/** 翻页动画时长，与下面 inline transition 一致。 */
+const FLIP_ANIMATION_MS = 170;
 
 const ReadingView: React.FC<ReadingViewProps> = ({
   book,
@@ -57,53 +51,116 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   onOffsetChange,
   onExit,
 }) => {
-  const [page, setPage] = useState<ReadingPage>(() => pageAtOffset(content, book.chapters, initialOffset));
+  /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
+  const [offset, setOffset] = useState(initialOffset);
   const [menuOpen, setMenuOpen] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
-  /** 翻页动画方向：'next' 向左推出，'prev' 向右推出，null 表示静止。 */
   const [flipping, setFlipping] = useState<'next' | 'prev' | null>(null);
 
-  const horizontalRef = useRef<HTMLDivElement>(null);
+  /** 当前块的页起点列表。测量得出，字号或屏幕变化后重算。 */
+  const [pageStarts, setPageStarts] = useState<number[]>([]);
+
+  const pageRef = useRef<HTMLDivElement>(null);
+  /** 隐藏的测量容器：与正文同样的宽度和排版，用来试排。 */
+  const measureRef = useRef<HTMLDivElement>(null);
   const verticalRef = useRef<HTMLDivElement>(null);
   const touchRef = useRef<{ x: number; y: number } | null>(null);
-  /** 竖滑模式下由程序触发的滚动，不该被当成用户移动了阅读位置。 */
   const programmaticScrollRef = useRef(false);
   const flipTimerRef = useRef<number | null>(null);
 
-  const chapter = book.chapters[page.chapterIndex];
-  const percent = progressPercent(book, page.start);
+  const chapterIndex = chapterIndexAtOffset(book.chapters, offset);
+  const chapter = book.chapters[chapterIndex];
+  const percent = progressPercent(book, offset);
 
   useEffect(() => () => {
     if (flipTimerRef.current !== null) window.clearTimeout(flipTimerRef.current);
   }, []);
 
-  // 换字号后页边界会变，位置要按当前偏移重新对齐，不能停在旧边界上。
-  useEffect(() => {
-    setPage(current => pageAtOffset(content, book.chapters, current.start));
-  }, [book.chapters, content, fontSize]);
+  /**
+   * 当前块：先用纯计算把章切成固定大小的块，再只对这一块做测量分页。
+   * 不直接量整章——「无目录」的书整章可能上百万字，一次量完会卡死。
+   */
+  const block = useMemo(
+    () => pageAtOffset(content, book.chapters, offset, READING_BLOCK_SIZE),
+    [book.chapters, content, offset],
+  );
 
-  const goToOffset = useCallback((offset: number) => {
-    const target = pageAtOffset(content, book.chapters, offset);
-    setPage(target);
-    onOffsetChange(target.start);
-  }, [book.chapters, content, onOffsetChange]);
+  /**
+   * 测量分页。必须在布局阶段做（useLayoutEffect），
+   * 否则会先闪一帧按旧页边界排的内容。
+   */
+  useLayoutEffect(() => {
+    if (flipMode !== 'horizontal') return;
+    const host = measureRef.current;
+    const viewport = pageRef.current;
+    if (!host || !viewport) return;
 
+    const limit = viewport.clientHeight;
+    if (limit <= 0) return;
+
+    const fits = (start: number, length: number): boolean => {
+      host.textContent = content.slice(start, start + length);
+      return host.scrollHeight <= limit;
+    };
+    const starts = paginateBlock(block.start, block.end, fits);
+    host.textContent = '';
+    setPageStarts(starts);
+  }, [block.start, block.end, content, flipMode, fontSize]);
+
+  const pageIndex = pageIndexForOffset(pageStarts, offset);
+  const pageStart = pageStarts[pageIndex] ?? block.start;
+  const pageEnd = pageStarts[pageIndex + 1] ?? block.end;
+  const pageText = useMemo(() => content.slice(pageStart, pageEnd), [content, pageEnd, pageStart]);
+
+  const commitOffset = useCallback((next: number) => {
+    setOffset(next);
+    onOffsetChange(next);
+  }, [onOffsetChange]);
+
+  /**
+   * 翻页。页内走 pageStarts，跨块/跨章时交给 pageAtOffset 算出相邻块，
+   * 块内第一页/最后一页由下一轮测量确定。
+   */
   const flipTo = useCallback((direction: 'next' | 'prev') => {
-    const target = direction === 'next'
-      ? nextPage(content, book.chapters, page)
-      : previousPage(content, book.chapters, page);
-    if (!target) return;
-    setFlipping(direction);
-    // 动画放完再换内容，否则会闪一下旧文字。
-    flipTimerRef.current = window.setTimeout(() => {
-      setPage(target);
-      onOffsetChange(target.start);
-      setFlipping(null);
-      horizontalRef.current?.scrollTo({ top: 0 });
-    }, FLIP_ANIMATION_MS);
-  }, [book.chapters, content, onOffsetChange, page]);
+    if (flipping) return;
+    let target: number | null = null;
+    if (direction === 'next') {
+      if (pageIndex + 1 < pageStarts.length) target = pageStarts[pageIndex + 1];
+      else if (block.end < content.length) target = block.end; // 下一块（可能是下一章）
+    } else if (pageIndex > 0) {
+      target = pageStarts[pageIndex - 1];
+    } else if (block.start > 0) {
+      // 回到上一块。落在它的末尾，下一轮测量会把位置对齐到那一块的最后一页。
+      target = block.start - 1;
+    }
+    if (target === null) return;
 
-  // ——— 横翻手势 ———
+    const resolved = target;
+    setFlipping(direction);
+    flipTimerRef.current = window.setTimeout(() => {
+      commitOffset(resolved);
+      setFlipping(null);
+    }, FLIP_ANIMATION_MS);
+  }, [block.end, block.start, commitOffset, content.length, flipping, pageIndex, pageStarts]);
+
+  /**
+   * 往上一块翻时落点是「块末尾 - 1」，需要在测量完成后对齐到那一块的最后一页。
+   * 判断依据：当前偏移落在最后一页之内但不等于它的起点。
+   */
+  useEffect(() => {
+    if (flipMode !== 'horizontal' || pageStarts.length === 0) return;
+    const start = pageStarts[pageIndexForOffset(pageStarts, offset)];
+    if (start !== undefined && start !== offset) setOffset(start);
+    // 只在测量结果变化时对齐，不把 offset 列进依赖，避免自触发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flipMode, pageStarts]);
+
+  const goToOffset = useCallback((next: number) => {
+    setChaptersOpen(false);
+    commitOffset(next);
+  }, [commitOffset]);
+
+  // ——— 手势 ———
   const handleTouchStart = useCallback((event: React.TouchEvent) => {
     const touch = event.touches[0];
     touchRef.current = { x: touch.clientX, y: touch.clientY };
@@ -112,51 +169,48 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const handleTouchEnd = useCallback((event: React.TouchEvent) => {
     const origin = touchRef.current;
     touchRef.current = null;
-    if (!origin || flipping) return;
+    if (!origin) return;
     const touch = event.changedTouches[0];
     const deltaX = touch.clientX - origin.x;
     const deltaY = touch.clientY - origin.y;
+    const horizontal = Math.abs(deltaX) > Math.abs(deltaY);
 
-    // 纵向动得比横向多：用户在滚动或选字，不翻页。
-    if (Math.abs(deltaY) > SWIPE_VERTICAL_TOLERANCE && Math.abs(deltaY) > Math.abs(deltaX)) return;
-
-    if (Math.abs(deltaX) >= SWIPE_THRESHOLD) {
-      flipTo(deltaX < 0 ? 'next' : 'prev');
+    if (flipMode === 'horizontal') {
+      if (horizontal && Math.abs(deltaX) >= SWIPE_THRESHOLD) {
+        flipTo(deltaX < 0 ? 'next' : 'prev');
+        return;
+      }
+      // 往下滑唤出菜单（和 CoRead 一致）。往上滑留空，以后可以接别的操作。
+      if (!horizontal && deltaY >= SWIPE_THRESHOLD) setMenuOpen(true);
       return;
     }
 
-    // 几乎没动：当成点击。只有点在屏幕中央那块才弹菜单；
-    // 两侧和上下边缘不做事，避免阅读时误触。
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const ratioX = (touch.clientX - bounds.left) / Math.max(1, bounds.width);
-    const ratioY = (touch.clientY - bounds.top) / Math.max(1, bounds.height);
-    if (ratioX > 0.3 && ratioX < 0.7 && ratioY > 0.15 && ratioY < 0.85) setMenuOpen(true);
-  }, [flipTo, flipping]);
+    // 竖滑模式：上下留给滚动，往右滑唤出菜单。
+    if (horizontal && deltaX >= SWIPE_THRESHOLD) setMenuOpen(true);
+  }, [flipMode, flipTo]);
 
   // ——— 竖滑 ———
   const verticalParagraphs = useMemo(() => {
     if (flipMode !== 'vertical') return [];
-    const { first, last } = verticalChapterRange(book.chapters, page.chapterIndex);
+    const { first, last } = verticalChapterRange(book.chapters, chapterIndex);
     const from = book.chapters[first]?.start ?? 0;
     const to = book.chapters[last]?.end ?? content.length;
     return splitParagraphs(content, from, to);
-  }, [book.chapters, content, flipMode, page.chapterIndex]);
+  }, [book.chapters, chapterIndex, content, flipMode]);
 
-  /** 进入竖滑、或渲染窗口换了章时，滚到当前阅读位置。 */
   useEffect(() => {
     if (flipMode !== 'vertical') return;
     const container = verticalRef.current;
     if (!container) return;
     programmaticScrollRef.current = true;
-    const nodes = container.querySelectorAll<HTMLElement>('[data-offset]');
     let target: HTMLElement | null = null;
-    for (const node of nodes) {
-      if (Number(node.dataset.offset) >= page.start) { target = node; break; }
+    for (const node of container.querySelectorAll<HTMLElement>('[data-offset]')) {
+      if (Number(node.dataset.offset) >= offset) { target = node; break; }
     }
     if (target) container.scrollTop = Math.max(0, target.offsetTop - 12);
     const timer = window.setTimeout(() => { programmaticScrollRef.current = false; }, 150);
     return () => window.clearTimeout(timer);
-    // page.start 变化时不重滚：那多半就是这次滚动本身上报的，会打架。
+    // offset 变化时不重滚：那通常就是这次滚动自己上报的，会打架。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flipMode, verticalParagraphs]);
 
@@ -164,22 +218,15 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     if (programmaticScrollRef.current) return;
     const container = verticalRef.current;
     if (!container) return;
-    const nodes = container.querySelectorAll<HTMLElement>('[data-offset]');
-    let topOffset: number | null = null;
-    for (const node of nodes) {
+    for (const node of container.querySelectorAll<HTMLElement>('[data-offset]')) {
       if (node.offsetTop + node.offsetHeight > container.scrollTop) {
-        topOffset = Number(node.dataset.offset);
-        break;
+        const top = Number(node.dataset.offset);
+        setOffset(top);
+        onOffsetChange(top);
+        return;
       }
     }
-    if (topOffset === null) return;
-    const aligned = pageAtOffset(content, book.chapters, topOffset);
-    // 只在跨章时重设 page（会换渲染窗口）；同章内只上报偏移，避免每次滚动都重排。
-    setPage(current => (current.chapterIndex === aligned.chapterIndex ? current : aligned));
-    onOffsetChange(topOffset);
-  }, [book.chapters, content, onOffsetChange]);
-
-  const pageText = useMemo(() => content.slice(page.start, page.end), [content, page]);
+  }, [onOffsetChange]);
 
   const bumpFontSize = useCallback((step: 1 | -1) => {
     const index = READING_FONT_SIZES.indexOf(fontSize as typeof READING_FONT_SIZES[number]);
@@ -187,54 +234,76 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     onChangeFontSize(READING_FONT_SIZES[Math.min(READING_FONT_SIZES.length - 1, Math.max(0, base + step))]);
   }, [fontSize, onChangeFontSize]);
 
+  /** 正文与测量容器必须共用这一份样式，否则量出来的页放不进真实页面。 */
   const textStyle: React.CSSProperties = {
     fontSize,
     lineHeight: 1.95,
     fontFamily: '"Noto Serif SC", Georgia, serif',
     color: '#3a3027',
+    whiteSpace: 'pre-wrap',
+    textIndent: '2em',
+    wordBreak: 'break-word',
   };
+
+  const atBookStart = chapterIndex === 0 && pageIndex === 0 && block.start === 0;
+  const atBookEnd = pageEnd >= content.length;
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#f6ecd9]">
-      {/* 唯一的常驻信息：左上角一行很小很淡的章节名。 */}
+      {/* 唯一常驻信息：左上角一行很小很淡的章节名。 */}
       <div
-        className="pointer-events-none absolute left-0 right-0 top-0 z-10 px-6 pb-1 text-[11px] text-stone-400/90"
-        style={{ paddingTop: 'calc(var(--safe-top) + 10px)' }}
+        className="pointer-events-none absolute left-0 right-0 top-0 z-10 px-6 text-[11px] text-stone-400/90"
+        style={{ paddingTop: 'calc(var(--safe-top) + 8px)' }}
       >
         <span className="line-clamp-1">
-          第{page.chapterIndex + 1}章{chapter?.title && chapter.title !== '全文' ? ` ${chapter.title}` : ''}
+          第{chapterIndex + 1}章{chapter?.title && chapter.title !== '全文' ? ` ${chapter.title}` : ''}
         </span>
       </div>
 
       {flipMode === 'horizontal' ? (
-        <div className="h-full w-full" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}>
+        <div
+          className="h-full w-full"
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
+        >
+          {/* 整页不可滚动：要滚才能读完一页就说明分页错了。 */}
           <div
-            ref={horizontalRef}
-            className="h-full w-full overflow-y-auto no-scrollbar px-6"
+            ref={pageRef}
+            className="h-full w-full overflow-hidden px-6"
             style={{
-              paddingTop: 'calc(var(--safe-top) + 40px)',
-              paddingBottom: 'calc(var(--safe-bottom) + 28px)',
-              transform: flipping === 'next' ? 'translateX(-12%)' : flipping === 'prev' ? 'translateX(12%)' : 'translateX(0)',
-              opacity: flipping ? 0.25 : 1,
-              transition: `transform ${FLIP_ANIMATION_MS}ms ease-out, opacity ${FLIP_ANIMATION_MS}ms ease-out`,
+              paddingTop: 'calc(var(--safe-top) + 34px)',
+              paddingBottom: 'calc(var(--safe-bottom) + 20px)',
             }}
           >
-            {/* 整页一个 pre-wrap 块：第二期按字符偏移还原划线时不必跨多个 <p> 做映射。 */}
-            <div style={{ ...textStyle, whiteSpace: 'pre-wrap', textIndent: '2em' }}>{pageText}</div>
+            <div
+              style={{
+                ...textStyle,
+                transform: flipping === 'next' ? 'translateX(-10%)' : flipping === 'prev' ? 'translateX(10%)' : 'translateX(0)',
+                opacity: flipping ? 0.2 : 1,
+                transition: `transform ${FLIP_ANIMATION_MS}ms ease-out, opacity ${FLIP_ANIMATION_MS}ms ease-out`,
+              }}
+            >
+              {pageText}
+            </div>
           </div>
+
+          {/* 测量容器：宽度与正文一致、位置在屏外，不参与点击与朗读。 */}
+          <div
+            ref={measureRef}
+            aria-hidden
+            className="pointer-events-none absolute left-6 right-6 top-0 -z-10 opacity-0"
+            style={{ ...textStyle, visibility: 'hidden' }}
+          />
         </div>
       ) : (
         <div
           ref={verticalRef}
           onScroll={handleVerticalScroll}
-          onClick={event => {
-            const bounds = event.currentTarget.getBoundingClientRect();
-            const ratioX = (event.clientX - bounds.left) / Math.max(1, bounds.width);
-            if (ratioX > 0.3 && ratioX < 0.7) setMenuOpen(true);
-          }}
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
           className="h-full w-full overflow-y-auto no-scrollbar px-6"
           style={{
-            paddingTop: 'calc(var(--safe-top) + 40px)',
+            paddingTop: 'calc(var(--safe-top) + 34px)',
             paddingBottom: 'calc(var(--safe-bottom) + 40px)',
           }}
         >
@@ -243,11 +312,18 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               key={paragraph.offset}
               data-offset={paragraph.offset}
               className="mb-4"
-              style={{ ...textStyle, textIndent: '2em' }}
+              style={{ ...textStyle, whiteSpace: 'normal' }}
             >
               {paragraph.text}
             </p>
           ))}
+        </div>
+      )}
+
+      {/* 第一次进来时提示手势，之后不再显示（只在最开头那一页出现）。 */}
+      {atBookStart && !menuOpen && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
+          {flipMode === 'horizontal' ? '左右滑翻页 · 向下滑唤出菜单' : '上下滑阅读 · 向右滑唤出菜单'}
         </div>
       )}
 
@@ -263,13 +339,13 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             <div className="flex items-center gap-3 px-4 pt-4">
               <button
                 onClick={onExit}
-                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm active:scale-95 transition"
+                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
               >
                 <ArrowLeft size={16} weight="bold" /> 书架
               </button>
               <button
                 onClick={() => { setMenuOpen(false); setChaptersOpen(true); }}
-                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm active:scale-95 transition"
+                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
               >
                 <List size={16} weight="bold" /> 目录
               </button>
@@ -281,7 +357,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               <button
                 onClick={() => bumpFontSize(-1)}
                 disabled={fontSize <= READING_FONT_SIZES[0]}
-                className="rounded-lg bg-stone-200/80 p-2 active:scale-90 transition disabled:opacity-35"
+                className="rounded-lg bg-stone-200/80 p-2 transition active:scale-90 disabled:opacity-35"
                 aria-label="缩小字号"
               >
                 <Minus size={16} weight="bold" />
@@ -290,7 +366,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               <button
                 onClick={() => bumpFontSize(1)}
                 disabled={fontSize >= READING_FONT_SIZES[READING_FONT_SIZES.length - 1]}
-                className="rounded-lg bg-stone-200/80 p-2 active:scale-90 transition disabled:opacity-35"
+                className="rounded-lg bg-stone-200/80 p-2 transition active:scale-90 disabled:opacity-35"
                 aria-label="放大字号"
               >
                 <Plus size={16} weight="bold" />
@@ -314,6 +390,9 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                 </button>
               </div>
             </div>
+            <p className="px-4 pb-1 text-[10px] leading-relaxed text-stone-400">
+              {flipMode === 'horizontal' ? '左右滑翻页，向下滑唤出这个菜单' : '上下滑阅读，向右滑唤出这个菜单'}
+            </p>
           </div>
         </div>
       )}
@@ -337,14 +416,21 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               {book.chapters.map((item, index) => (
                 <button
                   key={`${item.start}_${index}`}
-                  onClick={() => { setChaptersOpen(false); goToOffset(item.start); }}
-                  className={`w-full border-b border-stone-200/70 px-4 py-3 text-left text-sm active:bg-stone-200/60 ${index === page.chapterIndex ? 'bg-stone-200/80 font-semibold' : ''}`}
+                  onClick={() => goToOffset(item.start)}
+                  className={`w-full border-b border-stone-200/70 px-4 py-3 text-left text-sm active:bg-stone-200/60 ${index === chapterIndex ? 'bg-stone-200/80 font-semibold' : ''}`}
                 >
                   <span className="line-clamp-1">{item.title}</span>
                 </button>
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 读到最后一页时给个收尾提示，免得以为是卡住了。 */}
+      {atBookEnd && !menuOpen && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
+          已经是最后一页了
         </div>
       )}
     </div>

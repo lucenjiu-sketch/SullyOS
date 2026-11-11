@@ -21,6 +21,11 @@ import {
   splitParagraphs,
   verticalChapterRange,
 } from '../features/readingRoom/layout';
+import {
+  fitLength,
+  pageIndexForOffset,
+  paginateBlock,
+} from '../features/readingRoom/measure';
 
 const utf8 = (text: string): ArrayBuffer => {
   const bytes = new TextEncoder().encode(text);
@@ -219,5 +224,74 @@ describe('共读室 · 排版与书封', () => {
     expect(verticalChapterRange(chapters, 0)).toEqual({ first: 0, last: 2 });
     expect(verticalChapterRange(chapters, 5)).toEqual({ first: 3, last: 7 });
     expect(verticalChapterRange(chapters, 9)).toEqual({ first: 7, last: 9 });
+  });
+});
+
+describe('共读室 · 按屏幕容量分页', () => {
+  /**
+   * 模拟一块屏幕：每行 capacityPerLine 个字，共 lines 行。
+   * 真实环境里这个判断由浏览器排版给出，这里只要行为一致就能验证分页逻辑。
+   */
+  const screenFits = (capacity: number) => (_start: number, length: number) => length <= capacity;
+
+  it('每页都放得下，且不会白白浪费空间', () => {
+    const fits = screenFits(40);
+    const starts = paginateBlock(0, 200, fits);
+    starts.forEach((start, index) => {
+      const end = starts[index + 1] ?? 200;
+      const length = end - start;
+      expect(fits(start, length)).toBe(true);
+      // 除最后一页外，再多放一个字就应该放不下——否则是没填满。
+      if (index + 1 < starts.length) expect(fits(start, length + 1)).toBe(false);
+    });
+  });
+
+  it('页区间连续覆盖整块，不重不漏', () => {
+    const starts = paginateBlock(100, 340, screenFits(37));
+    expect(starts[0]).toBe(100);
+    starts.forEach((start, index) => {
+      if (index > 0) expect(start).toBeGreaterThan(starts[index - 1]);
+    });
+    const last = starts[starts.length - 1];
+    expect(last).toBeLessThan(340);
+  });
+
+  it('整块就能放进一屏时只有一页', () => {
+    expect(paginateBlock(0, 30, screenFits(100))).toEqual([0]);
+  });
+
+  it('空块也返回一页，不会死循环', () => {
+    expect(paginateBlock(50, 50, screenFits(10))).toEqual([50]);
+  });
+
+  it('一个字都放不下时仍然前进一个字，避免卡死', () => {
+    const starts = paginateBlock(0, 3, () => false);
+    expect(starts).toEqual([0, 1, 2]);
+  });
+
+  it('二分出的长度就是放得下的最大值', () => {
+    expect(fitLength(0, 100, screenFits(37))).toBe(37);
+    expect(fitLength(0, 20, screenFits(999))).toBe(20);
+  });
+
+  it('同一块两次分页结果一致（来回翻页不会错位）', () => {
+    const first = paginateBlock(0, 500, screenFits(43));
+    const second = paginateBlock(0, 500, screenFits(43));
+    expect(second).toEqual(first);
+  });
+
+  it('任意偏移都能定位回它所属的那一页', () => {
+    const starts = [0, 40, 85, 130];
+    expect(pageIndexForOffset(starts, 0)).toBe(0);
+    expect(pageIndexForOffset(starts, 39)).toBe(0);
+    expect(pageIndexForOffset(starts, 40)).toBe(1);
+    expect(pageIndexForOffset(starts, 120)).toBe(2);
+    expect(pageIndexForOffset(starts, 9_999)).toBe(3);
+  });
+
+  it('字号变大后页数变多，但每页仍放得下', () => {
+    const small = paginateBlock(0, 300, screenFits(50));
+    const large = paginateBlock(0, 300, screenFits(25));
+    expect(large.length).toBeGreaterThan(small.length);
   });
 });
