@@ -121,6 +121,61 @@ shell 的 `;` 不看前一条成不成。代码没丢（已经合进 master 了�
 
 所以：**推送一律写全远端和分支名。**
 
+**13. 终端工具会被「输出太大」和「跑太久」卡死，不是网的问题。**
+2026-11-11 补的。这次久连问了四次「是不是网卡了」「是不是没活了」，
+我花了好几轮才定位——她那边看到的就是卡住，很慌。别让她再这样等。
+
+三个已确认的卡死原因，都跟网络无关：
+
+- **`git diff` 啃大文件**：这仓库有 `pnpm-lock.yaml`（15 万行）和
+  `worker/amsg/worker.bundle.js`。`git diff --name-only --diff-filter=U`
+  在 62 个冲突时直接把会话卡死。
+  **改用 `git ls-files -u --format='%(path)' | sort -u`**，秒回。
+- **读大日志**：全量 vitest 的日志有 **90 万字节**，`read_file` 读不回来。
+  **先 `tail -c 400 日志` 只取摘要**，不要整个读。
+- **长命令占住会话**：全量测试要跑 25 分钟，工具等不住就断，
+  而且**那个会话会一直被占着**，后续命令全都没响应。
+  这时候不是挂了：**换 `session_name` 开新会话就能继续**（这次用的 k3）。
+
+判断方法：先发一条 `echo alive`。
+秒回 = 通道没事，是刚才那条命令太重；没回 = 会话被占，换 session_name。
+
+**顺带：heredoc（`<<'EOF'`）在这个工具里会把后面串联的命令一起吃掉。**
+写多行文本用 `printf '%s\n' ...`，或者写完单独再发一条命令确认结果。
+这次 `git commit -F -` 用 heredoc，提交成功了但后面的 `git log` 没执行，
+看起来像失败——别被骗，单独查一次 `git log --oneline -1`。
+
+**14. 本地构建要加内存参数，不然收尾阶段 OOM。**
+同一天。`npx vite build` 会打印 `✓ built in 1m 32s` 然后 **OOM 崩掉**，
+很容易误判成构建失败——其实 JS 都打完了，炸的是 Service Worker
+缓存清单那一步（`scripts/static-cache-build.ts`）。
+
+```bash
+NODE_OPTIONS="--max-old-space-size=3072" timeout 900 npx vite build
+```
+
+**成功的标志是最后那行 `Static cache: NN shell files / NNNN versioned resources`。**
+没有这行就是没跑完。另外别找 `dist/sw.js`——这项目不生成那个文件，
+清单是用 `define: __STATIC_CACHE_MANIFEST__` 编译进 JS 的。我找错过一次。
+
+Vercel 内存充足，不受这个影响。
+
+**15. 测试失败先做三方对照，不要先改代码。**
+同一天。全量测试 **109 个失败**，看着很吓人。正确做法是 worktree 对照：
+
+```bash
+git worktree add /tmp/wt2 <合并前的 sha>     # 她线上那版
+git worktree add /tmp/wt3 upstream/master    # 纯上游，没有她的改动
+ln -sfn ~/push/node_modules /tmp/wtN/node_modules   # 省一次装依赖
+```
+
+这次结论：**纯上游跑同一批 97 failed / 115 passed，跟合并后一模一样**，
+证明 109 个失败全部来自上游（主要是 `ReferenceError: location is not defined`，
+出在上游新文件 `apps/room3d/resourcePackGLTF.ts`，测试环境没有浏览器 `location`）。
+失败集中在 garment / wardrobe / room3d / chibi 这些衣服和 3D 房间的测试上。
+
+**数字一致才叫证明，「看着无关」不算。** 查完记得 `git worktree remove --force`。
+
 ---
 
 ## MCP 调不动那件事：已查实，不用再查
@@ -367,6 +422,66 @@ git diff --name-only origin/master HEAD
 ```
 两边有交集 = 有冲突，逐文件看；无交集 = 安全，直接 merge。
 
+## ⏳ 本次上游同步（2026-11-11）—— 等她真机验
+
+分支 `sync/upstream-20261111`，提交 `2091a49d`，**已推 origin，还没开 PR**。
+上游 681b1018，**169 个提交 1185 个文件**（前两次是 33 和 30 个提交，这次约五倍）。
+62 个文件冲突：55 个取上游原版，7 个手工解。解完相对上游只差 22 个文件。
+
+### 手工解的 7 个
+
+| 文件 | 怎么解 |
+|---|---|
+| `utils/activeMsgClient.ts` | +1 行，开关传参 |
+| `utils/context.ts` | +3 行，antiFiller 判断 + 补 import（取上游后 import 没了，必须补） |
+| `utils/chatOutputStylePrompt.ts` | +5 行，上游新增 `sarEnvelopeActive` 参数，开关照旧只包自带引导 |
+| `utils/chatRequestPayload.ts` | +1 行，开关传参（放在条件展开外面，和原来一致） |
+| `utils/chatPrompts.ts` | 2 组：import 两边都留；userLocation 取上游（多传 `char.id`） |
+| `apps/Chat.tsx` | 1 组，**取上游**。上游把 `mergedFineTune` 等三行上移了，保留会重复声明 |
+| `context/OSContext.tsx` | 7 组，见下 |
+
+### OSContext.tsx 的 7 组
+
+全部取上游。其中 4 组是 `ProactiveChat`（上游删了那个模块，换成 amsg2），
+包括一块 **446 行**的整段实现（2289-2736 行）。删完 grep 过
+`proactiveQueueRef` / `proactiveRunningRef` / `drainQueuedProactive` / `runProactive`
+四个变量确认零残留。另外 3 组是上游新增的备份逻辑（用户空间、text_only 资产）。
+
+**抓包代码没被碰**：`ResponseCapture` / `usageClone` / `API_REQUEST_CAPTURE_ARMED_KEY`
+四处都在，`apiResponseCapture.test.ts` + `apiCallLog.test.ts` 46 passed。
+
+### 跟随上游删掉的文件
+
+`components/chat/ProactiveSettingsModal.tsx` / `utils/proactiveChat.ts` /
+`utils/proactiveChat.test.ts`（旧主动消息架构整套）。
+前两个 `git checkout upstream/master -- <文件>` 会失败（上游没这文件），用 `git rm`。
+
+### 验证记录
+
+- `NODE_OPTIONS="--max-old-space-size=3072" npx vite build` 通过
+  `Static cache: 23 shell files (4.9 MiB), 1323 versioned resources`
+- 开关 + 抓包测试：**83 passed**
+- 全量：**8622 passed / 109 failed**。109 个已证明全部来自上游（见第 15 条对照方法）
+- 依赖这次正常装完，没报上次那个发布时间策略错误
+
+### 她要真机测什么（按这个顺序问她）
+
+**先提醒她：页面彻底关掉重开**（关标签页，不是切后台）。见第 8 条。
+
+1. 聊天设置 → 角色扮演规范，**七个开关逐个开关一次**，看有没有反应
+   （这次动了 `chatPrompts.ts` / `context.ts` / `chatOutputStylePrompt.ts`，
+   开关是重点怀疑对象）
+2. 「线上聊天状态」关掉后，角色能不能做动作描写（`*走过去抱住你*`）
+3. 「本次发送统计」抓一次，看响应面板有没有内容
+4. 正常聊两句、打一次电话
+5. 上游新东西顺带看看：见面挂起提醒、离开消息、amsg2 设置页变成引导式步骤
+
+**她说可以 → 开 PR → 等她点头才合 master。**（第 1 条、第 5 条）
+
+合进 master 之后再单独问她要不要补历史断层那笔记录。
+
+---
+
 ## ✅ 上游同步已完成（2026-10-22）
 
 分支 `sync/upstream-20261022`，PR #5。上游 30 个提交 256 个文件，
@@ -420,6 +535,57 @@ Vercel 那边自己按 lock 装，不受这个影响。
 ### 下次同步上游的流程
 
 **她改过的文件清单（冲突只会落在这些上）**
+
+⚠️ **2026-11-11 更正：之前的清单漏了两个文件，差点丢掉一个开关。**
+权威清单用这条命令现查，别照抄笔记（笔记会过期）：
+
+```bash
+cd ~/push && git grep -l -E 'resolveRpPromptToggles|rpPromptToggles|thinkingChainPromptEnabled|rpOnlineStateEnabled|buildApiResponseCapture' origin/master -- '*.ts' '*.tsx' | sed 's/^origin\/master://'
+```
+
+2026-11-11 实查结果（14 个，加粗的是原来漏记的）：
+`utils/rpPromptToggles.ts` / `characterResponsePrinciples.ts` / `characterCard.ts` /
+`chatOutputStylePrompt.ts` / `chatPrompts.ts` / `chatRequestPayload.ts` /
+**`utils/context.ts`**（「表达底线」antiFiller 真正生效的地方，第 722 行那个 `if`
+套了 `resolveRpPromptToggles(char).antiFiller`，还要记得补 import）/
+**`utils/activeMsgClient.ts`**（第 869 行传 `thinkingChainPromptEnabled`）/
+`apps/Chat.tsx` / `apps/CallApp.tsx` / `components/chat/ChatModals.tsx` /
+`features/collaboration/context.ts` / `types.ts` / `utils/apiCallLog.ts`
+抓包另外还有：`context/OSContext.tsx` / `components/settings/ApiCallLogModal.tsx`
+（这两个文件里没有上面那些关键词，grep 查不到，要单独记着）
+
+**⚠️ 判断「这是她的改动」不能只看 `git diff origin/master upstream/master`。**
+2026-11-11 踩到：历史断层（见下）会让**上游自己的新代码**显示成「她删掉的」。
+我差点保留 `apps/Chat.tsx` 里三行"看起来是她的"代码——其实是上游把那三行
+上移了，保留下来就是重复声明，构建直接失败。
+`apps/Settings.tsx`（-96 行）、`apps/room3d/editor.js`（-9 行）同样是这个假象。
+
+**正确办法：拿关键词清单（上面那条 grep）当准绳，不在清单里的一律取上游。**
+拿不准就查「这个变量在 upstream/master 里还存在吗」——
+存在就是上游挪了位置，必须取上游。
+
+### ⚠️ 历史断层：10-22 那次同步没接上血脉
+
+2026-11-11 查实。`git merge-base origin/master upstream/master` 返回的是
+**10-12** 的提交（`a333d0ea`），不是 10-22。原因是 10-22 那次合并
+把上游内容抄进来了，但没留下 merge 记录。
+
+后果：10-22 那批 30 个提交 git 还要**再合一遍**，表现为一堆
+`CONFLICT (add/add)` —— 两边都「新建」了同一个文件（`utils/userLocation.ts`
+`storyTheaterArchive.ts` `docs/user-location.md` 这些她压根没碰过的）。
+这次 62 个冲突里有 50 个是这种旧账。
+
+**分类的正确基准是上次同步时的上游 tip（`e19dcc12`），不是 merge-base：**
+```bash
+git diff --quiet e19dcc12 origin/master -- <文件>   # 静默=旧账，有输出=她真改过
+```
+用 merge-base 当基准会把 60 个文件全判成「她改过」，等于没分类。
+
+**跟久说过了，她同意这次照旧扛一遍，合并完单独补那笔记录。**
+补之前她要先真机验过并合进 master——一次只干一件事，是她定的。
+不补的话下次同步还要再扛一遍，而且会越来越厚。
+
+
 提示词开关那套：`utils/rpPromptToggles.ts` / `characterResponsePrinciples.ts` /
 `characterCard.ts` / `chatOutputStylePrompt.ts` / `apps/Chat.tsx` /
 `components/chat/ChatModals.tsx` / `apps/CallApp.tsx` /
