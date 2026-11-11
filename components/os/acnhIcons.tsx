@@ -128,6 +128,11 @@ const ACNH_ICON_MAP: Partial<Record<AppID, React.ReactNode>> = {
   [AppID.Study]: draw([21, 24, 79, 77], bookGlyph),
   [AppID.Worldbook]: draw([21, 24, 79, 77], bookGlyph),
   [AppID.Guidebook]: draw([21, 24, 79, 77], bookGlyph),
+  // 共读室和上面几个都是书，用一枚夹在书里的书签区分开，不然桌面上四个图标一模一样。
+  [AppID.ReadingRoom]: draw([21, 24, 79, 82], <>
+    {bookGlyph}
+    <path d="M58 28 V58 L64 52 L70 58 V28Z" fill="#82D5BB" stroke={BROWN} strokeWidth="2.5" strokeLinejoin="round" />
+  </>),
   [AppID.Schedule]: draw([22, 20, 78, 80], <>
     <rect x="22" y="26" width="56" height="54" rx="8" fill={CREAM} />
     <rect x="22" y="26" width="56" height="16" rx="8" fill="#FC736D" />
