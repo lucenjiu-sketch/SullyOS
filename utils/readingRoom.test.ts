@@ -15,6 +15,12 @@ import {
   previousPage,
   progressPercent,
 } from '../features/readingRoom/paginate';
+import {
+  coverPalette,
+  coverTitleLines,
+  splitParagraphs,
+  verticalChapterRange,
+} from '../features/readingRoom/layout';
 
 const utf8 = (text: string): ArrayBuffer => {
   const bytes = new TextEncoder().encode(text);
@@ -176,5 +182,42 @@ describe('共读室 · 分页', () => {
     expect(progressPercent({ charCount: 0 }, 50)).toBe(0);
     expect(progressPercent({ charCount: 200 }, 50)).toBe(25);
     expect(progressPercent({ charCount: 200 }, 999)).toBe(100);
+  });
+});
+
+describe('共读室 · 排版与书封', () => {
+  it('段落偏移指向正文第一个字，不落在缩进空白上', () => {
+    const content = '第一章\n\n    他推开门。\n\n外面在下雨。';
+    const paragraphs = splitParagraphs(content, 0, content.length);
+    expect(paragraphs.map(item => item.text)).toEqual(['第一章', '他推开门。', '外面在下雨。']);
+    // 用偏移直接去原文取字，必须对得上——竖滑进度和第二期划线都依赖这一点。
+    paragraphs.forEach(item => {
+      expect(content.slice(item.offset, item.offset + item.text.length)).toBe(item.text);
+    });
+  });
+
+  it('只切指定区间，不把别的章节带进来', () => {
+    const content = '甲甲甲\n乙乙乙\n丙丙丙';
+    const paragraphs = splitParagraphs(content, 4, 8);
+    expect(paragraphs.map(item => item.text)).toEqual(['乙乙乙']);
+  });
+
+  it('同一本书的封面配色每次都一样', () => {
+    expect(coverPalette('book_abc')).toEqual(coverPalette('book_abc'));
+    expect(coverPalette('book_abc').from).toMatch(/^#[0-9A-Fa-f]{6}$/);
+  });
+
+  it('过长的书名在封面上截断', () => {
+    expect(coverTitleLines('短名')).toBe('短名');
+    expect(coverTitleLines('一二三四五六七八九十', 4)).toBe('一二三四…');
+  });
+
+  it('竖滑渲染窗口夹在章节范围内，不越界', () => {
+    const chapters = Array.from({ length: 10 }, (_, index) => ({
+      start: index * 10, end: index * 10 + 10, title: `${index}`,
+    }));
+    expect(verticalChapterRange(chapters, 0)).toEqual({ first: 0, last: 2 });
+    expect(verticalChapterRange(chapters, 5)).toEqual({ first: 3, last: 7 });
+    expect(verticalChapterRange(chapters, 9)).toEqual({ first: 7, last: 9 });
   });
 });
