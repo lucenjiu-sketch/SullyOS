@@ -1,7 +1,15 @@
+import { listUserSpaces } from '../utils/userSpaces';
+import { BackupMissingAssetsNotice } from '../components/BackupMissingAssetsNotice';
+import type { BackupMissingAsset } from '../utils/backupMissingAssets';
+import { readBackupPreferences, updateBackupPreferences } from '../utils/backupPreferences';
+import {CharacterWeatherCities} from '../components/settings/CharacterAwarenessSettings';
+import {cleanCharacterWeatherCities} from '../utils/characterWeather';
 import NavigationBallSettings from '../components/settings/NavigationBallSettings';
 import { useSettingsFocus } from '../utils/settingsNavigation';
 import ApiPresetGroups from '../components/settings/ApiPresetGroups';
 import DialogueApiFields from '../components/settings/DialogueApiFields';
+import { llmApiType, normalizeLlmBaseUrl, type LlmApiType } from '../utils/llmEndpoint';
+import { fetchLlm } from '../utils/anthropicApi';
 import ModelPicker from '../components/settings/ModelPicker';
 import { buildModelPickerView } from '../utils/modelPickerView';
 
@@ -12,7 +20,7 @@ import { Capacitor } from '@capacitor/core';
 import { extractContent, safeResponseJson } from '../utils/safeApi';
 import { extractModelIds, normalizeModelIds } from '../utils/modelList';
 import { shareOrDownloadBlob } from '../utils/shareExport';
-import { bucketRetryCount, isAnalyticsConfigured, isAnalyticsEnabled, setAnalyticsEnabled, trackEvent } from '../utils/analytics';
+import { isAnalyticsConfigured, isAnalyticsEnabled, setAnalyticsEnabled, trackEvent } from '../utils/analytics';
 import Modal from '../components/os/Modal';
 import UserHolidaySettings from '../components/settings/UserHolidaySettings';
 import UserLocationSettings, { USER_LOCATION_PAGE_TITLES, getUserLocationParentPage, type UserLocationSettingsPage } from '../components/settings/UserLocationSettings';
@@ -37,8 +45,6 @@ import {
 import { getDateVoiceGuide } from '../utils/datePrompts';
 import { Sun, Newspaper, NotePencil, Notebook, Book, ForkKnife, Coffee, PlugsConnected } from '@phosphor-icons/react';
 import { loadMcpServers, saveMcpServers, createMcpServer, testMcpConnection, resetMcpSession, getMcpUseNativeTools, setMcpUseNativeTools, type McpServerConfig } from '../utils/mcpClient';
-import { loadPushConfig, savePushConfig, registerScheduleOnWorker, startHeartbeat, stopHeartbeat, isPushConfigAvailable, ensureSubscribed, sendTestPush, getPushDiagnostics, resetSubscription, deepResetSubscription, type PushDiagnostics } from '../utils/proactivePushConfig';
-import { ProactiveChat } from '../utils/proactiveChat';
 import { PushVapidSettingsModal } from '../components/settings/PushVapidSettingsModal';
 import AmsgCloudDataModal from '../components/settings/AmsgCloudDataModal';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
@@ -62,7 +68,13 @@ import {
 } from '../utils/avatarModelBackup';
 import { normalizeApiBaseUrl, normalizeApiCredential, normalizeApiModel } from '../utils/apiConfigNormalize';
 import { configFromPreset, findActivePresetId, presetDiffersFromConfig, type PresetSwitchPatch } from '../utils/apiPresetSwitch';
-import type { APIConfig, TtsProvider } from '../types';
+import type { APIConfig, TtsProvider, SttProvider } from '../types';
+import {
+    STT_PROVIDER_OPTIONS,
+    isSttProviderConfigured,
+    resolveSttProvider,
+    getSttProviderLabel,
+} from '../utils/speechToText';
 import { describeImageWithVisionApi, VISION_API_TEST_IMAGE_DATA_URL, visionApiConfigFromPreset } from '../utils/visionApi';
 import {
     FIRECRAWL_API_KEYS_URL,
@@ -96,9 +108,6 @@ const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
     { key: 'tenxunwang', label: '腾讯网' },
 ];
 
-// 「主动消息 Push 加速」面板入口开关。底层逻辑（心跳、订阅、诊断）全部保留，
-// 这里设为 false 只是把设置页里的入口隐藏掉，想恢复改回 true 即可。
-const SHOW_PROACTIVE_PUSH_ACCEL_UI = false;
 // Firecrawl「方舟计划」：实现、额度检测和抓取降级链全部保留，默认不向用户展示配置入口。
 // 需要重新启用时只改为 true。
 const SHOW_FIRECRAWL_ARK_UI = false;
@@ -111,13 +120,6 @@ const readStoredVisionModels = (): string[] => {
         return [];
     }
 };
-
-const DiagRow: React.FC<{ label: string; value: string; bad?: boolean }> = ({ label, value, bad }) => (
-    <div className="flex items-start justify-between gap-3">
-        <span className="text-slate-500 shrink-0">{label}</span>
-        <span className={`text-right ${bad ? 'text-rose-600 font-medium' : 'text-slate-700'}`}>{value}</span>
-    </div>
-);
 
 // 用户版 MCP 教程（自包含，写给用户和他们的 AI 助手看的）。静态部署的站点
 // 看不到仓库内文档，所以帮助弹窗只能跳 GitHub 的 blob 页。
@@ -323,7 +325,7 @@ const McpServersCard: React.FC<{
                         <button className="flex-1 text-left min-w-0" onClick={() => setExpandedId(expandedId === server.id ? null : server.id)}>
                             <div className="text-xs font-bold text-slate-700 truncate">{server.name || '(未命名)'}</div>
                             <div className="text-[10px] text-slate-400 truncate">
-                                {server.url || '未填 URL'}{server.tools?.length ? ` · ${server.tools.length} 个工具` : ' · 未获取工具'}{server.charIds?.length ? ` · 绑定 ${server.charIds.length} 个聊天` : ''}
+                                {server.url || '未填 URL'}{server.tools?.length ? ` · ${server.tools.length} 个工具` : ' · 未获取工具'}{server.charIds?.length ? (server.charIds.filter(id => id !== '__space_unselected__').length ? ` · 绑定 ${server.charIds.filter(id => id !== '__space_unselected__').length} 个聊天` : ' · 未选择聊天') : ''}
                             </div>
                         </button>
                         <label className="relative inline-flex items-center cursor-pointer shrink-0">
@@ -408,7 +410,8 @@ const McpServersCard: React.FC<{
                                         type="button"
                                         onClick={() => update(server.id, { charIds: [] })}
                                         className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${!server.charIds?.length ? 'bg-violet-500 text-white' : 'bg-white/80 border border-violet-200 text-slate-500'}`}
-                                    >通用（所有私聊和群聊）</button>
+                                    >通用（当前用户的所有聊天）</button>
+                                    <button type="button" onClick={() => update(server.id, { charIds: ['__space_unselected__'] })} className="px-2.5 py-1 rounded-lg text-[11px] border border-violet-200">暂不分配</button>
                                 </div>
                                 {characters.length > 0 && <div className="text-[10px] text-slate-400 mt-2 mb-1">角色</div>}
                                 <div className="flex flex-wrap gap-1.5">
@@ -419,8 +422,9 @@ const McpServersCard: React.FC<{
                                                 key={c.id}
                                                 type="button"
                                                 onClick={() => {
-                                                    const cur = server.charIds || [];
-                                                    update(server.id, { charIds: bound ? cur.filter(id => id !== c.id) : [...cur, c.id] });
+                                                    const cur = (server.charIds || []).filter(id => id !== '__space_unselected__');
+                                                    const next = bound ? cur.filter(id => id !== c.id) : [...cur, c.id];
+                                                    update(server.id, { charIds: next.length ? next : ['__space_unselected__'] });
                                                 }}
                                                 className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${bound ? 'bg-violet-500 text-white' : 'bg-white/80 border border-violet-200 text-slate-500'}`}
                                             >{c.name}</button>
@@ -436,8 +440,9 @@ const McpServersCard: React.FC<{
                                                 key={group.id}
                                                 type="button"
                                                 onClick={() => {
-                                                    const cur = server.charIds || [];
-                                                    update(server.id, { charIds: bound ? cur.filter(id => id !== group.id) : [...cur, group.id] });
+                                                    const cur = (server.charIds || []).filter(id => id !== '__space_unselected__');
+                                                    const next = bound ? cur.filter(id => id !== group.id) : [...cur, group.id];
+                                                    update(server.id, { charIds: next.length ? next : ['__space_unselected__'] });
                                                 }}
                                                 className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors ${bound ? 'bg-violet-500 text-white' : 'bg-white/80 border border-violet-200 text-slate-500'}`}
                                             >{group.name}</button>
@@ -447,7 +452,7 @@ const McpServersCard: React.FC<{
                                 <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
                                     通用 = 所有私聊和群聊都能用；绑定后只有选中的角色或群聊能看到这批工具。
                                 </p>
-                                {!!server.charIds?.length && server.charIds.some(id => !characters.some(c => c.id === id) && !groups.some(g => g.id === id)) && (
+                                {!!server.charIds?.length && server.charIds.some(id => id !== '__space_unselected__' && !characters.some(c => c.id === id) && !groups.some(g => g.id === id)) && (
                                     <p className="text-[10px] text-amber-600 mt-1">
                                         ⚠️ 绑定里有已删除的角色或群聊，对应绑定不再生效，可重新点选清理。
                                     </p>
@@ -496,8 +501,10 @@ const Settings: React.FC = () => {
   
   const [localKey, setLocalKey] = useState(apiConfig.apiKey);
   const [localUrl, setLocalUrl] = useState(apiConfig.baseUrl);
+  const [localApiType, setLocalApiType] = useState<LlmApiType>(llmApiType(apiConfig));
   const [localModel, setLocalModel] = useState(String(apiConfig.model || ''));
   const [localStream, setLocalStream] = useState<boolean>(apiConfig.stream === true);
+  const [localMaxTokens, setLocalMaxTokens] = useState(apiConfig.maxTokens ?? 8000);
   const [localTemperature, setLocalTemperature] = useState<number>(
     typeof apiConfig.temperature === 'number' ? apiConfig.temperature : 0.85
   );
@@ -521,6 +528,7 @@ const Settings: React.FC = () => {
       ? apiConfig.ttsProvider
       : 'minimax'
   );
+  const [localSttProvider, setLocalSttProvider] = useState<SttProvider | undefined>(apiConfig.sttProvider);
   const [localFishKey, setLocalFishKey] = useState(apiConfig.fishAudioApiKey || '');
   const [localFishModel, setLocalFishModel] = useState(apiConfig.fishAudioModel || 's2.1-pro');
   const [localElevenLabsKey, setLocalElevenLabsKey] = useState(apiConfig.elevenLabsApiKey || '');
@@ -549,10 +557,12 @@ const Settings: React.FC = () => {
   const [presetWriteback, setPresetWriteback] = useState<{ presetId: string; config: PresetSwitchPatch } | null>(null);
   const [editPresetName, setEditPresetName] = useState('');
   const [editPresetUrl, setEditPresetUrl] = useState('');
+  const [editPresetApiType, setEditPresetApiType] = useState<LlmApiType>('openai');
   const [editPresetKey, setEditPresetKey] = useState('');
   const [editPresetModel, setEditPresetModel] = useState('');
   const [editPresetStream, setEditPresetStream] = useState(false);
   const [editPresetTemperature, setEditPresetTemperature] = useState(0.85);
+  const [editPresetMaxTokens, setEditPresetMaxTokens] = useState(8000);
   const [holdingDeletePresetId, setHoldingDeletePresetId] = useState<string | null>(null);
   const presetDeleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
@@ -563,6 +573,7 @@ const Settings: React.FC = () => {
   const [showVisionModelModal, setShowVisionModelModal] = useState(false);
   const [visionModelFilter, setVisionModelFilter] = useState('');
   const [showExportModal, setShowExportModal] = useState(false); // Used for completion now
+  const [exportMissingAssets, setExportMissingAssets] = useState<BackupMissingAsset[]>([]);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetting, setResetting] = useState(false);
   /** 云端没清干净时停在这里：本地还一个字节都没动，等用户决定重试还是照样重置。 */
@@ -695,6 +706,7 @@ const Settings: React.FC = () => {
   useLocalBackHandler(() => { closeRealtimePage(); return true; }, 30, showRealtimeModal);
   const [rtUserHolidays, setRtUserHolidays] = useState<UserHolidayConfig>(() => ({ ...(realtimeConfig.userHolidays || { enabled: false, countryCode: '' }), ...(holidaySettingsFocus ? { enabled: true } : {}) }));
   const [rtWeatherKey, setRtWeatherKey] = useState(realtimeConfig.weatherApiKey);
+  const [rtWeatherCities, setRtWeatherCities] = useState(()=>cleanCharacterWeatherCities(realtimeConfig.weatherCities));
   const [rtWeatherCity, setRtWeatherCity] = useState(realtimeConfig.weatherCity);
   const [rtNewsEnabled, setRtNewsEnabled] = useState(realtimeConfig.newsEnabled);
   const [rtNewsApiKey, setRtNewsApiKey] = useState(realtimeConfig.newsApiKey || '');
@@ -755,30 +767,17 @@ const Settings: React.FC = () => {
   const [luckinTestStatus, setLuckinTestStatus] = useState('');
   const [luckinTesting, setLuckinTesting] = useState(false);
 
-  // Proactive Push 加速器（Worker URL / VAPID 公钥写死在 proactivePushConfig.ts 常量里）
-  const initialPushCfg = loadPushConfig();
-  const ppAvailable = isPushConfigAvailable();
-  const [ppEnabled, setPpEnabled] = useState(initialPushCfg.enabled);
-  const [ppStatus, setPpStatus] = useState<string>('');
-  const [ppBusy, setPpBusy] = useState(false);
-  const [showPpConfirm, setShowPpConfirm] = useState(false);
-  const [ppDiag, setPpDiag] = useState<PushDiagnostics | null>(null);
-  const [ppTestBusy, setPpTestBusy] = useState(false);
-  const [ppResetBusy, setPpResetBusy] = useState(false);
-  const [ppDeepResetBusy, setPpDeepResetBusy] = useState(false);
-  // 连续 zombie 重置失败次数 — 累计 >= 3 时, "重置订阅" 按钮自动 morph 成
-  // "深度重置". 不持久化, 刷新页面归零 (用户原话: "刷新页面正常消失").
-  const [ppZombieStreak, setPpZombieStreak] = useState(0);
   const [showAmsg2Modal, setShowAmsg2Modal] = useState(false);
   const [showAmsgCloudData, setShowAmsgCloudData] = useState(false);
+  const [exportUserScope, setExportUserScope] = useState<'current' | 'all'>('current');
   /**
-   * 导出时带不带主动消息 2.0 的后端连接（Worker 地址 + 密钥 + 用户 id）。
+   * 备份带不带主动消息 2.0 的后端连接（Worker 地址 + 密钥 + 用户 id），手动导出和云端备份共用。
    *
    * 默认不带。备份是会被分享出去的，带上就等于把自己那台 Worker 的钥匙一起发了：
    * 对方的 App 会静默连上来，把 ta 的 API 凭据和聊天上下文写进你的 D1，而 ta 手里的
    * 主密钥能解开你那台机器上所有的密文。换设备恢复自己的备份才需要它。
    */
-  const [exportBackendConnection, setExportBackendConnection] = useState(false);
+  const [exportBackendConnection, setExportBackendConnection] = useState(() => readBackupPreferences().includeBackendConnection);
   const [showVapidModal, setShowVapidModal] = useState(false);
   const [vapidReadyTick, setVapidReadyTick] = useState(0); // 关闭 VAPID 弹窗后刷新顶层徽标
 
@@ -787,153 +786,6 @@ const Settings: React.FC = () => {
       () => buildModelPickerView(availableVisionModels, visionModelFilter),
       [visionModelFilter, availableVisionModels],
   );
-
-  const refreshPpDiag = useCallback(async () => {
-      try { setPpDiag(await getPushDiagnostics()); } catch { /* ignore */ }
-  }, []);
-
-  const doEnablePushAccelerator = async () => {
-      if (ppBusy) return;
-      setPpBusy(true);
-      setPpStatus('正在连接 Worker…');
-      try {
-          const res = await fetch(`${initialPushCfg.workerUrl}/health`);
-          if (!res.ok) {
-              trackEvent('启用主动消息 Push 加速', { result: 'fail', failStage: 'worker_health' });
-              trackEvent('启用 Push 加速器的结果', { result: 'worker-unreachable' });
-              setPpStatus(`失败：Worker HTTP ${res.status}`); setPpBusy(false); return;
-          }
-      } catch (e: any) {
-          trackEvent('启用主动消息 Push 加速', { result: 'fail', failStage: 'network' });
-          trackEvent('启用 Push 加速器的结果', { result: 'worker-unreachable' });
-          setPpStatus(`失败：${e?.message || '网络错误'}`); setPpBusy(false); return;
-      }
-
-      // Step 1: ensure permission + subscription up front, regardless of schedules.
-      // This is the fix for the old bug where toggle "succeeded" without ever
-      // requesting permission when the user hadn't enabled any character timer yet.
-      setPpStatus('正在请求通知权限并创建订阅…');
-      const sub = await ensureSubscribed();
-      if (!sub.ok) {
-          trackEvent('启用主动消息 Push 加速', { result: 'fail', failStage: 'subscribe' });
-          trackEvent('启用 Push 加速器的结果', { result: 'subscribe-failed' });
-          setPpStatus(`失败：${sub.reason || '订阅创建失败'}`);
-          setPpBusy(false);
-          await refreshPpDiag();
-          return;
-      }
-
-      // Step 2: persist enabled flag and start heartbeat.
-      savePushConfig(true);
-      setPpEnabled(true);
-      startHeartbeat();
-
-      // Step 3: register any existing per-character schedules.
-      const schedules = ProactiveChat.getSchedules();
-      let okCount = 0;
-      for (const s of schedules) {
-          if (await registerScheduleOnWorker(s.charId, s.intervalMs)) okCount++;
-      }
-
-      if (schedules.length === 0) {
-          trackEvent('启用主动消息 Push 加速', { result: 'success' });
-          trackEvent('启用 Push 加速器的结果', { result: 'ok-no-schedule' });
-          setPpStatus('已启用（订阅已建立。暂无主动消息定时，下次开启角色主动消息时会自动注册）');
-      } else if (okCount < schedules.length) {
-          trackEvent('启用主动消息 Push 加速', { result: 'partial' });
-          trackEvent('启用 Push 加速器的结果', { result: 'ok-partial-schedule' });
-          setPpStatus(`已启用：${okCount}/${schedules.length} 个定时注册成功`);
-      } else {
-          trackEvent('启用主动消息 Push 加速', { result: 'success' });
-          trackEvent('启用 Push 加速器的结果', { result: 'ok' });
-          setPpStatus(`已启用，${okCount} 个主动消息定时已注册`);
-      }
-      setPpBusy(false);
-      await refreshPpDiag();
-  };
-
-  const doDisablePushAccelerator = async () => {
-      trackEvent('关闭主动消息 Push 加速');
-      savePushConfig(false);
-      setPpEnabled(false);
-      stopHeartbeat();
-      setPpStatus('已关闭（主动消息退回本地计时器）');
-      await refreshPpDiag();
-  };
-
-  const doSendTestPush = async () => {
-      if (ppTestBusy) return;
-      setPpTestBusy(true);
-      setPpStatus('正在让 Worker 发一条测试推送…');
-      const res = await sendTestPush();
-      if (res.ok) {
-          trackEvent('发送测试推送（主动消息加速）', { result: 'sent' });
-          trackEvent('发一条测试推送', { result: 'sent' });
-          setPpStatus('测试推送已发出。如果 5 秒内系统通知里没出现"推送测试成功"，说明送达环节有问题——看下方诊断面板。');
-      } else if (res.deadSubscription) {
-          trackEvent('发送测试推送（主动消息加速）', { result: 'dead_subscription' });
-          trackEvent('发一条测试推送', { result: 'dead-subscription' });
-          setPpStatus('订阅已被浏览器吊销（zombie endpoint）。请点下方"重置订阅"重建一次再测。');
-      } else {
-          trackEvent('发送测试推送（主动消息加速）', { result: 'fail' });
-          trackEvent('发一条测试推送', { result: 'failed' });
-          setPpStatus(`测试失败：${res.reason || '未知错误'}${res.status ? `（HTTP ${res.status}）` : ''}`);
-      }
-      setPpTestBusy(false);
-      await refreshPpDiag();
-  };
-
-  const doResetSubscription = async () => {
-      if (ppResetBusy || ppDeepResetBusy) return;
-      setPpResetBusy(true);
-      setPpStatus('正在重置订阅…');
-      const res = await resetSubscription();
-      if (res.ok) {
-          trackEvent('重置推送订阅', { result: 'success', attempt: bucketRetryCount(ppZombieStreak) });
-          setPpZombieStreak(0);
-          setPpStatus('订阅已重建。可以再点"发一条测试推送"试一下。');
-      } else {
-          const reason = res.reason || '';
-          // 失败原因指向 zombie endpoint 时累计, 达到 3 次后按钮自动 morph 成深度重置
-          if (/permanently-removed|zombie/i.test(reason)) {
-              setPpZombieStreak(c => c + 1);
-          }
-          // 只上报归类后的固定枚举，失败原文一个字都不带；重试次数同样先分桶
-          trackEvent('重置推送订阅', {
-              result: /permanently-removed|zombie/i.test(reason) ? 'fail_zombie' : 'fail_other',
-              attempt: bucketRetryCount(ppZombieStreak),
-          });
-          setPpStatus(`重置失败：${reason || '未知错误'}`);
-      }
-      setPpResetBusy(false);
-      await refreshPpDiag();
-  };
-
-  const doDeepResetSubscription = async () => {
-      if (ppDeepResetBusy || ppResetBusy) return;
-      setPpDeepResetBusy(true);
-      setPpStatus('正在深度重置…');
-      const res = await deepResetSubscription();
-      // 无论成败, 按钮都回归"重置订阅" — 下次出问题再次累计触发 morph
-      setPpZombieStreak(0);
-      if (res.ok) {
-          // ProactiveChat.resume() 把所有 schedule 推回新 SW. deepResetSubscription 内部
-          // 不调它是为了避免循环依赖 (ProactiveChat 反向依赖 proactivePushConfig).
-          try { ProactiveChat.resume(); } catch (e) { console.warn('[Settings] ProactiveChat.resume failed', e); }
-          trackEvent('深度重置推送订阅', { result: 'success' });
-          setPpStatus('订阅已重建。可以再点"发一条测试推送"试一下。');
-      } else {
-          trackEvent('深度重置推送订阅', { result: 'fail' });
-          setPpStatus(`深度重置失败：${res.reason || '未知错误'}`);
-      }
-      setPpDeepResetBusy(false);
-      await refreshPpDiag();
-  };
-
-  // Refresh diagnostics whenever the panel is mounted or the toggle changes.
-  useEffect(() => {
-      void refreshPpDiag();
-  }, [refreshPpDiag, ppEnabled]);
 
   // For web download link
   const [downloadUrl, setDownloadUrl] = useState<string>('');
@@ -956,6 +808,7 @@ const Settings: React.FC = () => {
   const [testingApi, setTestingApi] = useState(false);
   const [testApiResult, setTestApiResult] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const independentImportInputRef = useRef<HTMLInputElement>(null);
   const avatarModelBackupInputRef = useRef<HTMLInputElement>(null);
   const refreshAvatarModelInventory = useCallback(async () => {
       try {
@@ -973,11 +826,13 @@ const Settings: React.FC = () => {
   // 主 API 这边还没保存的输入就被悄悄冲回旧值了，而且界面上完全看不出来。
   useEffect(() => {
       setLocalUrl(apiConfig.baseUrl);
+      setLocalApiType(llmApiType(apiConfig));
       setLocalKey(apiConfig.apiKey);
       setLocalModel(String(apiConfig.model || ''));
       setLocalStream(apiConfig.stream === true);
+      setLocalMaxTokens(apiConfig.maxTokens ?? 8000);
       setLocalTemperature(typeof apiConfig.temperature === 'number' ? apiConfig.temperature : 0.85);
-  }, [apiConfig.baseUrl, apiConfig.apiKey, apiConfig.model, apiConfig.stream, apiConfig.temperature]);
+  }, [apiConfig.baseUrl, apiConfig.apiKey, apiConfig.model, apiConfig.stream, apiConfig.temperature, apiConfig.maxTokens, apiConfig.apiType]);
 
   useEffect(() => {
       setLocalVisionEnabled(apiConfig.visionApi?.enabled === true);
@@ -998,6 +853,7 @@ const Settings: React.FC = () => {
               ? apiConfig.ttsProvider
               : 'minimax'
       );
+      setLocalSttProvider(apiConfig.sttProvider);
       setLocalFishKey(apiConfig.fishAudioApiKey || '');
       setLocalFishModel(apiConfig.fishAudioModel || 's2.1-pro');
       setLocalElevenLabsKey(apiConfig.elevenLabsApiKey || '');
@@ -1012,7 +868,7 @@ const Settings: React.FC = () => {
       setLocalVoicePromptDate(apiConfig.voicePrompts?.dateVoice || '');
   }, [
       apiConfig.minimaxApiKey, apiConfig.minimaxGroupId, apiConfig.minimaxRegion, apiConfig.aceStepApiKey,
-      apiConfig.ttsProvider, apiConfig.fishAudioApiKey, apiConfig.fishAudioModel,
+      apiConfig.ttsProvider, apiConfig.sttProvider, apiConfig.fishAudioApiKey, apiConfig.fishAudioModel,
       apiConfig.elevenLabsApiKey, apiConfig.elevenLabsModel, apiConfig.elevenLabsStability,
       apiConfig.elevenLabsSimilarityBoost, apiConfig.elevenLabsStyle, apiConfig.elevenLabsUseSpeakerBoost,
       apiConfig.voicePrompts?.minimax, apiConfig.voicePrompts?.fishaudio,
@@ -1055,8 +911,10 @@ const Settings: React.FC = () => {
       setEditPresetName(preset.name);
       setEditPresetGroup(preset.group || '');
       setEditPresetUrl(preset.config.baseUrl || '');
+      setEditPresetApiType(llmApiType(preset.config));
       setEditPresetKey(preset.config.apiKey || '');
       setEditPresetModel(preset.config.model || '');
+      setEditPresetMaxTokens(isActive ? localMaxTokens : (preset.config.maxTokens ?? localMaxTokens));
       // 当前正在使用的预设要接住主表单里刚改的高级设置：用户点铅笔再点保存即可写回，
       // 不必猜还要额外按一次「用当前配置填入」。非当前/老预设则读取自身，缺字段才回退。
       setEditPresetStream(
@@ -1079,11 +937,13 @@ const Settings: React.FC = () => {
       }
       const nextConfig = {
           ...preset.config,
-          baseUrl: normalizeApiBaseUrl(editPresetUrl),
+          baseUrl: normalizeLlmBaseUrl(normalizeApiBaseUrl(editPresetUrl), editPresetApiType),
+          apiType: editPresetApiType,
           apiKey: normalizeApiCredential(editPresetKey),
           model: normalizeApiModel(editPresetModel),
           stream: editPresetStream,
           temperature: editPresetTemperature,
+          maxTokens: editPresetMaxTokens,
       };
       // 「正在用的就是这条」要在改之前问，改完值就对不上了
       const wasActive = activePresetId === preset.id;
@@ -1144,11 +1004,13 @@ const Settings: React.FC = () => {
           return;
       }
       addApiPreset(newPresetName, {
-        baseUrl: normalizeApiBaseUrl(localUrl),
+        baseUrl: normalizeLlmBaseUrl(normalizeApiBaseUrl(localUrl), localApiType),
+        apiType: localApiType,
         apiKey: normalizeApiCredential(localKey),
         model: normalizeApiModel(localModel),
         stream: localStream,
         temperature: localTemperature,
+        maxTokens: localMaxTokens,
       }, newPresetGroup);
       setNewPresetName('');
       setNewPresetGroup('');
@@ -1166,10 +1028,12 @@ const Settings: React.FC = () => {
   const handleSaveApi = (modelOverride?: string) => {
     const nextConfig = {
       apiKey: normalizeApiCredential(localKey),
-      baseUrl: normalizeApiBaseUrl(localUrl),
+      baseUrl: normalizeLlmBaseUrl(normalizeApiBaseUrl(localUrl), localApiType),
+      apiType: localApiType,
       model: normalizeApiModel(modelOverride ?? localModel),
       stream: localStream,
       temperature: localTemperature,
+      maxTokens: localMaxTokens,
     };
     // 「是不是来自某条预设」要在保存之前问，存完值就对不上了
     const sourcePreset = apiPresets.find(preset => preset.id === activePresetId);
@@ -1327,6 +1191,7 @@ const Settings: React.FC = () => {
       minimaxRegion: localMiniMaxRegion,
       aceStepApiKey: localAceStepKey,
       ttsProvider: localTtsProvider,
+      sttProvider: localSttProvider,
       fishAudioApiKey: localFishKey,
       fishAudioModel: localFishModel,
       elevenLabsApiKey: localElevenLabsKey,
@@ -1344,6 +1209,17 @@ const Settings: React.FC = () => {
       ...overrides,
   });
 
+  const draftSttLookupConfig: Partial<APIConfig> = {
+      ...apiConfig,
+      baseUrl: localUrl,
+      apiKey: localKey,
+      minimaxApiKey: localMiniMaxKey,
+      fishAudioApiKey: localFishKey,
+      elevenLabsApiKey: localElevenLabsKey,
+      ttsProvider: localTtsProvider,
+      sttProvider: localSttProvider,
+  };
+
   const handleSaveOtherApis = () => {
     updateApiConfig(buildOtherApiConfig());
     setOtherStatusMsg('已保存');
@@ -1360,6 +1236,17 @@ const Settings: React.FC = () => {
     addToast(`语音生成已切到 ${providerLabel}`, 'success');
   };
 
+  const selectSttProvider = (provider: SttProvider) => {
+    if (!isSttProviderConfigured(provider, draftSttLookupConfig)) {
+      const opt = STT_PROVIDER_OPTIONS.find(o => o.id === provider);
+      addToast(opt?.keyHint || '请先在上方填写对应平台的 API Key', 'error');
+      return;
+    }
+    setLocalSttProvider(provider);
+    updateApiConfig(buildOtherApiConfig({ sttProvider: provider }));
+    addToast(`语音转文字已切到 ${getSttProviderLabel(provider)}`, 'success');
+  };
+
   // 选鱼声模型：立即落库（同上，连带草稿一起提交，避免被同步 effect 冲掉）。
   const selectFishModel = (model: string) => {
     setLocalFishModel(model);
@@ -1373,13 +1260,13 @@ const Settings: React.FC = () => {
   };
 
   const fetchModels = async () => {
-    const baseUrl = normalizeApiBaseUrl(localUrl);
+    const baseUrl = normalizeLlmBaseUrl(normalizeApiBaseUrl(localUrl), localApiType);
     const apiKey = normalizeApiCredential(localKey);
     if (!baseUrl) { setStatusMsg('请先填写 URL'); return; }
     setIsLoadingModels(true);
     setStatusMsg('正在连接...');
     try {
-        const response = await fetch(`${baseUrl}/models`, {
+        const response = await fetchLlm(`${baseUrl}/models`, {
             method: 'GET',
             headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }
         });
@@ -1453,7 +1340,8 @@ const Settings: React.FC = () => {
           }
 
           // Trigger export (Context handles loading state UI)
-          const blob = await exportSystem(mode, { includeBackendConnection: exportBackendConnection });
+          setExportMissingAssets([]);
+          const blob = await exportSystem(mode, { userScope: exportUserScope, onMissingAssets: setExportMissingAssets });
           
           const fileName = `Sully_Backup_${mode}_${new Date().toISOString().slice(0, 10)}.zip`;
           if (!Capacitor.isNativePlatform()) {
@@ -1479,21 +1367,21 @@ const Settings: React.FC = () => {
       }
   };
 
-  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 本地导入和云端恢复共用。备份里带着 Worker 后端连接时问一句：程序分不清这份文件是自己的
+  // 还是别人的（换新设备时用户 id 本来就对不上），只有拿着文件的人知道，所以把话问出去。
+  const confirmBackendRestore = (workerUrl: string) => window.confirm(
+      `这份备份里带着一个主动消息 2.0 的后端连接：\n\n${workerUrl}\n\n`
+      + '如果这是你自己导出的备份，点「确定」连上它。\n\n'
+      + '如果是别人给你的，点「取消」——连上去的话，你的 API 密钥和聊天记录会被写进对方那台服务器。\n\n'
+      + '（不连也不影响其它数据导入，之后可以在设置里手动填。）',
+  );
+
+  const handleImport = (e: React.ChangeEvent<HTMLInputElement>, asNewUsers = false) => {
       const file = e.target.files?.[0];
       if (!file) return;
 
       // Pass the File object directly to importSystem
-      importSystem(file, {
-          // 备份里带着 Worker 后端连接时问一句。程序分不清这份文件是自己的还是别人的
-          // （换新设备时用户 id 本来就对不上），只有拿着文件的人知道，所以把话问出去。
-          confirmBackendRestore: (workerUrl) => window.confirm(
-              `这份备份里带着一个主动消息 2.0 的后端连接：\n\n${workerUrl}\n\n`
-              + '如果这是你自己导出的备份，点「确定」连上它。\n\n'
-              + '如果是别人给你的，点「取消」——连上去的话，你的 API 密钥和聊天记录会被写进对方那台服务器。\n\n'
-              + '（不连也不影响其它数据导入，之后可以在设置里手动填。）',
-          ),
-      }).catch(err => {
+      importSystem(file, { asNewUsers, confirmBackendRestore }).catch(err => {
           console.error(err);
           // 只上报归类后的固定枚举：报错原文（可能含文件路径/内容片段）只留在 console
           const rawMessage = String(err?.message || '');
@@ -1512,9 +1400,11 @@ const Settings: React.FC = () => {
       });
       
       if (importInputRef.current) importInputRef.current.value = '';
+      if (independentImportInputRef.current) independentImportInputRef.current.value = '';
   };
 
   const deliverStandaloneBackup = async (blob: Blob, fileName: string, shareTitle: string) => {
+      setExportMissingAssets([]);
       if (!Capacitor.isNativePlatform()) {
           if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current);
           const url = URL.createObjectURL(blob);
@@ -1717,7 +1607,7 @@ const Settings: React.FC = () => {
       }
       setShowCloudRestoreModal(false);
       try {
-          await cloudRestoreFromWebDAV(file);
+          await cloudRestoreFromWebDAV(file, { confirmBackendRestore });
       } catch (err: any) {
           // 只区分「下载阶段」还是「导入阶段」，报错原文只进 showError / console
           trackEvent('从云端恢复失败', {
@@ -1858,7 +1748,8 @@ const Settings: React.FC = () => {
           weatherEnabled: rtWeatherEnabled,
           userHolidays: { ...rtUserHolidays, introChoice: rtUserHolidays.enabled ? 'configured' as const : 'declined' as const },
           weatherApiKey: rtWeatherKey,
-          weatherCity: rtWeatherCity,
+          weatherCity: rtWeatherCity.trim(),
+          weatherCities: cleanCharacterWeatherCities(rtWeatherCities),
           newsEnabled: rtNewsEnabled,
           newsApiKey: rtNewsApiKey,
           newsPlatforms: rtNewsPlatforms,
@@ -2182,20 +2073,22 @@ const Settings: React.FC = () => {
                 </div>
             }
         >
+            {listUserSpaces().length > 1 && <fieldset className="mb-4 p-3 bg-white border border-slate-200 rounded-xl"><legend className="text-xs font-bold">先选择导出范围</legend><div className="flex gap-4 text-sm">{(['current', 'all'] as const).map(scope => <label key={scope} className="flex gap-2 items-center"><input type="radio" name="user-export-scope" checked={exportUserScope === scope} onChange={() => setExportUserScope(scope)} />{scope === 'current' ? '当前用户' : '所有用户'}</label>)}</div><p className="text-xs text-slate-400 mt-2">再选择下面的导出样式。共享素材只打包一次。</p></fieldset>}
             <StorageUsagePanel />
             <WebCacheControl />
+            <BackupMissingAssetsNotice items={exportMissingAssets} />
 
             <label className="mb-3 flex items-start gap-2 rounded-xl border border-slate-200 bg-white p-3 cursor-pointer">
                 <input
                     type="checkbox"
                     checked={exportBackendConnection}
-                    onChange={(e) => setExportBackendConnection(e.target.checked)}
+                    onChange={(e) => setExportBackendConnection(updateBackupPreferences({ includeBackendConnection: e.target.checked }).includeBackendConnection)}
                     className="mt-0.5 shrink-0"
                 />
                 <span className="text-[11px] leading-relaxed text-slate-600">
                     <span className="font-bold">包含主动消息 2.0 的后端连接</span>
                     <span className="block text-slate-400">
-                        换设备恢复时勾上，Worker 地址和密钥会一起带走。
+                        换设备恢复时勾上，导出和云端备份都会带上 Worker 地址和密钥。
                         <span className="font-bold text-rose-500">勾着导出的备份不要分享给别人</span>
                         ——拿到文件的人能连上你那台 Worker，也能解开里面的聊天记录。
                     </span>
@@ -2229,12 +2122,18 @@ const Settings: React.FC = () => {
                     <span>导入备份 (.zip / .json)</span>
                 </div>
                 <input type="file" ref={importInputRef} className="hidden" accept=".json,.zip" onChange={handleImport} />
+                <button onClick={() => independentImportInputRef.current?.click()} className="py-4 px-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs font-bold text-emerald-800 active:scale-95 transition-all">
+                    从其他网址 / App 迁入独立用户
+                    <span className="block mt-2 text-[11px] font-normal leading-relaxed">建议使用整合备份，自动新建用户并保留聊天、记忆和素材。共用当前系统设置，主动消息和离开后消息需重新开启。</span>
+                </button>
+                <input type="file" ref={independentImportInputRef} aria-label="迁入独立用户备份" className="hidden" accept=".json,.zip" onChange={event => handleImport(event, true)} />
             </div>
 
             <p className="text-[10px] text-slate-400 px-1 mb-4 leading-relaxed">
-                • <b>整合导出</b>: 一次性导出文字与图片媒体；VRM / Live2D 模型请使用下方独立备份。<br/>
+                • <b>整合导出</b>: {listUserSpaces().length > 1 ? '导出所选用户的文字、图片与引用的模型，共享文件只保存一份。' : '一次性导出文字与图片媒体；VRM / Live2D 模型请使用下方独立备份。'}<br/>
                 • <b>纯文字备份</b>: 包含所有聊天记录、角色设定、剧情数据。所有图片会被移除（减小体积）。<br/>
                 • <b>媒体与美化素材</b>: 导出相册、表情包、聊天图片、头像、主题气泡、壁纸、图标等图片资源和外观配置。<br/>
+                • <b>活动与哔哔</b>: 万圣节收集、装扮选择、恐龙箱庭、哔哔正文与设置、家园串门和秘密记录随纯文字/整合备份保存；哔哔上传配图随媒体/整合备份保存，补导媒体不覆盖正文或活动进度。<br/>
                 • <b>装扮与搭配</b>: 整合/媒体备份包含桌面主题、聊天装扮、搭配收藏、旧气泡及实际素材，并保留来源权限、角色搭配和投稿更新绑定。纯文字备份不能完整恢复美化。<br/>
                 • <b>作者搬家</b>: 整合备份还包含 Repo 状态、美化偏好和引导记录；已在作者页开启“记住作者身份”时，也携带作者码与密码。导入后恢复这些数据，不会自动登录或投稿。<br/>
                 • <b>语音范围</b>: 整合/媒体备份仅包含已收藏语音，以及 Live2D 开机、触摸预设实际引用的语音；未收藏的聊天、通话等临时语音不会导出。<br/>
@@ -2245,7 +2144,7 @@ const Settings: React.FC = () => {
                 <div className="mb-2 flex items-center justify-between gap-3">
                     <div>
                         <h3 className="text-xs font-bold text-slate-700">视频模型 · 单独备份</h3>
-                        <p className="mt-0.5 text-[10px] text-slate-400">VRM / Live2D 不再混进普通数据包</p>
+                        <p className="mt-0.5 text-[10px] text-slate-400">{listUserSpaces().length > 1 ? '也可单独备份当前用户的 VRM / Live2D' : 'VRM / Live2D 不再混进普通数据包'}</p>
                     </div>
                     <span className="shrink-0 rounded-full bg-violet-50 px-2.5 py-1 text-[10px] font-bold text-violet-600">
                         {avatarModelInventory
@@ -2571,12 +2470,14 @@ const Settings: React.FC = () => {
 
             <div className="space-y-4">
                 <DialogueApiFields
-                    value={{ baseUrl: localUrl, apiKey: localKey, model: localModel, stream: localStream, temperature: localTemperature }}
+                    value={{ baseUrl: localUrl, apiKey: localKey, model: localModel, stream: localStream, temperature: localTemperature, maxTokens: localMaxTokens, apiType: localApiType }}
                     onChange={patch => {
+                        if (patch.apiType !== undefined) setLocalApiType(patch.apiType);
                         if (patch.baseUrl !== undefined) setLocalUrl(patch.baseUrl);
                         if (patch.apiKey !== undefined) setLocalKey(patch.apiKey);
                         if (patch.stream !== undefined) setLocalStream(patch.stream);
                         if (patch.temperature !== undefined) setLocalTemperature(patch.temperature);
+                        if ('maxTokens' in patch) setLocalMaxTokens(patch.maxTokens ?? 8000);
                     }}
                     fetchModels={fetchModels} isLoadingModels={isLoadingModels} openModelPicker={openModelPicker}
                 />
@@ -2599,7 +2500,7 @@ const Settings: React.FC = () => {
                         setTestingApi(true);
                         setTestApiResult(null);
                         try {
-                            const res = await fetch(`${localUrl.trim().replace(/\/+$/, '')}/chat/completions`, {
+                            const res = await fetchLlm(`${normalizeLlmBaseUrl(localUrl, localApiType)}/chat/completions`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localKey.trim()}` },
                                 body: JSON.stringify({
@@ -2976,7 +2877,7 @@ const Settings: React.FC = () => {
                 {/* 底部：当前语音引擎三选一 —— radio 样式（配置都在上面，这里只挑用哪家） */}
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
                     <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0.5 block">当前语音引擎（三选一）</label>
-                    <p className="text-[11px] text-slate-400 mb-2.5">聊天语音条 / 约会 / 电话用哪一家。上面三家的配置都会保留，这里只切换当前生效的。</p>
+                    <p className="text-[11px] text-slate-400 mb-2.5">聊天语音条 / 约会 / 电话里角色开口用哪一家。上面三家的配置都会保留，这里只切换当前生效的。</p>
                     <div className="space-y-2">
                         {([
                             ['minimax', 'MiniMax', '国内可直连，默认推荐'],
@@ -2999,6 +2900,52 @@ const Settings: React.FC = () => {
                                         <span className="block text-[11px] text-slate-400 mt-0.5">{desc}</span>
                                     </span>
                                     {active && <span className="text-[10px] font-bold text-primary shrink-0">使用中</span>}
+                                </button>
+                            );
+                        })}
+                    </div>
+                </div>
+
+                {/* 通话语音转文字（你开口说话 → 转文字）四选一 —— 可与角色发声平台自由搭配，填了 Key 才能选对应平台 */}
+                <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0.5 block">语音转文字 · 通话麦克风（四选一）</label>
+                    <p className="text-[11px] text-slate-400 mb-2.5">
+                        电话里点麦克风说话走哪条路转成文字。可与上方角色发声平台分开搭配（比如语音用 MiniMax、识别用 ElevenLabs 或鱼声）；填好对应官方 Key 后即可切换。
+                    </p>
+                    <div className="space-y-2">
+                        {STT_PROVIDER_OPTIONS.map((opt) => {
+                            const configured = isSttProviderConfigured(opt.id, draftSttLookupConfig);
+                            const resolvedCurrent = resolveSttProvider(draftSttLookupConfig);
+                            const active = resolvedCurrent === opt.id;
+                            return (
+                                <button
+                                    key={opt.id}
+                                    type="button"
+                                    onClick={() => selectSttProvider(opt.id)}
+                                    className={`w-full flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${
+                                        active
+                                            ? 'border-primary bg-primary/5 shadow-sm'
+                                            : configured
+                                                ? 'border-slate-200 bg-white/70 active:bg-white'
+                                                : 'border-slate-200/60 bg-slate-100/60 opacity-65'
+                                    }`}
+                                >
+                                    <span className={`shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center ${active ? 'border-primary' : 'border-slate-300'}`}>
+                                        {active && <span className="w-2 h-2 rounded-full bg-primary" />}
+                                    </span>
+                                    <span className="flex-1 min-w-0">
+                                        <span className={`text-sm font-semibold ${active ? 'text-primary' : configured ? 'text-slate-700' : 'text-slate-500'}`}>
+                                            {opt.label}
+                                        </span>
+                                        <span className="block text-[11px] text-slate-400 mt-0.5">
+                                            {configured ? opt.desc : `${opt.desc}（${opt.keyHint}）`}
+                                        </span>
+                                    </span>
+                                    {active ? (
+                                        <span className="text-[10px] font-bold text-primary shrink-0">使用中</span>
+                                    ) : !configured ? (
+                                        <span className="text-[10px] font-medium text-slate-400 shrink-0">未填 Key</span>
+                                    ) : null}
                                 </button>
                             );
                         })}
@@ -3291,192 +3238,6 @@ const Settings: React.FC = () => {
             <PushSubscriptionPanel addToast={addToast} />
         </SettingsSection>
 
-        {/* ───────── 主动消息 Push 加速器（开关） ───────── */}
-        {SHOW_PROACTIVE_PUSH_ACCEL_UI && ppAvailable && (
-        <SettingsSection
-            title="主动消息 Push 加速"
-            icon={
-                <div className="p-2 bg-teal-100/60 rounded-xl text-teal-600">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0" />
-                    </svg>
-                </div>
-            }
-            actions={
-                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${ppEnabled ? 'bg-teal-100 text-teal-600' : 'bg-slate-100 text-slate-400'}`}>
-                    {ppEnabled ? '已启用' : '未启用'}
-                </span>
-            }
-        >
-            <p className="text-xs text-slate-500 mb-3 leading-relaxed">
-                让主动消息在浏览器后台标签里也能准点触发。AI 仍在本地生成，云端只管"到点喊醒浏览器"。
-                浏览器进程被完全关闭时无法唤醒——下次打开 app 会自动补跑漏掉的主动消息，
-                你看到的就是"开 app 即有"，不会半路弹窗打扰你。
-            </p>
-
-            {ppStatus && (
-                <div className={`mb-3 p-3 rounded-xl text-xs font-medium text-center ${ppStatus.includes('成功') || ppStatus.includes('已启用') || ppStatus.includes('OK') ? 'bg-emerald-100 text-emerald-700' : ppStatus.includes('失败') || ppStatus.includes('错误') || ppStatus.includes('拒绝') ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}>
-                    {ppStatus}
-                </div>
-            )}
-
-            <div className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2.5">
-                <div>
-                    <p className="text-[11px] text-slate-600 font-medium">启用 Push 加速</p>
-                    <p className="text-[10px] text-slate-400">关闭则退回纯本地计时器</p>
-                </div>
-                <button
-                    disabled={ppBusy}
-                    onClick={() => {
-                        if (ppBusy) return;
-                        trackEvent('切换主动消息Push加速', { action: ppEnabled ? 'disable' : 'enable' });
-                        if (ppEnabled) {
-                            void doDisablePushAccelerator();
-                        } else {
-                            setShowPpConfirm(true);
-                        }
-                    }}
-                    className={`w-10 h-5 rounded-full transition-colors ${ppEnabled ? 'bg-teal-500' : 'bg-slate-300'} ${ppBusy ? 'opacity-60' : ''}`}
-                >
-                    <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${ppEnabled ? 'translate-x-5' : 'translate-x-0.5'}`} />
-                </button>
-            </div>
-
-            {/* ───── 诊断面板 ───── */}
-            <div className="mt-4 bg-slate-50/70 rounded-2xl p-4 border border-slate-100">
-                <div className="flex items-center justify-between mb-3">
-                    <p className="text-xs font-semibold text-slate-600">Web Push 状态</p>
-                    <button
-                        onClick={() => {
-                            // 全部是浏览器/设备状态的固定枚举，不含端点地址、也不含任何用户配置值
-                            trackEvent('刷新 Web Push 诊断', ppDiag ? {
-                                permission: ppDiag.permission,
-                                subscription: !ppDiag.endpoint ? 'none' : ppDiag.endpointDead ? 'dead' : 'active',
-                                swState: ppDiag.swState === 'activated' ? 'activated' : ppDiag.swState === 'none' ? 'none' : 'other',
-                                platform: ppDiag.capacitorNative ? 'capacitor_native' : ppDiag.iosNeedsPwa ? 'ios_needs_pwa' : 'normal',
-                            } : undefined);
-                            void refreshPpDiag();
-                        }}
-                        className="text-[10px] px-2.5 py-1 rounded-full bg-white border border-slate-200 text-slate-500 hover:bg-slate-50"
-                    >
-                        刷新
-                    </button>
-                </div>
-
-                {ppDiag ? (
-                    <div className="space-y-1.5 text-[11px]">
-                        <DiagRow
-                            label="浏览器支持"
-                            value={
-                                ppDiag.capacitorNative ? '否（当前在 App 里运行）' :
-                                ppDiag.supported ? '是' : '否（浏览器缺少推送相关 API）'
-                            }
-                            bad={!ppDiag.supported || ppDiag.capacitorNative}
-                        />
-                        <DiagRow
-                            label="通知权限"
-                            value={
-                                ppDiag.permission === 'granted' ? '已授权' :
-                                ppDiag.permission === 'denied' ? '已拒绝（请到浏览器站点设置手动开启）' :
-                                ppDiag.permission === 'default' ? '未决定' :
-                                '不可用'
-                            }
-                            bad={ppDiag.permission !== 'granted'}
-                        />
-                        <DiagRow
-                            label="Service Worker"
-                            value={
-                                ppDiag.swState === 'activated' ? `已激活（scope: ${ppDiag.swScope || '?'}）` :
-                                ppDiag.swState === 'none' ? '未注册' :
-                                `${ppDiag.swState}（scope: ${ppDiag.swScope || '?'}）`
-                            }
-                            bad={ppDiag.swState !== 'activated'}
-                        />
-                        <DiagRow
-                            label="订阅"
-                            value={
-                                !ppDiag.endpoint ? '不存在' :
-                                ppDiag.endpointDead ? '已失效（zombie endpoint）' :
-                                '已建立'
-                            }
-                            bad={!ppDiag.endpoint || ppDiag.endpointDead}
-                        />
-                        <DiagRow label="推送通道" value={ppDiag.channel} />
-                        <DiagRow
-                            label="最近一次唤醒"
-                            value={
-                                ppDiag.lastWakeAt
-                                    ? `${new Date(ppDiag.lastWakeAt).toLocaleString()}${ppDiag.lastWakeChar ? `（${ppDiag.lastWakeChar}）` : ''}`
-                                    : '从未'
-                            }
-                        />
-                        {ppDiag.endpoint && (
-                            <div className="pt-2 mt-2 border-t border-slate-200">
-                                <p className="text-[10px] text-slate-400 mb-1">订阅端点（前 60 字符）</p>
-                                <p className={`text-[10px] font-mono break-all leading-relaxed ${ppDiag.endpointDead ? 'text-rose-600' : 'text-slate-500'}`}>{ppDiag.endpoint.slice(0, 60)}…</p>
-                            </div>
-                        )}
-                        {ppDiag.endpointDead && (
-                            <div className="mt-2 p-2 bg-rose-50 border border-rose-200 rounded-lg text-[10px] text-rose-700 leading-relaxed">
-                                订阅地址是 <code className="font-mono">permanently-removed.invalid</code>——浏览器已经把这个订阅吊销了
-                                （常见原因：长期不访问、通知权限切换过、浏览器清理过站点数据）。<br/>
-                                这个域名是 RFC 保留 TLD，全球永远不会解析；Worker 试图把 push 投递过去就会回 HTTP 530。<br/>
-                                点下方<b>"重置订阅"</b>会清掉这条死订阅并重建一个新的。
-                            </div>
-                        )}
-                        {ppDiag.iosNeedsPwa && (
-                            <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded-lg text-[10px] text-amber-700 leading-relaxed">
-                                检测到 iOS Safari，但当前不是已添加到主屏幕的 PWA。<br/>
-                                iOS 的 Web Push 必须先把网站"添加到主屏幕"启动后才能用。
-                            </div>
-                        )}
-                        {ppDiag.capacitorNative && (
-                            <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded-lg text-[10px] text-amber-700 leading-relaxed">
-                                你现在是在<b>打包好的 App</b>里运行（不是浏览器网页）。<br/>
-                                这个"Push 加速器"只对网页版生效——App 里没有网页推送通道，但<b>不影响你正常用</b>：
-                                主动消息会通过 App 的本地通知发出，App 在后台/锁屏也能收到。<br/>
-                                下面的"测试推送 / 重置订阅"按钮在 App 里点了也没用，可以直接忽略这个面板。
-                            </div>
-                        )}
-                    </div>
-                ) : (
-                    <p className="text-[10px] text-slate-400">加载中…</p>
-                )}
-
-                {(() => {
-                    const inDeepMode = ppZombieStreak >= 3;
-                    const resetLabel = inDeepMode
-                        ? (ppDeepResetBusy ? '深度重置中…' : '深度重置')
-                        : (ppResetBusy ? '重置中…' : '重置订阅');
-                    const resetBusy = ppResetBusy || ppDeepResetBusy;
-                    return (
-                        <div className="mt-4 grid grid-cols-2 gap-2">
-                            <button
-                                disabled={ppTestBusy || resetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative}
-                                onClick={() => void doSendTestPush()}
-                                className={`py-2 rounded-xl text-xs font-bold ${ppTestBusy || resetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative ? 'bg-slate-200 text-slate-400' : 'bg-teal-500 text-white hover:bg-teal-600'}`}
-                            >
-                                {ppTestBusy ? '测试中…' : '发一条测试推送'}
-                            </button>
-                            <button
-                                disabled={resetBusy || ppTestBusy || ppDiag?.capacitorNative}
-                                onClick={() => inDeepMode ? void doDeepResetSubscription() : void doResetSubscription()}
-                                className={`py-2 rounded-xl text-xs font-bold border ${resetBusy || ppTestBusy || ppDiag?.capacitorNative ? 'bg-slate-100 text-slate-400 border-slate-200' : inDeepMode || ppDiag?.endpointDead ? 'bg-rose-500 text-white border-rose-500 hover:bg-rose-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
-                            >
-                                {resetLabel}
-                            </button>
-                        </div>
-                    );
-                })()}
-                <p className="text-[10px] text-slate-400 mt-2 leading-relaxed">
-                    "测试推送"会让 Worker 立刻给你这台设备发一条 push，5 秒内系统通知里出现"推送测试成功"= 链路通。
-                    "重置订阅"会清掉旧订阅再建一个，适合订阅失效或换浏览器后用。
-                    {ppZombieStreak >= 3 && <><br/>连续几次都没成，已切到"深度重置"——点一下做一次更彻底的清理。</>}
-                </p>
-            </div>
-        </SettingsSection>
-        )}
-
         {/* ───────── 主动消息 2.0（定时推送） ───────── */}
         <section className="bg-white/80 rounded-3xl p-5 shadow-sm border border-white/50">
             <div className="flex items-center justify-between mb-3">
@@ -3496,7 +3257,7 @@ const Settings: React.FC = () => {
                 </button>
             </div>
             <p className="text-xs text-slate-500 leading-relaxed">
-                角色到点自动给你发消息，App 关着也能收。需要你自己部署一个 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里填地址即可。聊天上云（即时对话）与定时主动消息都由它承担。
+                角色到点自动给你发消息，App 关着也能收。需要一个属于你自己的 Cloudflare Worker（自带 D1 数据库 + 定时触发），在配置里粘一枚 Token 就能一键部署。聊天上云（即时对话）与定时主动消息都由它承担。
             </p>
             <button type="button" onClick={() => setShowAmsgCloudData(true)} className="mt-3 w-full rounded-2xl border border-violet-100 bg-violet-50/60 px-4 py-3 text-left text-xs text-violet-700">
                 <span className="block font-semibold">云端数据管理</span>
@@ -3615,63 +3376,6 @@ const Settings: React.FC = () => {
         <VersionInfo />
 
       </div>
-
-      {/* 主动消息 Push 加速 · 启用前确认 */}
-      <Modal
-          isOpen={showPpConfirm}
-          title="启用 Push 加速？"
-          onClose={() => setShowPpConfirm(false)}
-          footer={
-              <div className="flex gap-2 w-full">
-                  <button
-                      onClick={() => { trackEvent('在 Push 加速启用确认弹窗做出选择', { choice: 'cancel' }); setShowPpConfirm(false); }}
-                      className="flex-1 py-3 bg-slate-100 text-slate-600 font-bold rounded-2xl"
-                  >
-                      取消
-                  </button>
-                  <button
-                      onClick={() => {
-                          trackEvent('在 Push 加速启用确认弹窗做出选择', { choice: 'confirm' });
-                          setShowPpConfirm(false);
-                          void doEnablePushAccelerator();
-                      }}
-                      className="flex-1 py-3 bg-teal-500 text-white font-bold rounded-2xl shadow-lg shadow-teal-200"
-                  >
-                      我知道了，启用
-                  </button>
-              </div>
-          }
-      >
-          <div className="space-y-3 text-[12px] leading-relaxed text-slate-600">
-              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
-                  <p className="font-bold text-amber-800 mb-1">启用后会做三件事</p>
-                  <ol className="list-decimal pl-4 space-y-1 text-amber-900">
-                      <li>浏览器会弹 <b>"允许发送通知？"</b> 的系统对话框——请点"允许"，不然没法在后台唤醒</li>
-                      <li>浏览器生成一个 <b>推送订阅凭证</b>（只是一个"门铃地址"，不含任何聊天内容），上传到 Cloudflare</li>
-                      <li>开着本应用的标签页时，每 2 分钟给 Cloudflare 发一次心跳；关掉 5 分钟 Cloudflare 自动停止喊你</li>
-                  </ol>
-              </div>
-
-              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3">
-                  <p className="font-bold text-emerald-800 mb-1">谁能看到什么</p>
-                  <div className="space-y-1.5 text-emerald-900">
-                      <p><b>Cloudflare 能看到：</b>推送订阅凭证 + 角色 ID（一串随机字符串）+ 间隔分钟数。<b>看不到</b>聊天内容、角色人设、AI 回复、API Key、你是谁。</p>
-                      <p><b>浏览器厂商的推送服务（Google / Mozilla / Apple）：</b>知道你某时刻收到一条 push，内容是加密的，他们读不到。</p>
-                      <p><b>你的 AI 接口供应商：</b>和平时聊天一样，到点时浏览器在<b>本地</b>直接调你在"API 配置"里填的那个接口，走你自己的 key。Cloudflare 完全不碰这一步。</p>
-                  </div>
-              </div>
-
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
-                  <p className="font-bold text-slate-700 mb-1">一句话</p>
-                  <p className="text-slate-700">聊天记录和 AI 请求只在你自己和 AI 提供商之间，和现在没开 Push 加速时完全一样。Cloudflare 只是一个"到点按门铃"的闹钟。</p>
-              </div>
-
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-3">
-                  <p className="font-bold text-blue-800 mb-1">不会主动弹通知打扰你</p>
-                  <p className="text-blue-900">浏览器后台标签 → 静默触发，进 app 就看到。浏览器整个关掉 → 下次打开 app 自动补跑，开 app 即有。中间不弹"有人想找你"那种窗口扰你。</p>
-              </div>
-          </div>
-      </Modal>
 
       {/* Cloud Config Modal */}
       <Modal isOpen={showCloudModal} title="云端备份配置" onClose={() => setShowCloudModal(false)}>
@@ -4046,6 +3750,7 @@ const Settings: React.FC = () => {
               </div>
               <div className="space-y-1.5">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">URL</label>
+                  <select aria-label="预设接口类型" value={editPresetApiType} onChange={e => setEditPresetApiType(e.target.value as LlmApiType)} className="w-full bg-slate-100 rounded-xl px-4 py-2.5 text-sm"><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic 原生 Messages</option></select>
                   <input value={editPresetUrl} onChange={e => setEditPresetUrl(e.target.value)} placeholder="https://..." className="w-full bg-slate-100 rounded-xl px-4 py-2.5 text-sm font-mono focus:outline-primary" />
               </div>
               <div className="space-y-1.5">
@@ -4088,15 +3793,22 @@ const Settings: React.FC = () => {
                           className="w-full accent-primary mt-1"
                       />
                   </div>
+                  <label className="block text-[10px] text-slate-400">私聊最大生成 Token
+                      <input type="number" min={1} step={1} value={editPresetMaxTokens} aria-label="预设最大生成 Token"
+                          onChange={event => { const n = Number(event.target.value); if (Number.isSafeInteger(n) && n > 0) setEditPresetMaxTokens(n); }}
+                          className="mt-1 w-full bg-white rounded-xl px-3 py-2 text-sm" />
+                  </label>
               </div>
               <button
                   type="button"
                   onClick={() => {
                       setEditPresetUrl(localUrl);
+                      setEditPresetApiType(localApiType);
                       setEditPresetKey(localKey);
                       setEditPresetModel(localModel);
                       setEditPresetStream(localStream);
                       setEditPresetTemperature(localTemperature);
+                      setEditPresetMaxTokens(localMaxTokens);
                       addToast('已填入当前配置', 'info');
                   }}
                   className="w-full py-2 bg-slate-100 text-slate-500 text-xs font-bold rounded-xl active:scale-95 transition-transform"
@@ -4144,6 +3856,7 @@ const Settings: React.FC = () => {
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-8 h-8"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
               </div>
               <p className="text-sm font-bold text-slate-700">备份文件已生成！</p>
+              <div className="text-left"><BackupMissingAssetsNotice items={exportMissingAssets} /></div>
               <p className="text-xs text-slate-500">如果浏览器没有自动下载，请点击下方链接。</p>
               {downloadUrl && <a href={downloadUrl} download={downloadFileName} className="text-primary text-sm underline block py-2">点击手动下载 .zip</a>}
           </div>
@@ -4160,7 +3873,7 @@ const Settings: React.FC = () => {
       >
           <div className="space-y-5 max-h-[60vh] overflow-y-auto no-scrollbar">
               {rtUserLocationPage === 'main' && <UserHolidaySettings value={rtUserHolidays} onChange={setRtUserHolidays} />}
-              <UserLocationSettings value={rtUserLocation} onChange={setRtUserLocation} onSave={handleSaveUserLocation} page={rtUserLocationPage} onNavigate={setRtUserLocationPage} onBusyChange={setRtUserLocationBusy} userName={userProfile.name} />
+              <UserLocationSettings characters={characters} value={rtUserLocation} onChange={setRtUserLocation} onSave={handleSaveUserLocation} page={rtUserLocationPage} onNavigate={setRtUserLocationPage} onBusyChange={setRtUserLocationBusy} userName={userProfile.name} />
               {rtUserLocationPage === 'main' && <>
               {/* 天气配置 */}
               <div className="bg-emerald-50/50 p-4 rounded-2xl space-y-3">
@@ -4181,11 +3894,12 @@ const Settings: React.FC = () => {
                               <input type="password" value={rtWeatherKey} onChange={e => setRtWeatherKey(e.target.value)} className="w-full bg-white/80 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-mono" placeholder="留空则用免费的 Open-Meteo，无需注册" />
                           </div>
                           <div>
-                              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">城市</label>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">默认天气城市</label>
                               <input type="text" value={rtWeatherCity} onChange={e => setRtWeatherCity(e.target.value)} className="w-full bg-white/80 border border-emerald-200 rounded-xl px-3 py-2 text-sm" placeholder="北京 / Beijing / Shanghai" />
                           </div>
 <button onClick={testWeatherApi} className="w-full py-2 bg-emerald-100 text-emerald-600 text-xs font-bold rounded-xl active:scale-95 transition-transform">测试天气API</button>
                           {renderRtTestStatus('weather')}
+                          <CharacterWeatherCities characters={characters} value={rtWeatherCities} defaultCity={rtWeatherCity} onChange={setRtWeatherCities}/>
                       </div>
                   )}
               </div>
@@ -4679,7 +4393,7 @@ const Settings: React.FC = () => {
           <div className="flex flex-col items-center gap-3 py-2">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-12 h-12 text-red-500"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" /></svg>
               <p className="text-center text-sm text-slate-600 font-medium">
-                  这将<span className="text-red-500 font-bold">永久删除</span>所有角色、聊天记录和设置，且无法恢复！
+                  这将<span className="text-red-500 font-bold">永久删除所有用户空间</span>的角色、聊天记录、共享素材和系统设置，且无法恢复！
               </p>
               <p className="text-center text-xs text-slate-400">
                   主动消息 2.0 在云端存的定时任务、角色上下文和 API 凭据也会一起清掉。

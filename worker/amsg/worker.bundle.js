@@ -2,7 +2,7 @@
 
 // worker/amsg/src/instantInput.ts
 var INSTANT_INPUT_NAMESPACE = "amsg:instant-input";
-var INSTANT_INPUT_TTL_DAYS = 30;
+var INSTANT_INPUT_TTL_DAYS = 7;
 var parseInstantInputRef = (value) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const ref = value;
@@ -16,6 +16,345 @@ var parseInstantInputEnvelope = (value) => {
     return null;
   }
 };
+
+// utils/llmEndpoint.ts
+function isAnthropicEndpoint(value) {
+  try {
+    return /\/messages(?:\/(?:chat\/completions|models))?\/?$/.test(new URL(value).pathname);
+  } catch {
+    return false;
+  }
+}
+function nativeRequestUrl(value) {
+  const url = new URL(value);
+  url.pathname = url.pathname.replace(/\/messages\/chat\/completions\/?$/, "/messages").replace(/\/messages\/models\/?$/, "/models");
+  return url.href;
+}
+
+// utils/samplingParamCompat.ts
+function modelRejectsSamplingParams(model) {
+  if (typeof model !== "string" || !model) return false;
+  const m = model.toLowerCase();
+  if (/opus[-.\s]?4[-.\s]?(7|8|9)\b/.test(m)) return true;
+  if (/opus[-.\s]?(?:[5-9]|\d\d)\b/.test(m)) return true;
+  if (/sonnet[-.\s]?(?:[5-9]|\d\d)\b/.test(m)) return true;
+  if (/\b(?:fable|mythos)[-.\s]?\d/.test(m)) return true;
+  if (/\bgpt-?5/.test(m)) return true;
+  return false;
+}
+
+// utils/anthropicApi.ts
+var ephemeral = { type: "ephemeral" };
+var finishReason = (reason) => reason === "tool_use" ? "tool_calls" : reason === "max_tokens" ? "length" : "stop";
+function contentBlocks(content) {
+  if (content == null || content === "") return [];
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (!Array.isArray(content)) throw Error("Anthropic \u6D88\u606F\u5185\u5BB9\u5FC5\u987B\u4E3A\u6587\u672C\u6216\u5185\u5BB9\u5757");
+  return content.flatMap((part) => {
+    if (part.type === "text") return part.text ? [{ type: "text", text: part.text }] : [];
+    if (part.type === "image_url") {
+      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      const data = typeof url === "string" && url.match(/^data:(image\/(?:jpeg|png|gif|webp));base64,([\s\S]+)$/i);
+      if (data) return [{ type: "image", source: { type: "base64", media_type: data[1].toLowerCase(), data: data[2] } }];
+      if (typeof url === "string" && /^https?:\/\//i.test(url)) return [{ type: "image", source: { type: "url", url } }];
+      throw Error("Anthropic \u56FE\u7247\u9700\u4E3A HTTP \u5730\u5740\u6216\u53D7\u652F\u6301\u7684 base64 \u56FE\u7247");
+    }
+    if (["image", "document", "tool_result", "tool_use", "thinking", "redacted_thinking"].includes(part.type)) return [structuredClone(part)];
+    throw Error(`Anthropic \u6682\u4E0D\u652F\u6301\u5185\u5BB9\u5757\uFF1A${String(part.type)}`);
+  });
+}
+function toAnthropicRequest(body) {
+  if (!Array.isArray(body.messages)) throw Error("Anthropic \u8BF7\u6C42\u7F3A\u5C11 messages");
+  const system = [];
+  const messages = [];
+  let lastHistoryBlock;
+  let sawReminder = false;
+  const append = (role, blocks) => {
+    if (!blocks.length) return;
+    const previous = messages.at(-1);
+    if (previous?.role === role) previous.content.push(...blocks);
+    else messages.push({ role, content: blocks });
+  };
+  for (const message of body.messages) {
+    if (message.role === "system" || message.role === "developer") {
+      const blocks2 = contentBlocks(message.content);
+      if (!messages.length) system.push(...blocks2);
+      else {
+        sawReminder = true;
+        append("user", [{ type: "text", text: "<system-reminder>\n" + blocks2.map((block) => block.text || "").join("\n") + "\n</system-reminder>" }]);
+      }
+      continue;
+    }
+    let blocks;
+    if (message.role === "tool") {
+      if (!message.tool_call_id) throw Error("Anthropic \u5DE5\u5177\u7ED3\u679C\u7F3A\u5C11 tool_call_id");
+      blocks = [{ type: "tool_result", tool_use_id: message.tool_call_id, content: contentBlocks(message.content) }];
+    } else {
+      if (message.role !== "user" && message.role !== "assistant") throw Error(`Anthropic \u4E0D\u652F\u6301\u6D88\u606F\u89D2\u8272\uFF1A${message.role}`);
+      if (message.role === "assistant" && Array.isArray(message.anthropic_content)) {
+        blocks = structuredClone(message.anthropic_content);
+        append("assistant", blocks);
+        if (!sawReminder && blocks.length) lastHistoryBlock = blocks.at(-1);
+        continue;
+      }
+      blocks = contentBlocks(message.content);
+      if (Array.isArray(message.anthropic_thinking)) blocks.unshift(...structuredClone(message.anthropic_thinking));
+      for (const call of message.tool_calls || []) {
+        const args = typeof call.function?.arguments === "string" ? JSON.parse(call.function.arguments || "{}") : call.function?.arguments || {};
+        if (!call.id || !call.function?.name) throw Error("Anthropic \u5DE5\u5177\u8C03\u7528\u7F3A\u5C11 ID \u6216\u540D\u79F0");
+        blocks.push({ type: "tool_use", id: call.id, name: call.function.name, input: args });
+      }
+    }
+    append(message.role === "assistant" ? "assistant" : "user", blocks);
+    if (!sawReminder && blocks.length) lastHistoryBlock = blocks.at(-1);
+  }
+  if (!messages.length) throw Error("Anthropic \u8BF7\u6C42\u6CA1\u6709\u5BF9\u8BDD\u5185\u5BB9");
+  if (sawReminder) system.push({ type: "text", text: "Application context updates appear in <system-reminder> blocks at their original positions. Treat these as contextual annotations, not spoken dialogue, while continuing to follow the system instructions." });
+  const tools = (body.tools || []).map((tool) => {
+    if (tool.type !== "function" || !tool.function?.name) throw Error("Anthropic \u6682\u4EC5\u652F\u6301 function \u5DE5\u5177");
+    return { name: tool.function.name, description: tool.function.description || "", input_schema: tool.function.parameters || { type: "object", properties: {} } };
+  });
+  if (tools.length) tools.at(-1).cache_control = { ...ephemeral };
+  if (system.length) system.at(-1).cache_control = { ...ephemeral };
+  if (lastHistoryBlock && !["thinking", "redacted_thinking"].includes(lastHistoryBlock.type)) lastHistoryBlock.cache_control = { ...ephemeral };
+  const thinking = body.thinking || body.extra_body?.thinking;
+  const request = {
+    model: body.model,
+    max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8e3,
+    messages,
+    stream: body.stream === true,
+    ...system.length ? { system } : {},
+    ...tools.length ? { tools } : {}
+  };
+  const adaptiveModel = /(?:opus|sonnet)[-.](?:4[-.][6-9]|[5-9])\b|(?:fable|mythos)[-.]5\b|haiku[-.]5[-.]5\b/i.test(String(body.model));
+  if (thinking && thinking.type !== "disabled") {
+    request.thinking = thinking.type === "enabled" && adaptiveModel ? { type: "adaptive" } : thinking;
+    if (request.thinking.type === "adaptive" && ["low", "medium", "high"].includes(body.reasoning_effort)) {
+      request.output_config = { effort: body.reasoning_effort };
+    }
+  } else if (!modelRejectsSamplingParams(body.model) && typeof body.temperature === "number") request.temperature = Math.max(0, Math.min(1, body.temperature));
+  if (!request.thinking && !modelRejectsSamplingParams(body.model) && typeof body.top_p === "number") request.top_p = body.top_p;
+  if (body.stop) request.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+  if (body.tool_choice && tools.length) {
+    request.tool_choice = typeof body.tool_choice === "string" ? { type: body.tool_choice === "required" ? "any" : body.tool_choice } : { type: "tool", name: body.tool_choice.function?.name };
+  }
+  if (tools.length && body.parallel_tool_calls === false) {
+    request.tool_choice = { ...request.tool_choice || { type: "auto" }, disable_parallel_tool_use: true };
+  }
+  if (body.response_format?.type === "json_object") {
+    request.system = [...system, { type: "text", text: "Return a valid JSON value only, without Markdown fences." }];
+  } else if (body.response_format?.type === "json_schema") {
+    request.output_config = { ...request.output_config, format: { type: "json_schema", schema: body.response_format.json_schema?.schema } };
+  }
+  return request;
+}
+function anthropicUsage(usage = {}) {
+  const input = usage.input_tokens || 0, read = usage.cache_read_input_tokens || 0, write = usage.cache_creation_input_tokens || 0;
+  return { ...usage, prompt_tokens: input + read + write, completion_tokens: usage.output_tokens || 0, total_tokens: input + read + write + (usage.output_tokens || 0), prompt_tokens_details: { cached_tokens: read }, cache_creation_input_tokens: write };
+}
+function fromAnthropicMessage(message) {
+  if (message.type === "error") throw Error(message.error?.message || "Anthropic \u8FD4\u56DE\u9519\u8BEF");
+  if (message.type !== "message" || !Array.isArray(message.content)) throw Error("Anthropic \u8FD4\u56DE\u4E86\u65E0\u6548 Messages \u54CD\u5E94");
+  const text2 = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  const thinking = message.content.filter((b) => b.type === "thinking" || b.type === "redacted_thinking");
+  const calls = message.content.filter((b) => b.type === "tool_use").map((b) => ({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input) } }));
+  return { id: message.id, object: "chat.completion", model: message.model, choices: [{ index: 0, finish_reason: finishReason(message.stop_reason), message: {
+    role: "assistant",
+    content: text2,
+    ...thinking.length ? { reasoning_content: thinking.map((b) => b.thinking || "").join(""), anthropic_thinking: thinking } : {},
+    ...thinking.length || calls.length ? { anthropic_content: message.content } : {},
+    ...calls.length ? { tool_calls: calls } : {}
+  } }], usage: anthropicUsage(message.usage) };
+}
+function convertAnthropicStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder(), encoder2 = new TextEncoder();
+  let pending = "", eventData = [], stopped = false, id = "", model = "", usage = {}, emitted = 0;
+  const toolIndices = /* @__PURE__ */ new Map();
+  const thinking = /* @__PURE__ */ new Map();
+  const blocks = /* @__PURE__ */ new Map(), toolJson = /* @__PURE__ */ new Map();
+  const emitEvent = (controller) => {
+    if (stopped) {
+      eventData = [];
+      return;
+    }
+    if (!eventData.length) return;
+    const event = JSON.parse(eventData.join("\n"));
+    eventData = [];
+    if (event.type === "error") throw Error(event.error?.message || "Anthropic \u6D41\u5F0F\u9519\u8BEF");
+    let delta = {}, end = null;
+    if (event.type === "message_start") {
+      id = event.message.id;
+      model = event.message.model;
+      usage = { ...event.message.usage };
+      delta.role = "assistant";
+    } else if (event.type === "content_block_start") {
+      const block = structuredClone(event.content_block);
+      blocks.set(event.index, block);
+      if (block.type === "tool_use") {
+        const index = toolIndices.size;
+        toolIndices.set(event.index, index);
+        delta.tool_calls = [{ index, id: block.id, type: "function", function: { name: block.name, arguments: Object.keys(block.input || {}).length ? JSON.stringify(block.input) : "" } }];
+      } else if (block.type === "text") delta.content = block.text || "";
+      else if (block.type === "thinking" || block.type === "redacted_thinking") {
+        thinking.set(event.index, block);
+        delta.reasoning_content = block.thinking || "";
+      }
+    } else if (event.type === "content_block_delta") {
+      if (event.delta.type === "text_delta") delta.content = event.delta.text;
+      if (event.delta.type === "text_delta" && blocks.has(event.index)) blocks.get(event.index).text += event.delta.text;
+      if (event.delta.type === "input_json_delta") toolJson.set(event.index, (toolJson.get(event.index) || "") + event.delta.partial_json);
+      if (event.delta.type === "input_json_delta") {
+        const index = toolIndices.get(event.index);
+        if (index === void 0) throw Error("Anthropic \u5DE5\u5177\u6D41\u7F3A\u5C11\u8D77\u59CB\u4E8B\u4EF6");
+        delta.tool_calls = [{ index, function: { arguments: event.delta.partial_json } }];
+      }
+      if (event.delta.type === "thinking_delta") {
+        delta.reasoning_content = event.delta.thinking;
+        const block = thinking.get(event.index);
+        if (block) block.thinking = (block.thinking || "") + event.delta.thinking;
+      }
+      if (event.delta.type === "signature_delta") {
+        const block = thinking.get(event.index);
+        if (block) block.signature = (block.signature || "") + event.delta.signature;
+      }
+    } else if (event.type === "message_delta") {
+      usage = { ...usage, ...event.usage };
+    } else if (event.type === "message_stop") {
+      stopped = true;
+      end = "stop";
+    }
+    if (event.delta?.stop_reason) usage.__stop_reason = event.delta.stop_reason;
+    if (stopped) {
+      end = finishReason(usage.__stop_reason);
+      for (const [index, json] of toolJson) blocks.get(index).input = JSON.parse(json || "{}");
+      if (thinking.size) delta.anthropic_thinking = [...thinking.values()];
+      if (thinking.size || toolIndices.size) delta.anthropic_content = [...blocks.values()];
+    }
+    if (Object.keys(delta).length || stopped || event.type === "message_delta") {
+      emitted++;
+      const { __stop_reason, ...reportedUsage } = usage;
+      controller.enqueue(encoder2.encode(`data: ${JSON.stringify({ id, model, object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: end }], usage: anthropicUsage(reportedUsage) })}
+
+`));
+    }
+    if (stopped) controller.enqueue(encoder2.encode("data: [DONE]\n\n"));
+  };
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const before = emitted;
+        while (true) {
+          const result = await reader.read();
+          pending += decoder.decode(result.value, { stream: !result.done });
+          let newline;
+          while ((newline = pending.indexOf("\n")) >= 0) {
+            const line = pending.slice(0, newline).replace(/\r$/, "");
+            pending = pending.slice(newline + 1);
+            if (!line) emitEvent(controller);
+            else if (line.startsWith("data:")) eventData.push(line.slice(5).trimStart());
+          }
+          if (result.done) {
+            if (pending.startsWith("data:")) eventData.push(pending.slice(5).trimStart());
+            emitEvent(controller);
+            if (!stopped) throw Error("Anthropic \u6D41\u5F0F\u8FDE\u63A5\u63D0\u524D\u7ED3\u675F\uFF0C\u672A\u6536\u5230 message_stop");
+            controller.close();
+            reader.releaseLock();
+            return;
+          }
+          if (stopped) {
+            controller.close();
+            await reader.cancel();
+            return;
+          }
+          if (emitted > before) return;
+        }
+      } catch (error) {
+        controller.error(error);
+        await reader.cancel().catch(() => {
+        });
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    }
+  });
+  return new Response(stream, { status: response.status, statusText: response.statusText, headers: { "content-type": "text/event-stream", "x-request-id": response.headers.get("request-id") || "" } });
+}
+async function fetchLlm(resource, init, transport = globalThis.fetch, browser = typeof window !== "undefined") {
+  if (transport.__sullyAnthropic) return transport(resource, init);
+  const inputUrl = typeof resource === "string" ? resource : resource instanceof URL ? resource.href : resource.url;
+  if (!isAnthropicEndpoint(inputUrl)) return transport(resource, init);
+  const request = resource instanceof Request ? resource : void 0;
+  const method = (init?.method || request?.method || "GET").toUpperCase();
+  const body = init?.body ?? (request && method === "POST" ? await request.clone().text() : void 0);
+  let parsed;
+  if (method === "POST") {
+    try {
+      parsed = typeof body === "string" ? JSON.parse(body) : void 0;
+    } catch {
+    }
+    if (typeof parsed?.model !== "string" || !Array.isArray(parsed.messages)) return transport(resource, init);
+  } else if (method !== "GET" || !/\/messages\/models\/?$/.test(new URL(inputUrl).pathname)) return transport(resource, init);
+  const headers = new Headers(init?.headers || request?.headers);
+  const key = headers.get("x-api-key") || headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+  headers.delete("authorization");
+  headers.set("x-api-key", key);
+  headers.set("anthropic-version", "2023-06-01");
+  if (browser) headers.set("anthropic-dangerous-direct-browser-access", "true");
+  const url = nativeRequestUrl(inputUrl);
+  const inherited = request ? { cache: request.cache, credentials: request.credentials, integrity: request.integrity, keepalive: request.keepalive, mode: request.mode, redirect: request.redirect, referrer: request.referrer, referrerPolicy: request.referrerPolicy } : {};
+  const options = { ...inherited, ...init, method, headers, signal: init?.signal || request?.signal };
+  if (method === "POST") {
+    if (typeof body !== "string") throw Error("Anthropic \u8BF7\u6C42\u5FC5\u987B\u4E3A JSON");
+    options.body = JSON.stringify(toAnthropicRequest(parsed));
+    headers.set("content-type", "application/json");
+    headers.delete("content-length");
+  }
+  const response = await transport(url, options);
+  if (!response.ok || method !== "POST") return response;
+  if (response.headers.get("content-type")?.includes("text/event-stream")) {
+    if (!response.body) throw Error("Anthropic \u8FD4\u56DE\u4E86\u7A7A\u6D41");
+    return convertAnthropicStream(response);
+  }
+  return new Response(JSON.stringify(fromAnthropicMessage(await response.json())), { status: response.status, statusText: response.statusText, headers: { "content-type": "application/json" } });
+}
+function installAnthropicFetch(browser = false) {
+  if (globalThis.fetch.__sullyAnthropic) return;
+  const original = globalThis.fetch.bind(globalThis);
+  const wrapped = (resource, init) => fetchLlm(resource, init, original, browser);
+  wrapped.__sullyAnthropic = true;
+  globalThis.fetch = wrapped;
+}
+
+// utils/amsgReproduction.ts
+var DIAGNOSTIC_NAMESPACE = "amsg:diagnostic";
+var DIAGNOSTIC_CHAR_ID = "amsg-diagnostic";
+var DIAGNOSTIC_RETENTION_DAYS = 7;
+function diagnosticRunId(metadata) {
+  const value = metadata?.amsgDiagnosticRunId;
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
+}
+function safeDiagnosticError(error) {
+  const e = error;
+  const names = ["Error", "TypeError", "AbortError", "TimeoutError", "NotAllowedError", "InvalidStateError", "QuotaExceededError", "VersionError", "DataError", "TransactionInactiveError"];
+  const status = Number(e?.statusCode ?? e?.status ?? e?.llmStatus ?? e?.cause?.statusCode ?? e?.cause?.status);
+  return {
+    errorName: typeof e?.name === "string" && names.includes(e.name) ? e.name : "Error",
+    ...typeof e?.code === "string" && ["LLM_CALL_FAILED", "PUSH_PAYLOAD_TOO_LARGE", "PUSH_SUBSCRIPTION_MISSING", "CREDENTIAL_NOT_FOUND", "INVALID_PARAMETERS", "TASK_NOT_FOUND", "TASK_ALREADY_COMPLETED"].includes(e.code) ? { errorCode: e.code } : {},
+    ...Number.isInteger(status) && status >= 100 && status <= 599 ? { httpStatus: status } : {}
+  };
+}
+
+// utils/characterWeather.ts
+function cleanCharacterWeatherCities(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([id, city]) => id && typeof city === "string" && city.trim()).map(([id, city]) => [id, city.trim().slice(0, 100)]));
+}
+function weatherForCharacter(config, charId) {
+  const city = charId && Object.prototype.hasOwnProperty.call(config.weatherCities || {}, charId) ? config.weatherCities?.[charId] : void 0;
+  return typeof city === "string" && city.trim() ? { ...config, weatherCity: city.trim().slice(0, 100) } : config;
+}
 
 // utils/proxyWorker.ts
 var DEFAULT_PROXY_WORKER = "https://proxy.friedsully.com";
@@ -81,6 +420,7 @@ var parseToolConfig = (value) => {
     } else {
       delete parsed.mcpServers;
     }
+    if (parsed.weatherCities !== void 0) parsed.weatherCities = cleanCharacterWeatherCities(parsed.weatherCities);
     return parsed;
   } catch {
     return null;
@@ -418,6 +758,7 @@ var describeMinutes = (minutes) => {
   const m = minutes % 60;
   return m ? `${h} \u5C0F\u65F6 ${m} \u5206\u949F` : `${h} \u5C0F\u65F6`;
 };
+var SELF_SCHEDULE_HARD_GAP_MS = 3 * 6e4;
 var checkSelfScheduleRules = (input) => {
   const { limits } = input;
   if (input.recurrence !== "none" && !limits.allowSelfRecurring) {
@@ -427,18 +768,15 @@ var checkSelfScheduleRules = (input) => {
       message: "\u7528\u6237\u6CA1\u6709\u8BA9\u4F60\u6392\u6BCF\u5929/\u6BCF\u5468\u91CD\u590D\u7684\u6D88\u606F\uFF0C\u8FD9\u6B21\u53EA\u80FD\u6392\u4E00\u6B21\u6027\u7684\uFF08\u53BB\u6389 recurrence \u518D\u6392\uFF09\u3002"
     };
   }
-  const conflict = findGapConflict(input.sendAtMs, limits.minSendGapMs, input.busy);
+  const userGapApplies = limits.minSendGapMs >= SELF_SCHEDULE_HARD_GAP_MS;
+  const gapMs = Math.max(limits.minSendGapMs, SELF_SCHEDULE_HARD_GAP_MS);
+  const conflict = findGapConflict(input.sendAtMs, gapMs, input.busy);
   if (conflict !== null) {
-    const gapMinutes = Math.round(limits.minSendGapMs / 6e4);
-    const earliest = earliestSlotAfter(
-      Math.max(input.earliestMs, input.sendAtMs),
-      limits.minSendGapMs,
-      input.busy
-    );
+    const earliest = earliestSlotAfter(Math.max(input.earliestMs, input.sendAtMs), gapMs, input.busy);
     return {
       ok: false,
       reason: "min_gap",
-      message: `\u79BB ${input.formatTime(conflict)} \u90A3\u6B21\u592A\u8FD1\u4E86\uFF1A\u7528\u6237\u5B9A\u4E86\u4E24\u6B21\u4E3B\u52A8\u6D88\u606F\u4E4B\u95F4\u81F3\u5C11\u9694 ${describeMinutes(gapMinutes)}\u3002\u8981\u6392\u7684\u8BDD\u6700\u65E9 ${input.formatTime(earliest)}\uFF1B\u6CA1\u90A3\u4E48\u8981\u7D27\u7684\u8BDD\uFF0C\u8FD9\u6B21\u5C31\u522B\u6392\u4E86\u3002`
+      message: userGapApplies ? `\u79BB ${input.formatTime(conflict)} \u90A3\u6B21\u592A\u8FD1\u4E86\uFF1A\u7528\u6237\u5B9A\u4E86\u4E24\u6B21\u4E3B\u52A8\u6D88\u606F\u4E4B\u95F4\u81F3\u5C11\u9694 ${describeMinutes(Math.round(limits.minSendGapMs / 6e4))}\u3002\u8981\u6392\u7684\u8BDD\u6700\u65E9 ${input.formatTime(earliest)}\uFF1B\u6CA1\u90A3\u4E48\u8981\u7D27\u7684\u8BDD\uFF0C\u8FD9\u6B21\u5C31\u522B\u6392\u4E86\u3002` : `${input.formatTime(conflict)} \u524D\u540E\u5DF2\u7ECF\u6709\u4E00\u6B21\u4E3B\u52A8\u6D88\u606F\u4E86\uFF0C\u540C\u4E00\u65F6\u523B\u4E0D\u80FD\u518D\u6392\u4E00\u6761\u3002\u5982\u679C\u662F\u540C\u4E00\u4EF6\u4E8B\uFF0C\u5B83\u5DF2\u7ECF\u6392\u7740\uFF0C\u4E0D\u7528\u518D\u6392\uFF1B\u8981\u6362\u65F6\u95F4\u6216\u5185\u5BB9\uFF0C\u6539\u539F\u6765\u90A3\u6761\uFF08renew / cancel\uFF09\u3002`
     };
   }
   return {
@@ -450,20 +788,46 @@ var buildLimitsBrief = (input) => {
   const { limits } = input;
   const lines = [];
   if (Number.isFinite(limits.maxUnansweredSends)) {
-    const left = Math.max(0, limits.maxUnansweredSends - input.committedSends);
-    lines.push(`- \u5BF9\u65B9\u6CA1\u56DE\u7684\u65F6\u5019\uFF0C\u4F60\u6700\u591A\u8FDE\u7740\u4E3B\u52A8\u627E\u5BF9\u65B9 ${limits.maxUnansweredSends} \u6B21\uFF08\u4E00\u6B21\u53EF\u4EE5\u8BF4\u597D\u51E0\u53E5\uFF1B\u6392\u597D\u8FD8\u6CA1\u53D1\u7684\u4E5F\u7B97\uFF09\uFF0C` + (left > 0 ? `\u73B0\u5728\u8FD8\u80FD\u518D\u6392 ${left} \u6B21\u3002` : "\u73B0\u5728\u4E00\u6B21\u90FD\u4E0D\u80FD\u518D\u6392\u4E86\uFF0C\u7B49\u5BF9\u65B9\u56DE\u590D\u3002"));
+    const used = Math.min(limits.maxUnansweredSends, Math.max(0, input.committedSends));
+    lines.push(`- \u5BF9\u65B9\u6CA1\u56DE\u671F\u95F4\u7684\u4E3B\u52A8\u8054\u7CFB\uFF1A\u5DF2\u7528 ${used}/${limits.maxUnansweredSends} \u6B21\uFF08\u4E00\u6B21\u53EF\u4EE5\u8BF4\u597D\u51E0\u53E5\uFF1B\u6392\u597D\u8FD8\u6CA1\u53D1\u7684\u4E5F\u7B97\uFF09` + (used < limits.maxUnansweredSends ? "\u3002" : "\uFF0C\u5DF2\u6EE1\uFF0C\u7B49\u5BF9\u65B9\u56DE\u590D\u540E\u624D\u80FD\u518D\u6392\u3002"));
   }
   if (limits.minSendGapMs > 0) {
     lines.push(`- \u4E24\u6B21\u4E3B\u52A8\u627E\u5BF9\u65B9\u4E4B\u95F4\u81F3\u5C11\u9694 ${describeMinutes(Math.round(limits.minSendGapMs / 6e4))}` + (input.earliestText ? `\uFF0C\u8FD9\u6B21\u6700\u65E9\u6392\u5230 ${input.earliestText}\u3002` : "\u3002"));
   }
   if (input.dailyRemaining !== void 0 && Number.isFinite(limits.dailySendCap)) {
-    lines.push(input.dailyRemaining > 0 ? `- \u4ECA\u5929\u8FD8\u80FD\u518D\u4E3B\u52A8\u627E\u5BF9\u65B9 ${input.dailyRemaining} \u6B21\u3002` : "- \u4ECA\u5929\u4E3B\u52A8\u627E\u5BF9\u65B9\u7684\u6B21\u6570\u5DF2\u7ECF\u7528\u5B8C\u4E86\uFF0C\u8981\u6392\u5C31\u6392\u5230\u660E\u5929\u3002");
+    const remaining = Math.min(limits.dailySendCap, Math.max(0, input.dailyRemaining));
+    lines.push(`- \u4ECA\u5929\u7684\u4E3B\u52A8\u8054\u7CFB\uFF1A\u5DF2\u7528 ${limits.dailySendCap - remaining}/${limits.dailySendCap} \u6B21` + (remaining > 0 ? "\u3002" : "\uFF0C\u5DF2\u6EE1\uFF0C\u8981\u6392\u5C31\u6392\u5230\u660E\u5929\u3002"));
   }
-  lines.push(`- \u540C\u65F6\u6700\u591A\u6302 ${limits.maxActiveTasks} \u4E2A\u6392\u7A0B\u4EFB\u52A1\uFF0C\u73B0\u5728\u6302\u7740 ${input.activeTasks} \u4E2A\u3002`);
+  lines.push(`- \u6392\u7A0B\u4EFB\u52A1\uFF1A\u6302\u7740 ${input.activeTasks}/${limits.maxActiveTasks} \u4E2A\u3002`);
   if (!limits.allowSelfRecurring) lines.push("- \u53EA\u80FD\u6392\u4E00\u6B21\u6027\u7684\uFF0C\u4E0D\u80FD\u6392\u6BCF\u5929/\u6BCF\u5468\u91CD\u590D\u7684\u3002");
   if (!limits.allowSelfForce) lines.push("- \u6392\u7684\u6D88\u606F\u5230\u70B9\u78B0\u4E0A\u5BF9\u65B9\u6B63\u5728\u804A\u5929\u4F1A\u81EA\u52A8\u4F5C\u7F62\uFF08\u8F6C\u6210\u4F60\u5728\u804A\u5929\u91CC\u81EA\u7136\u5E26\u51FA\uFF09\uFF0C\u6CA1\u6709\u300C\u5230\u70B9\u5FC5\u53D1\u300D\u3002");
   return ["\u7528\u6237\u7ED9\u4F60\u5B9A\u7684\u89C4\u77E9\uFF08\u7CFB\u7EDF\u7167\u7740\u6267\u884C\uFF1A\u8D85\u51FA\u7684\u6392\u4E0D\u4E0A\uFF0C\u6392\u4E0A\u4E86\u5230\u70B9\u4E5F\u4E0D\u53D1\uFF09\uFF1A", ...lines].join("\n");
 };
+
+// utils/amsgTaskKinds.ts
+var AMSG_TASK_KIND_KEY = "amsgKind";
+var readTaskKind = (metadata) => {
+  const raw = metadata?.[AMSG_TASK_KIND_KEY];
+  return typeof raw === "string" && raw ? raw : null;
+};
+var AMSG_BACKGROUND_JOB_SUBTYPE = "job";
+var AMSG_INSTANT_CHAT_SUBTYPE = "instant-chat";
+var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
+var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
+var classifyTaskRow = (row) => {
+  const { metadata } = row;
+  if (metadata) {
+    if (isInstantChatTask(metadata)) return "instant-chat";
+    if (readTaskKind(metadata)) return "background-job";
+    if (metadata.amsgSelfScheduled === true) return "scheduled";
+  }
+  if (row.messageSubtype === AMSG_INSTANT_CHAT_SUBTYPE) return "instant-chat";
+  if (row.messageSubtype === AMSG_BACKGROUND_JOB_SUBTYPE) return "background-job";
+  return "scheduled";
+};
+var AMSG_JOB_NAMESPACE = "amsg:job";
+var AMSG_JOB_TTL_DAYS = 3;
+var AMSG_JOB_ID_KEY = "amsgJobId";
 
 // utils/amsgFirePack.ts
 var AMSG_STATE_NAMESPACE_PREFIX = "amsg:char:";
@@ -717,6 +1081,8 @@ var renderFirePack = (pack, nowMs, taskInstruction, extras) => {
   const timeSinceUser = formatTimeSinceUser(diffMinutes);
   const awayHint = buildAwayHint(pack.targetName, timeSinceUser);
   let out = pack.template;
+  if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join("\n")}
+`).join("");
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
   out = fillSlot(out, AMSG_SLOT_TIME_SINCE_USER, timeSinceUser);
@@ -752,7 +1118,7 @@ var describeFirePackVersion = (value) => {
     return `\u5305\u662F v${v}\u3001worker \u8981 v${FIRE_PACK_VERSION} \u2014\u2014 \u524D\u7AEF\u6BD4 worker \u65E7\uFF0C\u6253\u5F00\u4E00\u6B21\u7F51\u9875\u8BA9\u5B83\u91CD\u65B0\u4E0A\u4F20`;
   }
   if (typeof v === "number") {
-    return `\u5305\u662F v${v}\u3001worker \u53EA\u8BA4 v${FIRE_PACK_VERSION} \u2014\u2014 worker bundle \u662F\u65E7\u7684\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u7C98\u8D34\u90E8\u7F72`;
+    return `\u5305\u662F v${v}\u3001worker \u53EA\u8BA4 v${FIRE_PACK_VERSION} \u2014\u2014 worker bundle \u662F\u65E7\u7684\uFF0C\u53BB\u300C\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0\u300D\u70B9\u4E00\u4E0B\u300C\u66F4\u65B0 Worker\u300D`;
   }
   return "\u5305\u91CC\u6CA1\u6709\u7248\u672C\u53F7\uFF08\u6570\u636E\u635F\u574F\uFF09";
 };
@@ -764,8 +1130,8 @@ var chatContentOk = (content) => {
 var chatFieldOk = (chat) => {
   if (chat === void 0) return true;
   if (!chat || typeof chat !== "object" || Array.isArray(chat)) return false;
-  const { messages, builtAt } = chat;
-  return typeof builtAt === "number" && Array.isArray(messages) && messages.length > 0 && messages.every((m) => !!m && typeof m === "object" && typeof m.role === "string" && chatContentOk(m.content));
+  const { messages, builtAt, timelyInsertAt } = chat;
+  return typeof builtAt === "number" && (timelyInsertAt === void 0 || Number.isInteger(timelyInsertAt)) && Array.isArray(messages) && messages.length > 0 && messages.every((m) => !!m && typeof m === "object" && typeof m.role === "string" && chatContentOk(m.content));
 };
 var parseFirePack = (value) => {
   try {
@@ -1054,6 +1420,8 @@ var character = (id, kind, label) => ({
   kind
 });
 async function resolveSullyCloudOwnership(input) {
+  const diagnosticId = input.type === "state" && input.namespace === DIAGNOSTIC_NAMESPACE ? diagnosticRunId({ amsgDiagnosticRunId: input.key?.split(":")[0] }) : diagnosticRunId(record(record(input.payload).metadata)) ?? diagnosticRunId(record(record(input.task).metadata));
+  if (diagnosticId) return { owner: { type: "diagnostic", id: diagnosticId, label: "\u4E3B\u52A8\u6D88\u606F\u590D\u73B0" }, kind: "diagnostic" };
   if (input.type === "state") {
     if (input.namespace === INSTANT_INPUT_NAMESPACE && typeof input.value === "string") {
       const envelope = parseInstantInputEnvelope(input.value);
@@ -1112,29 +1480,67 @@ async function resolveSullyCloudOwnership(input) {
 }
 
 // utils/amsgStoppedReply.ts
-var stoppedReplyKey = (uuid) => `chat_stop:${uuid}`;
+var STOPPED_REPLY_KEY_PREFIX = "chat_stop:";
+var stoppedReplyKey = (uuid) => `${STOPPED_REPLY_KEY_PREFIX}${uuid}`;
+var MAX_CLOUD_STOPPED_REPLY_KEYS = 8;
+var STOPPED_REPLY_CLOUD_TTL_MS = 24 * 60 * 60 * 1e3;
 function reconcileStoppedReplies(log, rows) {
   if (!log) return log;
   const kept = /* @__PURE__ */ new Map();
   for (const row of rows) {
-    if (!row.key.startsWith("chat_stop:")) continue;
+    if (!row.key.startsWith(STOPPED_REPLY_KEY_PREFIX)) continue;
     try {
       const value = JSON.parse(row.value);
-      if (typeof value.text === "string") kept.set(row.key.slice("chat_stop:".length), value.text);
+      if (typeof value.text === "string") kept.set(row.key.slice(STOPPED_REPLY_KEY_PREFIX.length), value.text);
     } catch {
     }
   }
-  return { ...log, entries: log.entries.flatMap((entry) => {
+  if (kept.size === 0) return log;
+  let changed = false;
+  const entries = log.entries.flatMap((entry) => {
     if (!entry.taskUuid || !kept.has(entry.taskUuid)) return [entry];
     const text2 = kept.get(entry.taskUuid);
-    return text2 ? [{ ...entry, text: text2 }] : [];
-  }) };
+    if (!text2) {
+      changed = true;
+      return [];
+    }
+    if (text2 !== entry.text) changed = true;
+    return [{ ...entry, text: text2 }];
+  });
+  return changed ? { ...log, entries } : log;
+}
+function pickStaleStoppedReplyKeys(rows, nowMs = Date.now(), protectKey) {
+  const stopRows = rows.map((row, index) => ({ key: row.key, updatedAt: row.updatedAt, index })).filter((row) => row.key.startsWith(STOPPED_REPLY_KEY_PREFIX) && row.key !== protectKey);
+  if (stopRows.length === 0) return [];
+  const cutoff = nowMs - STOPPED_REPLY_CLOUD_TTL_MS;
+  const stale = /* @__PURE__ */ new Set();
+  const fresh = [];
+  for (const row of stopRows) {
+    if (typeof row.updatedAt === "number" && row.updatedAt > 0 && row.updatedAt < cutoff) {
+      stale.add(row.key);
+    } else {
+      fresh.push(row);
+    }
+  }
+  if (fresh.length > MAX_CLOUD_STOPPED_REPLY_KEYS) {
+    fresh.sort((a, b) => {
+      const ta = typeof a.updatedAt === "number" ? a.updatedAt : 0;
+      const tb = typeof b.updatedAt === "number" ? b.updatedAt : 0;
+      return ta !== tb ? ta - tb : a.index - b.index;
+    });
+    const overflow = fresh.length - MAX_CLOUD_STOPPED_REPLY_KEYS;
+    for (let i = 0; i < overflow; i += 1) {
+      stale.add(fresh[i].key);
+    }
+  }
+  return [...stale];
 }
 
 // worker/amsg/src/index.ts
 import { DurableObject } from "cloudflare:workers";
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@3.1.0-next.1_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@3.2.0-next.2_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-R2CRPRKR.mjs
+var CLEANUP_BATCH_LIMIT = 100;
 var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
   "user_id",
   "uuid",
@@ -1153,7 +1559,7 @@ var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
 var TASK_DELIVERY_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count";
 var TASK_DETAIL_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at";
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
+// node_modules/.pnpm/@rei-standard+amsg-shared@0.5.0-next.0/node_modules/@rei-standard/amsg-shared/dist/index.mjs
 var TEXT_ENCODER = new TextEncoder();
 var TEXT_DECODER = new TextDecoder("utf-8", { fatal: false });
 function toUint8(buf) {
@@ -1168,7 +1574,7 @@ function concatBytes(...chunks) {
   const out = new Uint8Array(total);
   let offset = 0;
   for (const c of chunks) {
-    out.set(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c), offset);
+    out.set(toUint8(c), offset);
     offset += c.byteLength;
   }
   return out;
@@ -1236,7 +1642,7 @@ function randomBytes(n) {
 function randomUUID() {
   return globalThis.crypto.randomUUID();
 }
-var VALID_LLM_MESSAGE_ROLES = /* @__PURE__ */ new Set(["system", "user", "assistant", "tool"]);
+var VALID_LLM_MESSAGE_ROLES = /* @__PURE__ */ new Set(["system", "developer", "user", "assistant", "tool"]);
 var LLM_MESSAGES_ERROR = Object.freeze({
   MESSAGES_NOT_ARRAY: "MESSAGES_NOT_ARRAY",
   MESSAGE_NOT_OBJECT: "MESSAGE_NOT_OBJECT",
@@ -1653,7 +2059,10 @@ var NONCE_INFO = utf8("Content-Encoding: nonce\0");
 var VAPID_DEFAULT_TTL = 60;
 var VAPID_TOKEN_LIFETIME = 12 * 3600;
 var RECORD_SIZE = 4096;
-async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl }) {
+var SEND_DEFAULT_TIMEOUT_MS = 3e4;
+var VAPID_MAX_TOKEN_LIFETIME = 24 * 3600;
+var RESPONSE_BODY_MAX_BYTES = 16 * 1024;
+async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl, signal, timeoutMs }) {
   if (!subscription || typeof subscription.endpoint !== "string") {
     throw new Error("sendWebPush: invalid subscription");
   }
@@ -1682,16 +2091,31 @@ async function sendWebPush({ subscription, payload, vapid, ttl, fetch: fetchImpl
   if (typeof fetchFn !== "function") {
     throw new Error("sendWebPush: no fetch implementation available");
   }
-  const res = await fetchFn(subscription.endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "Content-Encoding": "aes128gcm",
-      "TTL": String(Number.isFinite(ttl) ? ttl : VAPID_DEFAULT_TTL),
-      "Authorization": `vapid t=${jwt}, k=${vapid.publicKey}`
-    },
-    body: encryptedBody
-  });
+  const timeoutController = new AbortController();
+  const timer = setTimeout(
+    () => timeoutController.abort(new DOMException("Web Push request timed out", "TimeoutError")),
+    Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : SEND_DEFAULT_TIMEOUT_MS
+  );
+  let res;
+  try {
+    res = await fetchFn(subscription.endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Encoding": "aes128gcm",
+        "TTL": String(Number.isFinite(ttl) ? ttl : VAPID_DEFAULT_TTL),
+        "Authorization": `vapid t=${jwt}, k=${vapid.publicKey}`
+      },
+      body: encryptedBody,
+      signal: signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal
+    });
+  } catch (cause) {
+    const err6 = new Error(`Web Push delivery failed: ${cause?.message || cause}`, { cause });
+    err6.code = "PUSH_SEND_FAILED";
+    throw err6;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const text2 = await safeReadText(res);
     const err6 = new Error(
@@ -1822,7 +2246,22 @@ function writeUint32BE(buf, offset, value) {
 }
 async function safeReadText(res) {
   try {
-    return await res.text();
+    const body = res.body;
+    if (!body || typeof body.getReader !== "function") {
+      return (await res.text()).slice(0, RESPONSE_BODY_MAX_BYTES);
+    }
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < RESPONSE_BODY_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(toUint8(value));
+      total += value.byteLength;
+    }
+    reader.cancel().catch(() => {
+    });
+    return utf8Decode(concatBytes(...chunks).subarray(0, RESPONSE_BODY_MAX_BYTES));
   } catch {
     return "";
   }
@@ -1968,9 +2407,21 @@ function requireField(kind, field, value) {
     throw new Error(`[amsg-shared] ${kind}: '${field}' is required`);
   }
 }
+function requireEnumField(kind, field, value, allowed) {
+  requireField(kind, field, value);
+  const values = Object.values(allowed);
+  if (!values.includes(
+    /** @type {string} */
+    value
+  )) {
+    throw new Error(
+      `[amsg-shared] ${kind}: '${field}' must be one of ${values.map((v) => `'${v}'`).join(" | ")}`
+    );
+  }
+}
 function buildContentPush(args) {
-  requireField("ContentPush", "messageType", args.messageType);
-  requireField("ContentPush", "source", args.source);
+  requireEnumField("ContentPush", "messageType", args.messageType, MESSAGE_TYPE);
+  requireEnumField("ContentPush", "source", args.source, PUSH_SOURCE);
   requireField("ContentPush", "messageId", args.messageId);
   requireField("ContentPush", "sessionId", args.sessionId);
   if (typeof args.message !== "string") {
@@ -1998,8 +2449,8 @@ function buildContentPush(args) {
   return push;
 }
 function buildReasoningPush(args) {
-  requireField("ReasoningPush", "messageType", args.messageType);
-  requireField("ReasoningPush", "source", args.source);
+  requireEnumField("ReasoningPush", "messageType", args.messageType, MESSAGE_TYPE);
+  requireEnumField("ReasoningPush", "source", args.source, PUSH_SOURCE);
   requireField("ReasoningPush", "messageId", args.messageId);
   requireField("ReasoningPush", "sessionId", args.sessionId);
   if (typeof args.reasoningContent !== "string" || !args.reasoningContent) {
@@ -2060,8 +2511,8 @@ function buildResultPush(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new Error("[amsg-shared] ResultPush: payload must be a plain object");
   }
-  requireField("ResultPush", "messageType", args.messageType);
-  requireField("ResultPush", "source", args.source);
+  requireEnumField("ResultPush", "messageType", args.messageType, MESSAGE_TYPE);
+  requireEnumField("ResultPush", "source", args.source, PUSH_SOURCE);
   requireField("ResultPush", "messageId", args.messageId);
   requireField("ResultPush", "sessionId", args.sessionId);
   if (typeof args.resultKind !== "string" || !args.resultKind.trim()) {
@@ -2346,7 +2797,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@3.1.0-next.1_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-EIM3PKFY.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@3.2.0-next.2_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-WFKLHUUE.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -2406,23 +2857,34 @@ function epochFromWallParts({ year, month, day, hour, minute, second, ms }, tzId
   if (tzOffsetMsAt(refined, tzId) !== tzOffsetMsAt(firstGuess, tzId)) return firstGuess;
   return refined;
 }
+function timeOfDayFor(occurrenceMs, wall, tzId, anchorMs) {
+  if (!Number.isFinite(anchorMs)) return wall;
+  const anchor = wallPartsOf(anchorMs, tzId);
+  if (anchor.hour === wall.hour && anchor.minute === wall.minute && anchor.second === wall.second) return wall;
+  const anchorOnThisDay = epochFromWallParts(
+    { year: wall.year, month: wall.month, day: wall.day, hour: anchor.hour, minute: anchor.minute, second: anchor.second, ms: occurrenceMs - Math.floor(occurrenceMs / 1e3) * 1e3 },
+    tzId
+  );
+  return anchorOnThisDay === occurrenceMs ? anchor : wall;
+}
 function periodDaysOf(recurrenceType) {
   return recurrenceType === "weekly" ? 7 : 1;
 }
-function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId) {
+function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs) {
   const days = periodDaysOf(recurrenceType) * periods;
   if (!tzId) return occurrenceMs + days * DAY_MS;
   try {
     const p = wallPartsOf(occurrenceMs, tzId);
+    const time = timeOfDayFor(occurrenceMs, p, tzId, anchorMs);
     const shiftedDate = new Date(utcFromParts(p.year, p.month, p.day, 0, 0, 0, 0) + days * DAY_MS);
     return epochFromWallParts(
       {
         year: shiftedDate.getUTCFullYear(),
         month: shiftedDate.getUTCMonth() + 1,
         day: shiftedDate.getUTCDate(),
-        hour: p.hour,
-        minute: p.minute,
-        second: p.second,
+        hour: time.hour,
+        minute: time.minute,
+        second: time.second,
         ms: occurrenceMs - Math.floor(occurrenceMs / 1e3) * 1e3
       },
       tzId
@@ -2432,19 +2894,19 @@ function advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId) {
     return occurrenceMs + days * DAY_MS;
   }
 }
-function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
+function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs) {
   const periodMs = periodDaysOf(recurrenceType) * DAY_MS;
   let periods = nowMs > occurrenceMs ? Math.max(1, Math.floor((nowMs - occurrenceMs) / periodMs)) : 1;
-  let cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId);
+  let cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs);
   for (let step = 0; step < MAX_ADJUST_STEPS && periods > 1; step++) {
-    const previous = advanceOccurrence(occurrenceMs, recurrenceType, periods - 1, tzId);
+    const previous = advanceOccurrence(occurrenceMs, recurrenceType, periods - 1, tzId, anchorMs);
     if (previous <= nowMs) break;
     periods -= 1;
     cursor = previous;
   }
   for (let step = 0; step < MAX_ADJUST_STEPS && cursor <= nowMs; step++) {
     periods += 1;
-    cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId);
+    cursor = advanceOccurrence(occurrenceMs, recurrenceType, periods, tzId, anchorMs);
   }
   if (cursor <= nowMs) {
     periods = Math.ceil((nowMs - occurrenceMs + 1) / periodMs);
@@ -2456,16 +2918,177 @@ function planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
   if (skippedCount <= MAX_LISTED_SKIPPED_OCCURRENCES) {
     skippedOccurrences = [occurrenceMs];
     for (let i = 1; i < skippedCount; i++) {
-      skippedOccurrences.push(advanceOccurrence(occurrenceMs, recurrenceType, i, tzId));
+      skippedOccurrences.push(advanceOccurrence(occurrenceMs, recurrenceType, i, tzId, anchorMs));
     }
   } else {
-    skippedOccurrences = [occurrenceMs, advanceOccurrence(occurrenceMs, recurrenceType, skippedCount - 1, tzId)];
+    skippedOccurrences = [occurrenceMs, advanceOccurrence(occurrenceMs, recurrenceType, skippedCount - 1, tzId, anchorMs)];
     skippedTruncated = true;
   }
   return { nextMs: cursor, skippedCount, skippedOccurrences, skippedTruncated };
 }
-function nextFutureOccurrence(occurrenceMs, recurrenceType, nowMs, tzId) {
-  return new Date(planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId).nextMs).toISOString();
+function nextFutureOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs) {
+  return new Date(planNextOccurrence(occurrenceMs, recurrenceType, nowMs, tzId, anchorMs).nextMs).toISOString();
+}
+var NonRetryableError = class extends Error {
+  /**
+   * @param {string} message
+   * @param {{ code?: string, cause?: unknown }} [options]
+   */
+  constructor(message, options = {}) {
+    super(message, options.cause !== void 0 ? { cause: options.cause } : void 0);
+    this.name = "NonRetryableError";
+    this.permanent = true;
+    if (options.code) this.code = options.code;
+  }
+};
+function isNonRetryableError(error) {
+  return !!error && typeof error === "object" && /** @type {any} */
+  error.permanent === true;
+}
+var DeploymentConfigError = class extends Error {
+  /**
+   * @param {string} message
+   * @param {{ code?: string, cause?: unknown }} [options]
+   */
+  constructor(message, options = {}) {
+    super(message, options.cause !== void 0 ? { cause: options.cause } : void 0);
+    this.name = "DeploymentConfigError";
+    if (options.code) this.code = options.code;
+  }
+};
+var STORED_DATA_UNDECRYPTABLE_CODE = "STORED_DATA_UNDECRYPTABLE";
+var StoredDataUndecryptableError = class extends Error {
+  /** @param {{ cause?: unknown }} [options] */
+  constructor(options = {}) {
+    super(
+      "\u5E93\u91CC\u7684\u6570\u636E\u662F\u7528\u53E6\u4E00\u628A\u4E3B\u5BC6\u94A5\u52A0\u5BC6\u7684\uFF0C\u5F53\u524D\u7684 AMSG_MASTER_KEY \u89E3\u4E0D\u5F00\u3002\u5E38\u89C1\u539F\u56E0\u662F\u91CD\u65B0\u90E8\u7F72\u65F6\u6362\u4E86 AMSG_MASTER_KEY\uFF1A\u6362\u56DE\u539F\u6765\u7684\u5BC6\u94A5\u5373\u53EF\u6062\u590D\uFF0C\u6216\u8005\u6E05\u6389\u4E91\u7AEF\u7684\u65E7\u6570\u636E\u540E\u91CD\u65B0\u5199\u5165\u3002",
+      options.cause !== void 0 ? { cause: options.cause } : void 0
+    );
+    this.name = "StoredDataUndecryptableError";
+    this.code = STORED_DATA_UNDECRYPTABLE_CODE;
+    this.status = 409;
+  }
+};
+function isStoredDataUndecryptableError(error) {
+  return !!error && typeof error === "object" && /** @type {any} */
+  error.code === STORED_DATA_UNDECRYPTABLE_CODE;
+}
+function markPermanent(error, code) {
+  if (!error || typeof error !== "object") return error;
+  const target = (
+    /** @type {any} */
+    error
+  );
+  try {
+    target.permanent = true;
+    if (code && typeof target.code !== "string") target.code = code;
+  } catch (_frozen) {
+  }
+  return error;
+}
+var TASK_CANCELLED_CODE = "TASK_CANCELLED";
+function isTaskCancelledError(error) {
+  return !!error && typeof error === "object" && /** @type {any} */
+  error.code === TASK_CANCELLED_CODE;
+}
+function markUnrecoverablePartialDelivery(error, { outboxed, pushedCount }) {
+  if (outboxed || !(pushedCount > 0) || isTaskCancelledError(error)) return error;
+  return markPermanent(error);
+}
+var TERMINAL_PUSH_STATUSES = /* @__PURE__ */ new Set([404, 410]);
+var PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
+var PERMANENT_ERROR_CODES = /* @__PURE__ */ new Set([
+  "PUSH_SUBSCRIPTION_MISSING",
+  "PUSH_SUBSCRIPTION_STORE_UNSUPPORTED",
+  "PUSH_PAYLOAD_TOO_LARGE"
+]);
+var LLM_CALL_FAILED_CODE = "LLM_CALL_FAILED";
+var PERMANENT_LLM_STATUSES = /* @__PURE__ */ new Set([400, 401, 402, 403, 404, 405, 413, 422]);
+function isPermanentLlmFailure(error) {
+  if (!error || typeof error !== "object") return false;
+  const { code, llmStatus } = (
+    /** @type {any} */
+    error
+  );
+  return code === LLM_CALL_FAILED_CODE && Number.isInteger(llmStatus) && PERMANENT_LLM_STATUSES.has(llmStatus);
+}
+function markPermanentIfLlmRejected(error) {
+  return isPermanentLlmFailure(error) ? markPermanent(error) : error;
+}
+function isPermanentDeliveryFailure(failure) {
+  const { permanent, errorCode, pushStatus } = failure || {};
+  return permanent === true || typeof errorCode === "string" && PERMANENT_ERROR_CODES.has(errorCode) || Number.isInteger(pushStatus) && (TERMINAL_PUSH_STATUSES.has(
+    /** @type {number} */
+    pushStatus
+  ) || pushStatus === PUSH_PAYLOAD_TOO_LARGE_STATUS);
+}
+var pushStatusCodes = /* @__PURE__ */ new WeakMap();
+function tagPushStatusCode(error) {
+  if (error && typeof error === "object" && Number.isInteger(
+    /** @type {any} */
+    error.statusCode
+  )) {
+    pushStatusCodes.set(
+      /** @type {object} */
+      error,
+      /** @type {any} */
+      error.statusCode
+    );
+  }
+  return error;
+}
+async function sendTaggedPush(webpush, subscription, payloadJson) {
+  try {
+    return await webpush.sendNotification(subscription, payloadJson);
+  } catch (error) {
+    throw tagPushStatusCode(error);
+  }
+}
+function readPushStatusCode(error) {
+  if (!error || typeof error !== "object") return null;
+  const statusCode = pushStatusCodes.get(
+    /** @type {object} */
+    error
+  );
+  return Number.isInteger(statusCode) ? statusCode : null;
+}
+function buildErrorExtra(errorCode, pushStatus) {
+  const extra = {};
+  if (typeof errorCode === "string" && errorCode) extra.errorCode = errorCode.slice(0, 64);
+  if (Number.isInteger(pushStatus)) extra.pushStatus = /** @type {number} */
+  pushStatus;
+  return Object.keys(extra).length > 0 ? extra : void 0;
+}
+var ERROR_SUMMARY_MAX_CHARS = 500;
+function sanitizeErrorSummary(reason) {
+  const flattened = String(reason ?? "").replace(/\s+/g, " ").trim();
+  const safe = redactCredentials(flattened);
+  return safe.length > ERROR_SUMMARY_MAX_CHARS ? `${safe.slice(0, ERROR_SUMMARY_MAX_CHARS - 3)}\u2026` : safe;
+}
+var D1_LIMIT_CODES = [
+  [/Exceeded maximum DB size/i, "D1_STORAGE_FULL"],
+  [/daily row read limit/i, "D1_DAILY_READ_LIMIT"],
+  [/daily row write limit/i, "D1_DAILY_WRITE_LIMIT"]
+];
+function summarizeErrorCause(error, stage) {
+  const raw = error && typeof error === "object" ? (
+    /** @type {any} */
+    error
+  ) : {};
+  const name = typeof raw.name === "string" && raw.name ? raw.name : "Error";
+  const rawMessage = typeof raw.message === "string" && raw.message ? raw.message : String(error ?? "");
+  const cause = {
+    stage,
+    name: sanitizeErrorSummary(name).slice(0, 100),
+    message: sanitizeErrorSummary(rawMessage)
+  };
+  if (typeof raw.code === "string" && raw.code) {
+    cause.code = sanitizeErrorSummary(raw.code).slice(0, 100);
+  } else {
+    const limit = D1_LIMIT_CODES.find(([pattern]) => pattern.test(rawMessage));
+    if (limit) cause.code = limit[1];
+  }
+  return cause;
 }
 var base64ToBytes2 = base64UrlToBytes;
 var TAG_LENGTH_BYTES = 16;
@@ -2550,14 +3173,18 @@ async function encryptForStorage(text2, encryptionKey) {
   return `${bytesToHex(iv)}:${bytesToHex(authTag)}:${bytesToHex(ciphertext)}`;
 }
 async function decryptFromStorage(encryptedText, encryptionKey) {
-  const [ivHex, authTagHex, encryptedDataHex] = encryptedText.split(":");
-  const plain = await aesGcmOpen(
-    encryptionKey,
-    hexToBytes(ivHex),
-    hexToBytes(encryptedDataHex),
-    hexToBytes(authTagHex)
-  );
-  return utf8Decode(plain);
+  try {
+    const [ivHex, authTagHex, encryptedDataHex] = encryptedText.split(":");
+    const plain = await aesGcmOpen(
+      encryptionKey,
+      hexToBytes(ivHex),
+      hexToBytes(encryptedDataHex),
+      hexToBytes(authTagHex)
+    );
+    return utf8Decode(plain);
+  } catch (error) {
+    throw new StoredDataUndecryptableError({ cause: error });
+  }
 }
 var CRED_ID_MAX_LENGTH = 128;
 var CRED_VALUE_FIELD_MAX_LENGTH = 2048;
@@ -2680,9 +3307,26 @@ async function resolveFireCredentials({ db, userId, userKey, decryptedPayload })
     `\u51ED\u636E ${credId} \u4E0D\u5B58\u5728\uFF08PUT /llm-credentials \u8865\u4F20\u540E\u8FD9\u6761\u4EFB\u52A1\u4E0B\u4E00\u8F6E\u91CD\u8BD5\u5373\u81EA\u6108\uFF09`
   );
 }
+var ISO_8601_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
 function isValidISO8601(dateString) {
-  const date = new Date(dateString);
-  return date instanceof Date && !isNaN(date.getTime());
+  return typeof dateString === "string" && ISO_8601_RE.test(dateString) && !Number.isNaN(Date.parse(dateString));
+}
+function isFutureTimestamp(value) {
+  return new Date(value) > /* @__PURE__ */ new Date();
+}
+var LOCAL_FETCH_SCHEMES = /* @__PURE__ */ new Set(["file:", "data:", "blob:", "javascript:", "about:"]);
+function isValidPushEndpoint(endpoint) {
+  if (typeof endpoint !== "string") return false;
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  if (!url.host && !LOCAL_FETCH_SCHEMES.has(url.protocol)) return true;
+  if (url.protocol !== "https:" || url.username || url.password) return false;
+  const host = url.hostname;
+  return host !== "localhost" && !host.endsWith(".localhost") && !host.startsWith("[") && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
 }
 function isValidUUID(uuid) {
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2788,9 +3432,12 @@ function validateScheduleMessagePayload(payload) {
     if (!payload.firstSendTime || !isValidISO8601(payload.firstSendTime)) {
       return { valid: false, errorCode: "INVALID_TIMESTAMP", errorMessage: "\u65F6\u95F4\u683C\u5F0F\u65E0\u6548", details: { field: "firstSendTime" } };
     }
-    if (payload.firstSendTime && new Date(payload.firstSendTime) <= /* @__PURE__ */ new Date()) {
+    if (!isFutureTimestamp(payload.firstSendTime)) {
       return { valid: false, errorCode: "INVALID_TIMESTAMP", errorMessage: "\u65F6\u95F4\u5FC5\u987B\u5728\u672A\u6765", details: { field: "firstSendTime", reason: "must be in the future" } };
     }
+  }
+  if (payload.metadata != null && (typeof payload.metadata !== "object" || Array.isArray(payload.metadata))) {
+    return { valid: false, errorCode: "INVALID_PARAMETERS", errorMessage: "metadata \u5FC5\u987B\u662F\u666E\u901A\u5BF9\u8C61", details: { invalidFields: ["metadata"] } };
   }
   if (payload.supersedesUuid !== void 0 && payload.supersedesUuid !== null) {
     if (typeof payload.supersedesUuid !== "string" || !isValidUUID(payload.supersedesUuid)) {
@@ -3082,142 +3729,6 @@ function createGetUserKeyHandler(ctx) {
   }
   return { GET };
 }
-var NonRetryableError = class extends Error {
-  /**
-   * @param {string} message
-   * @param {{ code?: string, cause?: unknown }} [options]
-   */
-  constructor(message, options = {}) {
-    super(message, options.cause !== void 0 ? { cause: options.cause } : void 0);
-    this.name = "NonRetryableError";
-    this.permanent = true;
-    if (options.code) this.code = options.code;
-  }
-};
-function isNonRetryableError(error) {
-  return !!error && typeof error === "object" && /** @type {any} */
-  error.permanent === true;
-}
-var DeploymentConfigError = class extends Error {
-  /**
-   * @param {string} message
-   * @param {{ code?: string, cause?: unknown }} [options]
-   */
-  constructor(message, options = {}) {
-    super(message, options.cause !== void 0 ? { cause: options.cause } : void 0);
-    this.name = "DeploymentConfigError";
-    if (options.code) this.code = options.code;
-  }
-};
-function markPermanent(error, code) {
-  if (!error || typeof error !== "object") return error;
-  const target = (
-    /** @type {any} */
-    error
-  );
-  try {
-    target.permanent = true;
-    if (code && typeof target.code !== "string") target.code = code;
-  } catch (_frozen) {
-  }
-  return error;
-}
-var TASK_CANCELLED_CODE = "TASK_CANCELLED";
-function isTaskCancelledError(error) {
-  return !!error && typeof error === "object" && /** @type {any} */
-  error.code === TASK_CANCELLED_CODE;
-}
-function markUnrecoverablePartialDelivery(error, { outboxed, pushedCount }) {
-  if (outboxed || !(pushedCount > 0) || isTaskCancelledError(error)) return error;
-  return markPermanent(error);
-}
-var TERMINAL_PUSH_STATUSES = /* @__PURE__ */ new Set([404, 410]);
-var PUSH_PAYLOAD_TOO_LARGE_STATUS = 413;
-var PERMANENT_ERROR_CODES = /* @__PURE__ */ new Set([
-  "PUSH_SUBSCRIPTION_MISSING",
-  "PUSH_SUBSCRIPTION_STORE_UNSUPPORTED",
-  "PUSH_PAYLOAD_TOO_LARGE"
-]);
-var LLM_CALL_FAILED_CODE = "LLM_CALL_FAILED";
-var PERMANENT_LLM_STATUSES = /* @__PURE__ */ new Set([400, 401, 402, 403, 404, 405, 413, 422]);
-function isPermanentLlmFailure(error) {
-  if (!error || typeof error !== "object") return false;
-  const { code, llmStatus } = (
-    /** @type {any} */
-    error
-  );
-  return code === LLM_CALL_FAILED_CODE && Number.isInteger(llmStatus) && PERMANENT_LLM_STATUSES.has(llmStatus);
-}
-function markPermanentIfLlmRejected(error) {
-  return isPermanentLlmFailure(error) ? markPermanent(error) : error;
-}
-function isPermanentDeliveryFailure(failure) {
-  const { permanent, errorCode, pushStatus } = failure || {};
-  return permanent === true || typeof errorCode === "string" && PERMANENT_ERROR_CODES.has(errorCode) || Number.isInteger(pushStatus) && (TERMINAL_PUSH_STATUSES.has(
-    /** @type {number} */
-    pushStatus
-  ) || pushStatus === PUSH_PAYLOAD_TOO_LARGE_STATUS);
-}
-var pushStatusCodes = /* @__PURE__ */ new WeakMap();
-function tagPushStatusCode(error) {
-  if (error && typeof error === "object" && Number.isInteger(
-    /** @type {any} */
-    error.statusCode
-  )) {
-    pushStatusCodes.set(
-      /** @type {object} */
-      error,
-      /** @type {any} */
-      error.statusCode
-    );
-  }
-  return error;
-}
-async function sendTaggedPush(webpush, subscription, payloadJson) {
-  try {
-    return await webpush.sendNotification(subscription, payloadJson);
-  } catch (error) {
-    throw tagPushStatusCode(error);
-  }
-}
-function readPushStatusCode(error) {
-  if (!error || typeof error !== "object") return null;
-  const statusCode = pushStatusCodes.get(
-    /** @type {object} */
-    error
-  );
-  return Number.isInteger(statusCode) ? statusCode : null;
-}
-function buildErrorExtra(errorCode, pushStatus) {
-  const extra = {};
-  if (typeof errorCode === "string" && errorCode) extra.errorCode = errorCode.slice(0, 64);
-  if (Number.isInteger(pushStatus)) extra.pushStatus = /** @type {number} */
-  pushStatus;
-  return Object.keys(extra).length > 0 ? extra : void 0;
-}
-var ERROR_SUMMARY_MAX_CHARS = 500;
-function sanitizeErrorSummary(reason) {
-  const flattened = String(reason ?? "").replace(/\s+/g, " ").trim();
-  const safe = redactCredentials(flattened);
-  return safe.length > ERROR_SUMMARY_MAX_CHARS ? `${safe.slice(0, ERROR_SUMMARY_MAX_CHARS - 3)}\u2026` : safe;
-}
-function summarizeErrorCause(error, stage) {
-  const raw = error && typeof error === "object" ? (
-    /** @type {any} */
-    error
-  ) : {};
-  const name = typeof raw.name === "string" && raw.name ? raw.name : "Error";
-  const rawMessage = typeof raw.message === "string" && raw.message ? raw.message : String(error ?? "");
-  const cause = {
-    stage,
-    name: sanitizeErrorSummary(name).slice(0, 100),
-    message: sanitizeErrorSummary(rawMessage)
-  };
-  if (typeof raw.code === "string" && raw.code) {
-    cause.code = sanitizeErrorSummary(raw.code).slice(0, 100);
-  }
-  return cause;
-}
 var DEFAULT_MAX_DELIVERY_RETRIES = 3;
 function resolveMaxDeliveryRetries(ctx) {
   const value = ctx.maxDeliveryRetries;
@@ -3286,7 +3797,8 @@ async function sendWebPush2(args) {
 var SCHEDULED_DEFAULT_TTL = 2419200;
 function createWebCryptoWebPush(vapid = {}, { ttl = SCHEDULED_DEFAULT_TTL } = {}) {
   return {
-    async sendNotification(subscription, payload) {
+    acceptsSendOptions: true,
+    async sendNotification(subscription, payload, { signal, timeoutMs } = {}) {
       return sendWebPush2({
         subscription,
         payload,
@@ -3296,10 +3808,37 @@ function createWebCryptoWebPush(vapid = {}, { ttl = SCHEDULED_DEFAULT_TTL } = {}
           publicKey: vapid.publicKey,
           privateKey: vapid.privateKey
         },
-        fetch: globalThis.fetch
+        fetch: globalThis.fetch,
+        signal,
+        timeoutMs
       });
     }
   };
+}
+function withPushSignal(webpush, signal) {
+  if (!signal || !webpush || /** @type {any} */
+  webpush.acceptsSendOptions !== true) return webpush;
+  const bound = Object.create(
+    /** @type {any} */
+    webpush
+  );
+  Object.defineProperty(bound, "sendNotification", {
+    value: (subscription, payload, options) => (
+      /** @type {any} */
+      webpush.sendNotification(subscription, payload, { signal, ...options })
+    ),
+    writable: true,
+    enumerable: true,
+    configurable: true
+  });
+  return bound;
+}
+function assertVapidConfigured(vapid) {
+  if (!vapid || !vapid.email || !vapid.publicKey || !vapid.privateKey) {
+    const err6 = new Error("VAPID configuration missing - push notifications cannot be sent");
+    err6.code = "VAPID_CONFIG_MISSING";
+    throw err6;
+  }
 }
 var ATTACHMENT_NAMESPACE = "amsg:attachments";
 var ATTACHMENT_RETENTION_DAYS = 30;
@@ -3378,7 +3917,7 @@ function parseChunkedRootCount(value) {
 function splitStateValue(value) {
   return chunkReasoningByUtf8Bytes(value, STATE_CHUNK_SLICE_BYTES);
 }
-async function resolveClientStateEntries(rows, fetchChunkRows, decryptValue) {
+async function resolveClientStateEntries(rows, fetchChunkRows, decryptValue, onUndecryptable) {
   let chunkMap = null;
   const loadChunks = async () => {
     if (chunkMap === null) {
@@ -3390,32 +3929,30 @@ async function resolveClientStateEntries(rows, fetchChunkRows, decryptValue) {
   const entries = [];
   for (const row of rows) {
     const count = parseChunkedRootCount(row.value);
-    if (count === null) {
-      entries.push({
-        namespace: row.namespace,
-        key: row.key,
-        value: await decryptValue(row.value),
-        updatedAt: row.updated_at
-      });
+    let valueSources = [row.value];
+    if (count !== null) {
+      const map = await loadChunks();
+      const chunkRows = [];
+      for (let i = 0; i < count; i++) {
+        const chunk = map.get(chunkKeyFor(row.key, i));
+        if (!chunk || chunk.updated_at !== row.updated_at) break;
+        chunkRows.push(chunk);
+      }
+      if (chunkRows.length !== count) continue;
+      valueSources = chunkRows.map((chunk) => chunk.value);
+    }
+    let value;
+    try {
+      value = (await Promise.all(valueSources.map(decryptValue))).join("");
+    } catch (error) {
+      if (!onUndecryptable || !isStoredDataUndecryptableError(error)) throw error;
+      onUndecryptable(row);
       continue;
     }
-    const map = await loadChunks();
-    const chunkRows = [];
-    let intact = true;
-    for (let i = 0; i < count; i++) {
-      const chunk = map.get(chunkKeyFor(row.key, i));
-      if (!chunk || chunk.updated_at !== row.updated_at) {
-        intact = false;
-        break;
-      }
-      chunkRows.push(chunk);
-    }
-    if (!intact) continue;
-    const parts = await Promise.all(chunkRows.map((chunk) => decryptValue(chunk.value)));
     entries.push({
       namespace: row.namespace,
       key: row.key,
-      value: parts.join(""),
+      value,
       updatedAt: row.updated_at
     });
   }
@@ -3788,9 +4325,10 @@ function supportsPushSubscriptionStore(db) {
   return !!db && typeof db.getPushSubscription === "function" && typeof db.upsertPushSubscription === "function" && typeof db.deletePushSubscription === "function";
 }
 function isPushSubscriptionShape(subscription) {
-  return !!subscription && typeof subscription === "object" && !Array.isArray(subscription) && typeof /** @type {{ endpoint?: unknown }} */
-  subscription.endpoint === "string" && /** @type {{ endpoint: string }} */
-  subscription.endpoint.trim().length > 0;
+  return !!subscription && typeof subscription === "object" && !Array.isArray(subscription) && isValidPushEndpoint(
+    /** @type {{ endpoint?: unknown }} */
+    subscription.endpoint
+  );
 }
 async function savePushSubscription({ db, userId, userKey, subscription, updatedAt }) {
   const at = Number.isInteger(updatedAt) && updatedAt > 0 ? updatedAt : Date.now();
@@ -3879,7 +4417,9 @@ function createResultEmitter({
       assertNotCancelled();
       pushed = shouldSendPush(push, { outboxed: true }) ? await sendResultPush({ db, task, userKey, decryptedPayload, webpush, push }) : false;
     } catch (error) {
-      await discardUndeliveredPushes({ db, userId: task.user_id, pushes: [push], sentIds: [] });
+      if (!isTaskCancelledError(error)) {
+        await discardUndeliveredPushes({ db, userId: task.user_id, pushes: [push], sentIds: [] });
+      }
       throw error;
     }
     if (pushed) {
@@ -3958,6 +4498,14 @@ function projectTask(row, decryptedPayload, options = {}) {
     // 这一层的话，客户端只能回去正则匹配 reason 那句人话。
     lastError: hasRowLastError(row) ? parseRowLastError(row.last_error) : payload.lastError ?? null
   };
+}
+async function projectStoredTask(row, userKey, options) {
+  try {
+    return projectTask(row, JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)), options);
+  } catch (error) {
+    if (!isStoredDataUndecryptableError(error)) throw error;
+    return { ...projectTask(row, null, options), error: { code: error.code, message: error.message } };
+  }
 }
 function hasRowLastError(row) {
   return !!row && Object.prototype.hasOwnProperty.call(row, "last_error");
@@ -4061,17 +4609,20 @@ function firstPositiveNumber(values, fallback) {
 }
 async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
   const hooks = ctx.hooks;
-  const signal = ctx.signal || new AbortController().signal;
-  const isCancelled = () => signal.aborted || ctx.isTaskCancelled?.() === true;
+  const taskSignal = ctx.signal || new AbortController().signal;
+  const isCancelled = () => taskSignal.aborted || ctx.isTaskCancelled?.() === true;
   const throwIfCancelled = () => {
     if (!isCancelled()) return;
-    if (isTaskCancelledError(signal.reason)) throw signal.reason;
+    if (isTaskCancelledError(taskSignal.reason)) throw taskSignal.reason;
     const error = new Error("Task was cancelled or superseded");
     error.code = "TASK_CANCELLED";
     throw error;
   };
-  const cancellation = { signal, isCancelled, throwIfCancelled };
-  ctx = { ...ctx, ...cancellation };
+  const hookController = new AbortController();
+  if (taskSignal.aborted) hookController.abort(taskSignal.reason);
+  else taskSignal.addEventListener("abort", () => hookController.abort(taskSignal.reason), { once: true });
+  const cancellation = { signal: hookController.signal, isCancelled, throwIfCancelled };
+  ctx = { ...ctx, ...cancellation, webpush: withPushSignal(ctx.webpush, hookController.signal) };
   if (typeof hooks.onLLMOutput !== "function") {
     throw new DeploymentConfigError(
       "AGENTIC_CONFIG_ERROR: hooks.onBeforeFire requires hooks.onLLMOutput to classify LLM rounds",
@@ -4134,11 +4685,7 @@ async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       throw new DeploymentConfigError("AGENTIC_TASK_VIEW_UNSUPPORTED: adapter has no listTasks", { code: "AGENTIC_TASK_VIEW_UNSUPPORTED" });
     }
     const { tasks, total } = await ctx.db.listTasks(task.user_id, { status, limit, offset });
-    const projected = await Promise.all(tasks.map(async (row) => projectTask(
-      row,
-      JSON.parse(await decryptFromStorage(row.encrypted_payload, userKey)),
-      { includeMetadata }
-    )));
+    const projected = await Promise.all(tasks.map((row) => projectStoredTask(row, userKey, { includeMetadata })));
     return { tasks: projected, pagination: { total, limit, offset, hasMore: offset + tasks.length < total } };
   };
   const scheduleTask = async (options) => {
@@ -4432,6 +4979,7 @@ async function runAgenticFire({ task, decryptedPayload, userKey, ctx }) {
       resolveLlmCredential: resolveLlmCredential2,
       fireCtx,
       progress,
+      hookController,
       sessionId,
       messageIdBase,
       occurrenceMs
@@ -4510,12 +5058,17 @@ async function runFireChain({
   resolveLlmCredential: resolveLlmCredential2,
   fireCtx,
   progress,
+  hookController,
   sessionId,
   messageIdBase,
   occurrenceMs
 }) {
   ctx.throwIfCancelled();
-  const before = await hooks.onBeforeFire(fireCtx);
+  const beforeFireBudgetMs = firstPositiveNumber([ctx.totalTimeoutMs], DEFAULT_TOTAL_TIMEOUT_MS);
+  const before = await awaitWithinBudget(() => hooks.onBeforeFire(fireCtx), beforeFireBudgetMs, {
+    hookController,
+    makeError: () => totalTimeoutError(beforeFireBudgetMs, 0)
+  });
   ctx.throwIfCancelled();
   if (before == null) return { handled: false };
   if (typeof before === "object" && before.skip === true) {
@@ -4562,10 +5115,12 @@ async function runFireChain({
   });
   for (let iteration = 0; iteration < maxToolIterations; iteration++) {
     ctx.throwIfCancelled();
-    if (nowFn() >= deadline) {
-      throw new Error(`AGENTIC_TOTAL_TIMEOUT: fire chain exceeded ${totalTimeoutMs}ms after ${iteration} LLM round(s)`);
-    }
+    if (nowFn() >= deadline) throw totalTimeoutError(totalTimeoutMs, iteration);
     progress.iterations = iteration + 1;
+    const withinDeadline = (run) => awaitWithinBudget(run, deadline - nowFn(), {
+      hookController,
+      makeError: () => totalTimeoutError(totalTimeoutMs, iteration + 1)
+    });
     const roundTimeoutMs = Math.max(1, Math.min(3e5, deadline - nowFn()));
     progress.llmCalls++;
     const { response: llmResponse } = await callLlm2(
@@ -4610,7 +5165,7 @@ async function runFireChain({
       renewTask,
       resolveLlmCredential: resolveLlmCredential2
     });
-    const decision = await hooks.onLLMOutput(sessionCtx);
+    const decision = await withinDeadline(() => hooks.onLLMOutput(sessionCtx));
     ctx.throwIfCancelled();
     const rawCalls = decision?.decision === "tool-request" ? extractToolCallsFromDecision(decision) : [];
     const validId = (call) => typeof call?.id === "string" && call.id.trim().length > 0;
@@ -4686,14 +5241,14 @@ async function runFireChain({
     let toolResults;
     try {
       ctx.throwIfCancelled();
-      toolResults = permittedCalls.length > 0 ? await hooks.executeToolCalls(permittedCalls, sessionCtx) : [];
+      toolResults = permittedCalls.length > 0 ? await withinDeadline(() => hooks.executeToolCalls(permittedCalls, sessionCtx)) : [];
       ctx.throwIfCancelled();
       if (!Array.isArray(toolResults)) {
         throw new TypeError('executeToolCalls must resolve to an array of { tool_call_id, role: "tool", content }');
       }
     } catch (error) {
       ctx.throwIfCancelled();
-      if (isTaskCancelledError(error)) throw error;
+      if (isTaskCancelledError(error) || error?.code === TOTAL_TIMEOUT_CODE) throw error;
       toolResults = permittedCalls.map((toolCall) => ({
         tool_call_id: toolCall && typeof toolCall === "object" && typeof toolCall.id === "string" ? toolCall.id : "",
         role: "tool",
@@ -4711,6 +5266,30 @@ async function runFireChain({
     `AGENTIC_LOOP_EXCEEDED: no finish/skip-push decision within ${maxToolIterations} LLM round(s)`,
     "AGENTIC_LOOP_EXCEEDED"
   );
+}
+var TOTAL_TIMEOUT_CODE = "AGENTIC_TOTAL_TIMEOUT";
+function totalTimeoutError(totalTimeoutMs, rounds) {
+  return taggedRetryableError(
+    `${TOTAL_TIMEOUT_CODE}: fire chain exceeded ${totalTimeoutMs}ms after ${rounds} LLM round(s)`,
+    TOTAL_TIMEOUT_CODE
+  );
+}
+async function awaitWithinBudget(run, remainingMs, { hookController, makeError }) {
+  const expire = () => {
+    const error = makeError();
+    hookController.abort(error);
+    return error;
+  };
+  if (remainingMs <= 0) throw expire();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(expire()), Math.min(remainingMs, 2147483647));
+  });
+  try {
+    return await Promise.race([run(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 function taggedRetryableError(message, code) {
   const error = new Error(message);
@@ -4789,9 +5368,7 @@ async function sendHookPushPayloads({
     progress.outboxed = outboxed;
     if (ctx._deliveryState) ctx._deliveryState.outboxed = outboxed;
     ctx.throwIfCancelled();
-    if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-      throw new Error("VAPID configuration missing - push notifications cannot be sent");
-    }
+    assertVapidConfigured(ctx.vapid);
     const pushSubscription = await resolvePushSubscription({
       db: ctx.db,
       userId: task.user_id,
@@ -4816,14 +5393,6 @@ async function sendHookPushPayloads({
   } catch (error) {
     markUnrecoverablePartialDelivery(error, { outboxed, pushedCount });
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-    if (isTaskCancelledError(error)) {
-      await discardUndeliveredPushes({
-        db: ctx.db,
-        userId: task.user_id,
-        pushes: finalized,
-        sentIds
-      });
-    }
     await notifyAfterSend(ctx, { ...afterSendBase, sentCount, pushedCount, outboxed, error });
     throw error;
   }
@@ -4863,13 +5432,17 @@ var RAW_CLOUD_ADAPTER = /* @__PURE__ */ Symbol("cloud-data-adapter");
 function guardError(code, message) {
   return Object.assign(new Error(message), { code, status: 409 });
 }
+var MAX_OWNER_LABEL_CHARS = 300;
 function validOwner(owner) {
-  return owner && typeof owner.type === "string" && owner.type.trim().length > 0 && owner.type.length <= 100 && typeof owner.id === "string" && owner.id.trim().length > 0 && owner.id.length <= 300;
+  return owner && typeof owner.type === "string" && owner.type.trim().length > 0 && owner.type.length <= 100 && typeof owner.id === "string" && owner.id.trim().length > 0 && owner.id.length <= 300 && (owner.label == null || typeof owner.label === "string" && owner.label.length <= MAX_OWNER_LABEL_CHARS);
+}
+function validOwnerGeneration(generation) {
+  return Number.isSafeInteger(generation) && generation >= 0;
 }
 function validateGuard(guard) {
   if (!validOwner(guard?.owner))
     throw guardError("INVALID_CLOUD_OWNER", "Cloud owner is invalid");
-  if (!Number.isSafeInteger(guard.generation) || guard.generation < 0) {
+  if (!validOwnerGeneration(guard.generation)) {
     throw guardError(
       "INVALID_CLOUD_OWNER_GENERATION",
       "Cloud owner generation must be a non-negative integer"
@@ -4920,6 +5493,15 @@ async function captureCloudTaskGuard(db, userId, payload, resolveOwner, task) {
   await assertCloudGuard(db, userId, guard);
   return guard;
 }
+async function readPreviousMetadata(stored, userKey) {
+  try {
+    return JSON.parse(await decryptFromStorage(stored, userKey));
+  } catch (error) {
+    if (!isStoredDataUndecryptableError(error)) throw error;
+    console.warn("[amsg-server] \u65E7\u5F52\u5C5E\u8BB0\u5F55\u89E3\u4E0D\u5F00\uFF08\u4E3B\u5BC6\u94A5\u6362\u8FC7\uFF1F\uFF09\uFF0C\u6309\u6CA1\u6709\u65E7\u8BB0\u5F55\u8986\u76D6\u5199\u5165");
+    return null;
+  }
+}
 function createCloudGuardedAdapter(db, {
   masterKey,
   resolveOwner,
@@ -4941,8 +5523,8 @@ function createCloudGuardedAdapter(db, {
       );
       expectedCloudMetadata = stored;
       if (stored) {
-        const previous = JSON.parse(await decryptFromStorage(stored, userKey));
-        if (previous.owner) {
+        const previous = await readPreviousMetadata(stored, userKey);
+        if (previous?.owner) {
           if (resolved.owner && (previous.owner.type !== resolved.owner.type || previous.owner.id !== resolved.owner.id)) {
             throw guardError(
               "CLOUD_OWNER_IMMUTABLE",
@@ -4999,6 +5581,16 @@ function createCloudGuardedAdapter(db, {
   const wrap = (name, fn) => {
     if (typeof db[name] === "function") methods.set(name, fn);
   };
+  const withSidecarRetry = async (attempt) => {
+    for (let tries = 0; ; tries++) {
+      try {
+        return await attempt();
+      } catch (error) {
+        if (error?.code !== "CLOUD_RESOURCE_CHANGED") throw error;
+        if (tries >= 2) throw Object.assign(error, { status: error.status ?? 409 });
+      }
+    }
+  };
   for (const method of ["createTask", "createTaskSuperseding"]) {
     wrap(method, async (params, supersedesUuid) => {
       const key = await keyFor(params.user_id);
@@ -5023,7 +5615,7 @@ function createCloudGuardedAdapter(db, {
   }
   wrap(
     "upsertClientState",
-    async (userId, entries, cleanups = [], now = Date.now()) => {
+    (userId, entries, cleanups = [], now = Date.now()) => withSidecarRetry(async () => {
       const key = await keyFor(userId);
       const roots = /* @__PURE__ */ new Map();
       const rows = [];
@@ -5081,9 +5673,9 @@ function createCloudGuardedAdapter(db, {
         now,
         inheritedGuard
       );
-    }
+    })
   );
-  wrap("upsertLlmCredentials", async (userId, entries) => {
+  wrap("upsertLlmCredentials", (userId, entries) => withSidecarRetry(async () => {
     const key = await keyFor(userId);
     const rows = [];
     for (const entry of entries) {
@@ -5099,7 +5691,7 @@ function createCloudGuardedAdapter(db, {
       rows.push({ ...entry, ...metadata });
     }
     return db.upsertLlmCredentials(userId, rows, inheritedGuard);
-  });
+  }));
   wrap("appendOutboxMessages", async (userId, entries) => {
     const key = await keyFor(userId);
     const rows = [];
@@ -5303,9 +5895,7 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
   if (pending.length === 0) {
     return { success: true, messagesSent, redelivered: true, pushedCount: 0 };
   }
-  if (!ctx.vapid || !ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-    throw new Error("VAPID configuration missing - push notifications cannot be sent");
-  }
+  assertVapidConfigured(ctx.vapid);
   const pushSubscription = await resolvePushSubscription({
     db: ctx.db,
     userId: task.user_id,
@@ -5313,21 +5903,14 @@ async function redeliverCommittedBatch(task, ctx, userKey, decryptedPayload, bat
     legacyFallback: decryptedPayload.pushSubscription ?? null
   });
   const sentIds = [];
-  let cancelled = false;
   try {
     for (let i = 0; i < pending.length; i++) {
       await sendTaggedPush(ctx.webpush, pushSubscription, JSON.stringify(pending[i]));
       sentIds.push(pending[i].messageId);
       if (i < pending.length - 1) await sleepFor(ctx, SLEEP_BETWEEN_MESSAGES_MS2);
     }
-  } catch (error) {
-    cancelled = isTaskCancelledError(error);
-    throw error;
   } finally {
     await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-    if (cancelled) {
-      await discardUndeliveredPushes({ db: ctx.db, userId: task.user_id, pushes: pending, sentIds });
-    }
   }
   return { success: true, messagesSent, redelivered: true, pushedCount: sentIds.length };
 }
@@ -5335,11 +5918,13 @@ async function processSingleMessage(task, ctx, providedMasterKey, predecrypted =
   const deliveryState = {
     outboxed: false,
     deliveryLimit: resolveMaxDeliveryRetries(ctx),
+    // 按任务定的 generation 上限要等 payload 解出来才算得出；解密、云守卫这些更早
+    // 的失败也得有个上限可查，先按投递上限兜着。
     generationLimit: resolveMaxDeliveryRetries(ctx),
     retryCount: task.retry_count ?? 0,
     isCancelled: ctx.isTaskCancelled
   };
-  ctx = { ...ctx, _deliveryState: deliveryState };
+  ctx = { ...ctx, _deliveryState: deliveryState, webpush: withPushSignal(ctx.webpush, ctx.signal) };
   try {
     const masterKey = providedMasterKey || ctx.masterKey;
     if (!masterKey) {
@@ -5352,13 +5937,20 @@ async function processSingleMessage(task, ctx, providedMasterKey, predecrypted =
       await assertCloudGuard(ctx.db, task.user_id, cloudGuard);
       const originalWebpush = ctx.webpush;
       const guardedDb = createCloudGuardedAdapter(ctx.db, { masterKey, resolveOwner: ctx.cloudData?.resolveOwner, guard: cloudGuard, userId: task.user_id });
-      ctx = { ...ctx, db: guardedDb, webpush: originalWebpush && {
-        ...originalWebpush,
-        async sendNotification(...args) {
-          await assertCloudGuard(guardedDb, task.user_id, cloudGuard);
-          return originalWebpush.sendNotification(...args);
-        }
-      } };
+      let guardedWebpush = originalWebpush;
+      if (originalWebpush) {
+        guardedWebpush = Object.create(originalWebpush);
+        Object.defineProperty(guardedWebpush, "sendNotification", {
+          value: async (...args) => {
+            await assertCloudGuard(guardedDb, task.user_id, cloudGuard);
+            return originalWebpush.sendNotification(...args);
+          },
+          writable: true,
+          enumerable: true,
+          configurable: true
+        });
+      }
+      ctx = { ...ctx, db: guardedDb, webpush: guardedWebpush };
     }
     const committed = await findCommittedBatch({
       db: ctx.db,
@@ -5453,9 +6045,7 @@ async function processSingleMessage(task, ctx, providedMasterKey, predecrypted =
     const pushesToSend = reasoningPush ? [reasoningPush, ...contentPushes] : contentPushes;
     const outboxed = await appendPushesToOutbox({ db: ctx.db, userId: task.user_id, userKey, pushes: pushesToSend });
     deliveryState.outboxed = outboxed;
-    if (!ctx.vapid.email || !ctx.vapid.publicKey || !ctx.vapid.privateKey) {
-      throw new Error("VAPID configuration missing - push notifications cannot be sent");
-    }
+    assertVapidConfigured(ctx.vapid);
     const pushSubscription = await resolvePushSubscription({
       db: ctx.db,
       userId: task.user_id,
@@ -5465,7 +6055,6 @@ async function processSingleMessage(task, ctx, providedMasterKey, predecrypted =
     const pushGate = { outboxed };
     const contentToPush = contentPushes.filter((push) => shouldSendPush(push, pushGate));
     const sentIds = [];
-    let cancelledMidBurst = false;
     let reasoningError;
     try {
       if (reasoningPush && shouldSendPush(reasoningPush, pushGate)) {
@@ -5485,18 +6074,9 @@ async function processSingleMessage(task, ctx, providedMasterKey, predecrypted =
         }
       }
     } catch (error) {
-      cancelledMidBurst = isTaskCancelledError(error);
       throw markUnrecoverablePartialDelivery(error, { outboxed, pushedCount: sentIds.length });
     } finally {
       await markPushesDelivered({ db: ctx.db, userId: task.user_id, messageIds: sentIds });
-      if (cancelledMidBurst) {
-        await discardUndeliveredPushes({
-          db: ctx.db,
-          userId: task.user_id,
-          pushes: pushesToSend,
-          sentIds
-        });
-      }
     }
     return {
       success: true,
@@ -5948,9 +6528,19 @@ async function deriveSerializeGroup(userKey, rawKey) {
   return bytesToBase64Url(await hmacSha256(utf8(userKey), utf8(rawKey)));
 }
 async function runScheduledTick(ctx) {
-  const tasks = await ctx.db.getPendingTasks(50);
-  const summary = await deliverTasks(ctx, tasks);
-  await ctx.db.cleanupOldTasks(7);
+  try {
+    const tasks = await ctx.db.getPendingTasks(50);
+    return await deliverTasks(ctx, tasks);
+  } finally {
+    await runTickCleanup(ctx);
+  }
+}
+async function runTickCleanup(ctx) {
+  try {
+    await ctx.db.cleanupOldTasks(7);
+  } catch (error) {
+    console.warn("[amsg-server] cleanupOldTasks \u5931\u8D25\uFF08\u5DF2\u5FFD\u7565\uFF09:", error && error.message);
+  }
   if (typeof ctx.db.cleanupOutbox === "function") {
     try {
       await ctx.db.cleanupOutbox({
@@ -5962,7 +6552,6 @@ async function runScheduledTick(ctx) {
     }
   }
   await cleanupExpiredClientState(ctx);
-  return summary;
 }
 async function cleanupExpiredClientState(ctx) {
   if (typeof ctx.db.cleanupClientState !== "function") return;
@@ -6008,7 +6597,7 @@ async function deliverTasks(ctx, tasks) {
   const serializeBy = typeof ctx.serializeBy === "function" ? ctx.serializeBy : null;
   const heartbeatMs = ctx.leaseHeartbeatMs === 0 ? 0 : positiveNumber(ctx.leaseHeartbeatMs) || DEFAULT_LEASE_HEARTBEAT_MS;
   const heartbeatEnabled = heartbeatMs > 0 && typeof db.claimTask === "function" && typeof db.renewTaskLease === "function";
-  const heartbeatLeaseTtlMs = Math.max(DEFAULT_HEARTBEAT_LEASE_TTL_MS, heartbeatMs * 2);
+  const heartbeatLeaseTtlMs = Math.max(DEFAULT_HEARTBEAT_LEASE_TTL_MS, heartbeatMs * 3);
   const startTime = Date.now();
   const MAX_CONCURRENT = 8;
   const results = {
@@ -6022,28 +6611,42 @@ async function deliverTasks(ctx, tasks) {
     staleTasks: [],
     deferredTasks: [],
     cancelledTasks: [],
+    leaseLostTasks: [],
     reasoningSkippedTasks: [],
     redeliveredTasks: [],
     failedTasks: []
   };
   const groupsTakenThisTick = /* @__PURE__ */ new Set();
   const taskCloudGuards = /* @__PURE__ */ new Map();
+  const leaseOptions = (taskId) => {
+    const token = activeLeases.get(taskId)?.token;
+    return token ? { leaseToken: token } : null;
+  };
   const updateLifecycleTask = (taskId, fields) => {
-    const guard = taskCloudGuards.get(taskId);
-    return guard ? db.updateTaskById(taskId, fields, guard) : db.updateTaskById(taskId, fields);
+    const guard = taskCloudGuards.get(taskId) ?? null;
+    const options = leaseOptions(taskId);
+    if (!guard && !options) return db.updateTaskById(taskId, fields);
+    return db.updateTaskById(taskId, fields, guard, options ?? {});
   };
   const supportsClaim = typeof db.claimTask === "function";
-  async function claimForThisTick(task, serializeGroup) {
+  async function claimForThisTick(task, serializeGroup, leaseToken) {
     if (!supportsClaim) return true;
     const leaseUntil = new Date(
       Date.now() + (heartbeatEnabled ? heartbeatLeaseTtlMs : claimLeaseMs)
     ).toISOString();
-    const guard = taskCloudGuards.get(task.id);
-    return !!(guard ? await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup, guard) : await db.claimTask(task.id, task.next_send_at, leaseUntil, serializeGroup));
+    const guard = taskCloudGuards.get(task.id) ?? null;
+    return !!await db.claimTask(
+      task.id,
+      task.next_send_at,
+      leaseUntil,
+      serializeGroup,
+      guard,
+      { leaseToken, userId: task.user_id }
+    );
   }
-  function startLeaseHeartbeat(task) {
+  function startLeaseHeartbeat(task, leaseToken) {
     const controller = new AbortController();
-    const lease = { lost: false, released: false, signal: controller.signal, stop: () => {
+    const lease = { lost: false, released: false, token: leaseToken, signal: controller.signal, stop: () => {
     } };
     if (!heartbeatEnabled) return lease;
     let stopped = false;
@@ -6052,12 +6655,16 @@ async function deliverTasks(ctx, tasks) {
       if (stopped) return;
       let renewed;
       try {
-        const guard = taskCloudGuards.get(task.id);
+        const guard = taskCloudGuards.get(task.id) ?? null;
         const until = new Date(Date.now() + heartbeatLeaseTtlMs).toISOString();
-        renewed = guard ? await db.renewTaskLease(task.id, until, guard) : await db.renewTaskLease(task.id, until);
+        renewed = await db.renewTaskLease(task.id, until, guard, { leaseToken, userId: task.user_id });
       } catch (error) {
-        if (error?.code === "CLOUD_OWNER_RETIRED") renewed = false;
-        else console.warn("[amsg-server] \u79DF\u7EA6\u7EED\u79DF\u5931\u8D25\uFF08\u4E0B\u4E2A\u5FC3\u8DF3\u518D\u8BD5\uFF09:", error && error.message);
+        if (error?.code === "CLOUD_OWNER_RETIRED") {
+          lease.ownerRetired = true;
+          renewed = false;
+        } else {
+          console.warn("[amsg-server] \u79DF\u7EA6\u7EED\u79DF\u5931\u8D25\uFF08\u4E0B\u4E2A\u5FC3\u8DF3\u518D\u8BD5\uFF09:", error && error.message);
+        }
       }
       if (renewed === false) {
         if (stopped || lease.released) return;
@@ -6065,7 +6672,7 @@ async function deliverTasks(ctx, tasks) {
         const error = new Error("Task was cancelled or superseded");
         error.code = TASK_CANCELLED_CODE;
         controller.abort(error);
-        console.warn(`[amsg-server] \u4EFB\u52A1 ${task.id} \u7684\u79DF\u7EA6\u5DF2\u5931\u6548\uFF08\u884C\u88AB\u53D6\u6D88\u6216\u9876\u66FF\uFF09\uFF0C\u5269\u4F59\u63A8\u9001\u5C06\u4E2D\u6B62`);
+        console.warn(`[amsg-server] \u4EFB\u52A1 ${task.id} \u7684\u79DF\u7EA6\u5DF2\u5931\u6548\uFF08\u884C\u88AB\u53D6\u6D88\u3001\u9876\u66FF\uFF0C\u6216\u79DF\u7EA6\u8FC7\u671F\u540E\u88AB\u522B\u7684 tick \u63A5\u624B\uFF09\uFF0C\u5269\u4F59\u63A8\u9001\u5C06\u4E2D\u6B62`);
         return;
       }
       if (!stopped) schedule();
@@ -6151,6 +6758,10 @@ async function deliverTasks(ctx, tasks) {
     groupsTakenThisTick.add(scopedKey);
     return { taken: false, rawKey };
   }
+  function anchorMsOf(decryptedPayload) {
+    const ms = decryptedPayload && decryptedPayload.firstSendTime ? Date.parse(decryptedPayload.firstSendTime) : NaN;
+    return Number.isNaN(ms) ? void 0 : ms;
+  }
   async function recordCancelled(task, status) {
     results.cancelledTasks.push({
       taskId: task.id,
@@ -6159,6 +6770,26 @@ async function deliverTasks(ctx, tasks) {
     });
     console.warn(`[amsg-server] \u4EFB\u52A1 ${task.id} \u5728\u6295\u9012\u671F\u95F4\u88AB\u53D6\u6D88\u6216\u9876\u66FF\uFF08${status}\uFF09`);
     await discardUndeliveredPushesForTask({ db, userId: task.user_id, taskUuid: task.uuid });
+  }
+  async function recordLostLease(task, status) {
+    if (activeLeases.get(task.id)?.ownerRetired) {
+      await recordCancelled(task, "owner_retired");
+      return;
+    }
+    let rowGone = !task.uuid;
+    if (task.uuid) {
+      try {
+        rowGone = await db.getTaskStatus(task.uuid, task.user_id) === null;
+      } catch (_readError) {
+        rowGone = false;
+      }
+    }
+    if (rowGone) {
+      await recordCancelled(task, status);
+      return;
+    }
+    results.leaseLostTasks.push({ taskId: task.id, status });
+    console.warn(`[amsg-server] \u4EFB\u52A1 ${task.id} \u7684\u79DF\u7EA6\u5DF2\u88AB\u522B\u7684 tick \u63A5\u624B\uFF08${status}\uFF09\uFF0C\u672C\u8DF3\u4E0D\u518D\u5199\u8FD9\u6761\u4EFB\u52A1`);
   }
   async function payloadStillFresh(task) {
     if (typeof db.getTaskByUuid !== "function" || !task.uuid) return true;
@@ -6211,56 +6842,68 @@ async function deliverTasks(ctx, tasks) {
     const tzId = decryptedPayload ? decryptedPayload.tzId ?? null : null;
     const permanent = isPermanentDeliveryFailure({ permanent: failure.permanent, errorCode, pushStatus });
     const errorExtra = buildErrorExtra(errorCode, pushStatus);
+    const landed = async (write) => {
+      if (!rowVanished(await write)) return true;
+      results.failedCount--;
+      await recordLostLease(task, "cancelled_mid_delivery");
+      return false;
+    };
     try {
       if (permanent || failure.willRetry === false || task.retry_count >= (failure.retryLimit ?? maxDeliveryRetries)) {
         const encrypted = await encryptPayloadWithLastError(task, decryptedPayload, userKey, reason, errorExtra);
         if (isRecurringType(recurrenceType)) {
-          const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
-          await updateAndRelease(task.id, {
+          const nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload));
+          if (!await landed(updateAndRelease(task.id, {
             next_send_at: nextSendAt,
             retry_count: 0,
             ...encrypted ? { encrypted_payload: encrypted } : {},
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: "occurrence_skipped", nextSendAt, ...permanent ? { permanent: true } : {} });
         } else {
-          await updateAndRelease(task.id, {
+          if (!await landed(updateAndRelease(task.id, {
             status: "failed",
             ...encrypted ? { encrypted_payload: encrypted } : {},
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
           results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count, status: "permanently_failed", ...permanent ? { permanent: true } : {} });
         }
       } else {
         const nextRetryTime = new Date(Date.now() + (task.retry_count + 1) * 2 * 60 * 1e3);
         if (supportsClaim) {
-          await updateTaskWithLastError(task.id, {
+          if (!await landed(updateTaskWithLastError(task.id, {
             retry_after: nextRetryTime.toISOString(),
             lease_until: null,
             retry_count: task.retry_count + 1,
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
         } else {
-          await updateTaskWithLastError(task.id, {
+          if (!await landed(updateTaskWithLastError(task.id, {
             next_send_at: nextRetryTime.toISOString(),
             retry_count: task.retry_count + 1,
             last_error: lastErrorJson(task, reason, errorExtra)
-          });
+          }))) return;
         }
         results.failedTasks.push({ taskId: task.id, reason, retryCount: task.retry_count + 1, nextRetryAt: nextRetryTime.toISOString() });
       }
     } catch (updateError) {
-      results.failedTasks.push({ taskId: task.id, reason, status: "retry_update_failed", updateError: updateError.message });
+      results.failedTasks.push({ taskId: task.id, reason, status: "retry_update_failed", updateError: updateError?.message ?? String(updateError) });
     }
   }
-  async function handlePostSendPersistenceFailure(task, reason, recurrenceType, tzId) {
+  async function handlePostSendPersistenceFailure(task, reason, recurrenceType, tzId, anchorMs) {
     results.failedCount++;
+    const vanished = async (write) => {
+      if (!rowVanished(await write)) return false;
+      results.failedCount--;
+      await recordLostLease(task, "cancelled_after_delivery");
+      return true;
+    };
     if (isRecurringType(recurrenceType)) {
       let advanced = false;
       let nextSendAt = null;
       try {
-        nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId);
-        await updateAndRelease(task.id, { next_send_at: nextSendAt, retry_count: 0 });
+        nextSendAt = nextFutureOccurrence(Date.parse(task.next_send_at), recurrenceType, Date.now(), tzId, anchorMs);
+        if (await vanished(updateAndRelease(task.id, { next_send_at: nextSendAt, retry_count: 0 }))) return;
         advanced = true;
       } catch (_advanceError) {
         advanced = false;
@@ -6275,7 +6918,7 @@ async function deliverTasks(ctx, tasks) {
     }
     let markedSent = false;
     try {
-      await updateAndRelease(task.id, { status: "sent", retry_count: 0 });
+      if (await vanished(updateAndRelease(task.id, { status: "sent", retry_count: 0 }))) return;
       markedSent = true;
     } catch (_markSentError) {
       markedSent = false;
@@ -6291,27 +6934,28 @@ async function deliverTasks(ctx, tasks) {
     const decryptedPayload = decrypted.ok ? decrypted.payload : null;
     const userKey = decrypted.ok ? decrypted.userKey : null;
     const serializeGroup = serializeKey ? await deriveSerializeGroup(userKey, serializeKey) : null;
+    const leaseToken = supportsClaim ? globalThis.crypto.randomUUID() : null;
     let claimed;
     try {
       if (decrypted.ok) {
         const guard = await captureCloudTaskGuard(db, task.user_id, decryptedPayload, ctx.cloudData?.resolveOwner, task);
         if (guard) taskCloudGuards.set(task.id, guard);
       }
-      claimed = await claimForThisTick(task, serializeGroup);
+      claimed = await claimForThisTick(task, serializeGroup, leaseToken);
     } catch (error) {
       if (error?.code === "CLOUD_OWNER_RETIRED") {
         await recordCancelled(task, "owner_retired");
         return;
       }
       results.failedCount++;
-      results.failedTasks.push({ taskId: task.id, reason: error.message || "\u4EFB\u52A1\u5360\u4F4D\u5931\u8D25", status: "claim_failed" });
+      results.failedTasks.push({ taskId: task.id, reason: error?.message || "\u4EFB\u52A1\u5360\u4F4D\u5931\u8D25", status: "claim_failed" });
       return;
     }
     if (!claimed) {
       results.claimSkippedTasks++;
       return;
     }
-    const lease = startLeaseHeartbeat(task);
+    const lease = startLeaseHeartbeat(task, leaseToken);
     activeLeases.set(task.id, lease);
     try {
       await deliverClaimedTask(task, decrypted, lease);
@@ -6324,7 +6968,7 @@ async function deliverTasks(ctx, tasks) {
     const decryptedPayload = decrypted.ok ? decrypted.payload : null;
     const userKey = decrypted.ok ? decrypted.userKey : null;
     if (!decrypted.ok) {
-      await handleDeliveryFailure(task, decrypted.error && decrypted.error.message || "\u4EFB\u52A1\u8F7D\u8377\u89E3\u5BC6\u5931\u8D25", null, null, null);
+      await handleDeliveryFailure(task, decrypted.error && decrypted.error.message || "\u4EFB\u52A1\u8F7D\u8377\u89E3\u5BC6\u5931\u8D25", null, null, null, { errorCode: decrypted.error?.code });
       return;
     }
     const recurrenceType = decryptedPayload.recurrenceType;
@@ -6361,7 +7005,7 @@ async function deliverTasks(ctx, tasks) {
           isCancelled: () => lease.lost
         });
         const recurring = isRecurringType(recurrenceType);
-        const plan = recurring ? planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId) : null;
+        const plan = recurring ? planNextOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload)) : null;
         const nextSendAt = recurring ? new Date(plan.nextMs).toISOString() : null;
         const action = recurring ? "fast_forwarded" : "expired";
         const skippedCount = recurring ? plan.skippedCount : 1;
@@ -6372,11 +7016,16 @@ async function deliverTasks(ctx, tasks) {
           "stale",
           recurring ? { skippedCount, nextSendAt } : void 0
         );
-        await updateAndRelease(task.id, {
+        const settled = await updateAndRelease(task.id, {
           ...recurring ? { next_send_at: nextSendAt, retry_count: 0 } : { status: "failed" },
           ...encrypted ? { encrypted_payload: encrypted } : {},
           last_error: lastErrorJson(task, "stale", recurring ? { skippedCount, nextSendAt } : void 0)
         });
+        if (rowVanished(settled)) {
+          await recordLostLease(task, "cancelled_before_delivery");
+          return;
+        }
+        await discardUndeliveredPushesForTask({ db, userId: task.user_id, taskUuid: task.uuid });
         results.staleTasks.push({
           taskId: task.id,
           reason: "stale",
@@ -6399,7 +7048,7 @@ async function deliverTasks(ctx, tasks) {
         });
       } catch (error) {
         results.failedCount++;
-        results.failedTasks.push({ taskId: task.id, reason: error.message || "\u8FC7\u671F\u4EFB\u52A1\u5904\u7406\u5931\u8D25", status: "stale_update_failed" });
+        results.failedTasks.push({ taskId: task.id, reason: error?.message || "\u8FC7\u671F\u4EFB\u52A1\u5904\u7406\u5931\u8D25", status: "stale_update_failed" });
       }
     };
     if (Number.isFinite(occurrenceMs) && Date.now() - occurrenceMs > staleAfterMs && notOnFreshRetryChain) {
@@ -6418,13 +7067,13 @@ async function deliverTasks(ctx, tasks) {
           lease_until: null
         });
         if (rowVanished(updated)) {
-          await recordCancelled(task, "cancelled_mid_delivery");
+          await recordLostLease(task, "cancelled_mid_delivery");
           return;
         }
         results.deferredTasks.push({ taskId: task.id, retryAfter: retryAfter2 });
       } catch (error) {
         results.failedCount++;
-        results.failedTasks.push({ taskId: task.id, reason: error.message || "\u63A8\u8FDF\u5199\u5E93\u5931\u8D25", status: "defer_update_failed" });
+        results.failedTasks.push({ taskId: task.id, reason: error?.message || "\u63A8\u8FDF\u5199\u5E93\u5931\u8D25", status: "defer_update_failed" });
       }
     };
     let sendResult;
@@ -6448,12 +7097,12 @@ async function deliverTasks(ctx, tasks) {
       );
     } catch (error) {
       if (lease.lost) {
-        await recordCancelled(task, "cancelled_mid_delivery");
+        await recordLostLease(task, "cancelled_mid_delivery");
         return;
       }
       await handleDeliveryFailure(
         task,
-        error.message || "\u6D88\u606F\u53D1\u9001\u5931\u8D25",
+        error?.message || "\u6D88\u606F\u53D1\u9001\u5931\u8D25",
         recurrenceType,
         decryptedPayload,
         userKey,
@@ -6463,7 +7112,7 @@ async function deliverTasks(ctx, tasks) {
     }
     if (sendResult.deferred) {
       if (lease.lost) {
-        await recordCancelled(task, "cancelled_mid_delivery");
+        await recordLostLease(task, "cancelled_mid_delivery");
         return;
       }
       await handleDeferred(sendResult.retryAfter);
@@ -6475,7 +7124,7 @@ async function deliverTasks(ctx, tasks) {
         return;
       }
       if (lease.lost) {
-        await recordCancelled(task, "cancelled_mid_delivery");
+        await recordLostLease(task, "cancelled_mid_delivery");
         return;
       }
       await handleDeliveryFailure(
@@ -6500,13 +7149,14 @@ async function deliverTasks(ctx, tasks) {
     try {
       if (recurrenceType === "none") {
         markLeaseReleased(task.id);
-        if (rowVanished(await db.deleteTaskById(task.id))) {
-          await recordCancelled(task, "cancelled_after_delivery");
+        const deleteOptions = leaseOptions(task.id);
+        if (rowVanished(deleteOptions ? await db.deleteTaskById(task.id, deleteOptions) : await db.deleteTaskById(task.id))) {
+          await recordLostLease(task, "cancelled_after_delivery");
           return;
         }
         results.deletedOnceOffTasks++;
       } else {
-        const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId);
+        const nextSendAt = nextFutureOccurrence(occurrenceMs, recurrenceType, Date.now(), tzId, anchorMsOf(decryptedPayload));
         const clearedPayload = decryptedPayload && decryptedPayload.lastError ? await encryptPayloadWithoutLastError(task, decryptedPayload, userKey) : null;
         const updated = await updateAndRelease(task.id, {
           next_send_at: nextSendAt,
@@ -6515,14 +7165,14 @@ async function deliverTasks(ctx, tasks) {
           ...clearedPayload ? { encrypted_payload: clearedPayload } : {}
         });
         if (rowVanished(updated)) {
-          await recordCancelled(task, "cancelled_after_delivery");
+          await recordLostLease(task, "cancelled_after_delivery");
           return;
         }
         results.updatedRecurringTasks++;
       }
       results.successCount++;
     } catch (error) {
-      await handlePostSendPersistenceFailure(task, error.message || "\u53D1\u9001\u540E\u72B6\u6001\u66F4\u65B0\u5931\u8D25", recurrenceType, tzId);
+      await handlePostSendPersistenceFailure(task, error?.message || "\u53D1\u9001\u540E\u72B6\u6001\u66F4\u65B0\u5931\u8D25", recurrenceType, tzId, anchorMsOf(decryptedPayload));
     }
   }
   const taskQueue = [];
@@ -6539,9 +7189,12 @@ async function deliverTasks(ctx, tasks) {
   while (taskQueue.length > 0 || processing.length > 0) {
     while (processing.length < MAX_CONCURRENT && taskQueue.length > 0) {
       const entry = taskQueue.shift();
-      const promise = processTask(entry);
+      const promise = processTask(entry).catch((error) => {
+        results.failedCount++;
+        results.failedTasks.push({ taskId: entry.task.id, reason: error?.message || "\u4EFB\u52A1\u5904\u7406\u5F02\u5E38", status: "unexpected_error" });
+      });
       processing.push(promise);
-      promise.finally(() => {
+      promise.then(() => {
         const index = processing.indexOf(promise);
         if (index > -1) processing.splice(index, 1);
       });
@@ -6570,8 +7223,12 @@ async function deliverTasks(ctx, tasks) {
       deferredTasks: results.deferredTasks,
       // 投递期间行被取消 / 顶替的任务。`cancelled_mid_delivery` = 推送在发出去
       // 之前被拦下；`cancelled_after_delivery` = 推送已经发完，收尾写库才发现
-      // 行没了。两种都不计入 successCount / failedCount。
+      // 行没了；`cancelled_before_delivery` = 过期收场写库时发现行没了。三种都
+      // 不计入 successCount / failedCount。
       cancelledTasks: results.cancelledTasks,
+      // 租约过期后被别的 tick 接手的任务（{ taskId, status }，status 与上面同一
+      // 套：说明是在哪一步发现的）。这边没再写过这条任务，也不计成功 / 失败。
+      leaseLostTasks: results.leaseLostTasks,
       // 正文送到了、只有思考过程没发出去的任务（{ taskId, reason }）。这些任务
       // 照常计入 successCount——列在这里只是让「这次没有思考过程」看得见。
       reasoningSkippedTasks: results.reasoningSkippedTasks,
@@ -6629,6 +7286,12 @@ function createUpdateMessageHandler(ctx) {
     }
     if (updates.nextSendAt && !isValidISO8601(updates.nextSendAt)) {
       return { status: 400, body: { success: false, error: { code: "INVALID_UPDATE_DATA", message: "\u66F4\u65B0\u6570\u636E\u683C\u5F0F\u9519\u8BEF", details: { invalidFields: ["nextSendAt"] } } } };
+    }
+    if (updates.nextSendAt && !isFutureTimestamp(updates.nextSendAt)) {
+      return { status: 400, body: { success: false, error: { code: "INVALID_UPDATE_DATA", message: "nextSendAt \u5FC5\u987B\u5728\u672A\u6765", details: { invalidFields: ["nextSendAt"] } } } };
+    }
+    if (updates.metadata != null && !isPlainObject(updates.metadata)) {
+      return { status: 400, body: { success: false, error: { code: "INVALID_UPDATE_DATA", message: "metadata \u5FC5\u987B\u662F\u666E\u901A\u5BF9\u8C61", details: { invalidFields: ["metadata"] } } } };
     }
     if (Object.prototype.hasOwnProperty.call(updates, "contactName") && (typeof updates.contactName !== "string" || !updates.contactName.trim())) {
       return { status: 400, body: { success: false, error: { code: "INVALID_UPDATE_DATA", message: "contactName \u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32", details: { invalidFields: ["contactName"] } } } };
@@ -6728,6 +7391,9 @@ function createUpdateMessageHandler(ctx) {
       ...promptUpdates,
       ...Object.prototype.hasOwnProperty.call(updates, "contactName") && { contactName: updates.contactName },
       ...updates.userMessage && { userMessage: updates.userMessage },
+      // 改排期时 payload 里的首发时刻跟着走（与 hook 的 renewTask 同口径）：循环
+      // 任务推进用它当锚点，不同步的话春令时顺延后回不到用户改过的钟点。
+      ...updates.nextSendAt && { firstSendTime: updates.nextSendAt },
       ...updates.recurrenceType && { recurrenceType: updates.recurrenceType },
       ...Object.prototype.hasOwnProperty.call(updates, "tzId") && { tzId: updates.tzId ?? null },
       // avatarUrl 走 truthy spread：显式传 null 只是「不改」，不是「清空」。
@@ -6833,6 +7499,7 @@ function createCancelMessageHandler(ctx) {
   }
   return { DELETE };
 }
+var TASK_STATUS_FILTERS = ["all", "pending", "sent", "failed"];
 function createMessagesHandler(ctx) {
   async function GET(url, headers) {
     const tenantResult = await ctx.tenantManager.resolveTenant(headers, { url });
@@ -6849,6 +7516,9 @@ function createMessagesHandler(ctx) {
     const status = u.searchParams.get("status") || "all";
     const limit = Math.min(parseInt(u.searchParams.get("limit") || "20", 10), 100);
     const offset = parseInt(u.searchParams.get("offset") || "0", 10);
+    if (!TASK_STATUS_FILTERS.includes(status)) {
+      return { status: 400, body: { success: false, error: { code: "INVALID_PARAMETERS", message: `status \u53C2\u6570\u65E0\u6548\uFF0C\u5FC5\u987B\u662F ${TASK_STATUS_FILTERS.join(" / ")} \u4E4B\u4E00` } } };
+    }
     if (isNaN(limit) || limit < 1) {
       return { status: 400, body: { success: false, error: { code: "INVALID_PARAMETERS", message: "limit \u53C2\u6570\u65E0\u6548\uFF0C\u5FC5\u987B\u4E3A\u6B63\u6574\u6570" } } };
     }
@@ -6857,10 +7527,7 @@ function createMessagesHandler(ctx) {
     }
     const { tasks, total } = await db.listTasks(userId, { status, limit, offset });
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
-    const decryptedTasks = await Promise.all(tasks.map(async (task) => {
-      const decrypted = JSON.parse(await decryptFromStorage(task.encrypted_payload, userKey));
-      return projectTask(task, decrypted);
-    }));
+    const decryptedTasks = await Promise.all(tasks.map((task) => projectStoredTask(task, userKey)));
     const responsePayload = {
       tasks: decryptedTasks,
       pagination: { total, limit, offset, hasMore: offset + limit < total }
@@ -7208,6 +7875,7 @@ var SQLITE_TABLE_SQL = `
     message_type TEXT NOT NULL CHECK (message_type IN ('fixed', 'prompted', 'auto', 'instant')),
     next_send_at TEXT NOT NULL,
     lease_until TEXT,
+    lease_token TEXT,
     retry_after TEXT,
     serialize_group TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
@@ -7240,6 +7908,11 @@ var SQLITE_MIGRATIONS = [
     // 解密失败时也写得进去，GET /message 对已失败的行也读得出来。
     sql: "ALTER TABLE scheduled_messages ADD COLUMN last_error TEXT",
     description: "Sanitized last delivery-failure summary (2.6.0)"
+  },
+  {
+    name: "add_lease_token",
+    sql: "ALTER TABLE scheduled_messages ADD COLUMN lease_token TEXT",
+    description: "Lease ownership token (claimTask / renewTaskLease)"
   }
 ];
 var SQLITE_INDEXES = [
@@ -7674,11 +8347,12 @@ var D1Adapter = class {
       return indexes.map((index) => results[index]);
     } catch (error) {
       if (/cloud_metadata_guard/.test(error.message || "")) {
-        throw Object.assign(new Error("Cloud resource ownership changed"), { code: "CLOUD_RESOURCE_CHANGED" });
+        throw Object.assign(new Error("Cloud resource ownership changed"), { code: "CLOUD_RESOURCE_CHANGED", status: 409 });
       }
       if (/cloud_owner_guard/.test(error.message || "")) {
         const denied = new Error("Cloud owner is retired or generation changed");
         denied.code = "CLOUD_OWNER_RETIRED";
+        denied.status = 409;
         throw denied;
       }
       throw error;
@@ -8122,7 +8796,7 @@ var D1Adapter = class {
       );
     }
     return {
-      columnsCreated: 13,
+      columnsCreated: SQLITE_REQUIRED_SCHEMA.tables.scheduled_messages.length,
       indexesCreated: indexResults.filter((r) => r.status === "success").length,
       indexesFailed: indexResults.filter((r) => r.status === "failed").length,
       columns: [],
@@ -8247,7 +8921,9 @@ var D1Adapter = class {
     ).bind(uuid).first();
     return row ? { status: row.status } : null;
   }
-  async updateTaskById(taskId, updates, cloudGuard = null) {
+  // options.leaseToken 见 interface.js：带上时只改仍持有这份租约的行，改不到
+  // 回 null（行没了，或租约已经是别人的）。
+  async updateTaskById(taskId, updates, cloudGuard = null, options = {}) {
     const sets = [];
     const values = [];
     for (const [key, value] of Object.entries(updates)) {
@@ -8262,12 +8938,18 @@ var D1Adapter = class {
       values.push(this._now());
     }
     values.push(taskId);
+    let tokenGate = "";
+    if (options?.leaseToken) {
+      tokenGate = " AND lease_token = ?";
+      values.push(options.leaseToken);
+    }
     const statement = this._db.prepare(
-      `UPDATE scheduled_messages SET ${sets.join(", ")} WHERE id = ?`
+      `UPDATE scheduled_messages SET ${sets.join(", ")} WHERE id = ?${tokenGate}`
     ).bind(...values);
     const ownerUser = cloudGuard ? await this._db.prepare("SELECT user_id FROM scheduled_messages WHERE id=?").bind(taskId).first() : null;
     if (cloudGuard && !ownerUser) return null;
-    await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    if (tokenGate && !(res.meta.changes > 0)) return null;
     return this._db.prepare("SELECT * FROM scheduled_messages WHERE id = ?").bind(taskId).first();
   }
   /**
@@ -8306,8 +8988,14 @@ var D1Adapter = class {
     if (!res.meta.changes) return null;
     return { uuid, updated_at: now };
   }
-  async deleteTaskById(taskId) {
-    const res = await this._db.prepare("DELETE FROM scheduled_messages WHERE id = ?").bind(taskId).run();
+  async deleteTaskById(taskId, options = {}) {
+    const values = [taskId];
+    let tokenGate = "";
+    if (options?.leaseToken) {
+      tokenGate = " AND lease_token = ?";
+      values.push(options.leaseToken);
+    }
+    const res = await this._db.prepare(`DELETE FROM scheduled_messages WHERE id = ?${tokenGate}`).bind(...values).run();
     return res.meta.changes > 0;
   }
   async deleteTaskByUuid(uuid, userId) {
@@ -8360,10 +9048,14 @@ var D1Adapter = class {
    * @param {string} expectedNextSendAt - 读这行时拿到的 next_send_at 原值
    * @param {string|Date} leaseUntil - 租期末尾
    * @param {string|null} [serializeGroup] - 串行分组标识；空表示不参与分组串行
+   * @param {Object|null} [cloudGuard]
+   * @param {{ leaseToken?: string|null, userId?: string|null }} [options] -
+   *   `leaseToken` 随租约写进 lease_token，之后续租 / 收尾写库带同一个值比对；
+   *   `userId` 是这行的 user_id（调用方手里有就传，带 cloudGuard 时省掉一次查）
    * @returns {Promise<boolean>} true = 领到了；false = 别人正拿着租约、同分组
    *   有任务正在跑、排期被改过、或行已不是 pending
    */
-  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, cloudGuard = null) {
+  async claimTask(taskId, expectedNextSendAt, leaseUntil, serializeGroup = null, cloudGuard = null, options = {}) {
     const expected = typeof expectedNextSendAt === "string" ? expectedNextSendAt : this._iso(expectedNextSendAt);
     const grouped = typeof serializeGroup === "string" && serializeGroup.length > 0;
     const now = this._now();
@@ -8372,6 +9064,10 @@ var D1Adapter = class {
     if (grouped) {
       sets.push("serialize_group = ?");
       values.push(serializeGroup);
+    }
+    if (options?.leaseToken) {
+      sets.push("lease_token = ?");
+      values.push(options.leaseToken);
     }
     sets.push("updated_at = ?");
     values.push(now);
@@ -8390,28 +9086,50 @@ var D1Adapter = class {
     const statement = this._db.prepare(
       `UPDATE scheduled_messages SET ${sets.join(", ")} WHERE ${where}`
     ).bind(...values);
-    const ownerUser = cloudGuard ? await this._db.prepare("SELECT user_id FROM scheduled_messages WHERE id=?").bind(taskId).first() : null;
-    if (cloudGuard && !ownerUser) return false;
-    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+    const ownerUserId = await this._taskOwnerForGuard(taskId, cloudGuard, options?.userId);
+    if (cloudGuard && !ownerUserId) return false;
+    const [res] = await this._cloudBatch([statement], ownerUserId, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
+  }
+  /**
+   * 带 cloudGuard 的写要知道这行归哪个用户（守卫断言按 user_id 查）。调用方手里
+   * 有就直接用，没有才去查一次。没有守卫时不查。
+   *
+   * @private
+   * @returns {Promise<string|null|undefined>} 守卫要用的 user_id；带守卫但行不存在 → null
+   */
+  async _taskOwnerForGuard(taskId, cloudGuard, userId) {
+    if (!cloudGuard) return void 0;
+    if (userId) return userId;
+    const row = await this._db.prepare("SELECT user_id FROM scheduled_messages WHERE id=?").bind(taskId).first();
+    return row ? row.user_id : null;
   }
   /**
    * 投递期间的租约续期（run-tick 的心跳用）。只在行仍是 pending 且确实持有
    * 租约（lease_until 非空）时生效——收尾把租约放掉之后，迟到的心跳不会把
-   * 租约复活。
+   * 租约复活。带 leaseToken 时还要求租约仍是自己那份：租约过期后被别的 tick
+   * 接手，原执行者的心跳就续不上了，不会把接手者的租约当成自己的续下去。
    *
    * @param {number} taskId
    * @param {string|Date} leaseUntil - 新的租期末尾
+   * @param {Object|null} [cloudGuard]
+   * @param {{ leaseToken?: string|null, userId?: string|null }} [options] - 同 claimTask
    * @returns {Promise<boolean>} true = 续上了
    */
-  async renewTaskLease(taskId, leaseUntil, cloudGuard = null) {
+  async renewTaskLease(taskId, leaseUntil, cloudGuard = null, options = {}) {
+    const values = [this._iso(leaseUntil), taskId];
+    let tokenGate = "";
+    if (options?.leaseToken) {
+      tokenGate = " AND lease_token = ?";
+      values.push(options.leaseToken);
+    }
     const statement = this._db.prepare(
       `UPDATE scheduled_messages SET lease_until = ?
-       WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL`
-    ).bind(this._iso(leaseUntil), taskId);
-    const ownerUser = cloudGuard ? await this._db.prepare("SELECT user_id FROM scheduled_messages WHERE id=?").bind(taskId).first() : null;
-    if (cloudGuard && !ownerUser) return false;
-    const [res] = await this._cloudBatch([statement], ownerUser?.user_id, [cloudGuard]);
+       WHERE id = ? AND status = 'pending' AND lease_until IS NOT NULL${tokenGate}`
+    ).bind(...values);
+    const ownerUserId = await this._taskOwnerForGuard(taskId, cloudGuard, options?.userId);
+    if (cloudGuard && !ownerUserId) return false;
+    const [res] = await this._cloudBatch([statement], ownerUserId, [cloudGuard]);
     return (res.meta.changes || 0) > 0;
   }
   async listTasks(userId, opts = {}) {
@@ -8431,7 +9149,7 @@ var D1Adapter = class {
       `SELECT ${TASK_DETAIL_COLUMNS}
        FROM scheduled_messages
        WHERE ${where}
-       ORDER BY next_send_at ASC
+       ORDER BY next_send_at ASC, id ASC
        LIMIT ? OFFSET ?`
     ).bind(...params, limit, offset).all();
     return { tasks: res.results || [], total };
@@ -8442,7 +9160,7 @@ var D1Adapter = class {
     const res = await this._db.prepare(
       `DELETE FROM scheduled_messages
        WHERE rowid IN (SELECT rowid FROM scheduled_messages
-         WHERE status IN ('sent', 'failed') AND updated_at < ? LIMIT 100)`
+         WHERE status IN ('sent', 'failed') AND updated_at < ? LIMIT ${CLEANUP_BATCH_LIMIT})`
     ).bind(cutoff).run();
     return res.meta.changes || 0;
   }
@@ -9274,6 +9992,12 @@ function validateEntry(entry, index, maxValueBytes) {
   if (guard !== void 0 && (!Number.isInteger(guard) || guard <= 0)) {
     return rejectEntry(entry, index, "INVALID_STATE_VERSION", `entries[${index}].version / builtAt \u5FC5\u987B\u662F\u6B63\u6574\u6570\uFF08\u6BEB\u79D2\u65F6\u95F4\u6233\u6216\u5355\u8C03\u9012\u589E\u7248\u672C\u53F7\uFF09`);
   }
+  if (entry.owner !== void 0 && entry.owner !== null && !validOwner(entry.owner)) {
+    return rejectEntry(entry, index, "INVALID_CLOUD_OWNER", `entries[${index}].owner \u5FC5\u987B\u662F { type, id, label? }\uFF08type \u2264 100\u3001id \u2264 300\u3001label \u2264 300 \u5B57\u7B26\uFF09`);
+  }
+  if (entry.ownerGeneration != null && !validOwnerGeneration(entry.ownerGeneration)) {
+    return rejectEntry(entry, index, "INVALID_CLOUD_OWNER_GENERATION", `entries[${index}].ownerGeneration \u5FC5\u987B\u662F\u975E\u8D1F\u6574\u6570`);
+  }
   return null;
 }
 function createClientStateHandler(ctx) {
@@ -9356,12 +10080,18 @@ function createClientStateHandler(ctx) {
     }
     const userKey = await deriveUserEncryptionKey(userId, masterKey);
     const rows = await db.getClientState(userId, namespace, key === null ? void 0 : { key });
+    const undecryptable = [];
     const decrypted = await resolveClientStateEntries(
       key === null ? rows : rows.filter((row) => row.key === key),
       () => db.getClientState(userId, chunkNamespaceFor(namespace), key === null ? void 0 : { keyPrefix: chunkKeyPrefixFor(key) }),
-      (value) => decryptFromStorage(value, userKey)
+      (value) => decryptFromStorage(value, userKey),
+      (row) => undecryptable.push({ key: row.key, updatedAt: row.updated_at, code: STORED_DATA_UNDECRYPTABLE_CODE })
     );
-    const encryptedResponse = await encryptPayload({ namespace, entries: decrypted }, userKey);
+    const encryptedResponse = await encryptPayload({
+      namespace,
+      entries: decrypted,
+      ...undecryptable.length > 0 ? { undecryptable } : {}
+    }, userKey);
     return { status: 200, body: { success: true, encrypted: true, version: 1, data: encryptedResponse } };
   }
   async function DELETE(url, headers) {
@@ -9432,7 +10162,7 @@ function createClientStateNamespacesHandler(ctx) {
   }
   return { GET };
 }
-var SERVER_VERSION = true ? "3.1.0-next.1" : "0.0.0-dev";
+var SERVER_VERSION = true ? "3.2.0-next.2" : "0.0.0-dev";
 var SERVER_FEATURES = Object.freeze([
   "client-state",
   "client-state-chunking",
@@ -9952,9 +10682,6 @@ var CLOUD_RESOURCE_TYPES = [
 function cloudError(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status });
 }
-function validCloudOwner(owner) {
-  return owner && typeof owner.type === "string" && owner.type.length > 0 && owner.type.length <= 100 && typeof owner.id === "string" && owner.id.length > 0 && owner.id.length <= 300;
-}
 var ownerEquals = (a, b) => a && b && a.type === b.type && a.id === b.id;
 async function cloudInventory(ctx, db, userId, userKey) {
   return buildCloudDataInventory({
@@ -10010,9 +10737,9 @@ async function makeCleanupPlan(ctx, db, userId, key, input) {
   const { mode, owner, resourceIds, types } = input;
   if (!["purge", "retire-owner"].includes(mode))
     throw cloudError("INVALID_CLEANUP_MODE", "\u6E05\u7406\u6A21\u5F0F\u65E0\u6548");
-  if (owner !== void 0 && !validCloudOwner(owner))
+  if (owner !== void 0 && !validOwner(owner))
     throw cloudError("INVALID_CLOUD_OWNER", "\u5F52\u5C5E\u683C\u5F0F\u65E0\u6548");
-  if (mode === "retire-owner" && !validCloudOwner(owner))
+  if (mode === "retire-owner" && !validOwner(owner))
     throw cloudError("INVALID_CLOUD_OWNER", "\u5F7B\u5E95\u79FB\u9664\u9700\u8981\u660E\u786E\u5F52\u5C5E");
   if (resourceIds !== void 0 && (!Array.isArray(resourceIds) || !resourceIds.length || resourceIds.some((id) => typeof id !== "string")))
     throw cloudError("INVALID_CLEANUP_SELECTION", "\u8BF7\u9009\u62E9\u81F3\u5C11\u4E00\u9879\u8D44\u6E90");
@@ -10154,7 +10881,7 @@ function assertRetirementAcknowledged(operation) {
     );
   }
 }
-async function advanceCleanup(ctx, db, userId, key, operation) {
+async function advanceCleanup(ctx, db, userId, key, operation, { maxEntries = 25, deadline = Infinity } = {}) {
   if (operation.status === "completed" || operation.status === "failed" || operation.nextAttemptAt > Date.now())
     return operation;
   const leaseToken = crypto.randomUUID();
@@ -10182,6 +10909,7 @@ async function advanceCleanup(ctx, db, userId, key, operation) {
       );
     }
   };
+  let leaseLost = false;
   try {
     operation = await readCloudRecord(
       db,
@@ -10254,11 +10982,9 @@ async function advanceCleanup(ctx, db, userId, key, operation) {
     const currentById = new Map(
       beforeBatch.entries.map((entry) => [entry.resource.id, entry])
     );
-    const batch = operation.entries.slice(
-      operation.cursor,
-      operation.cursor + 25
-    );
-    for (const entry of batch) {
+    const end = Math.min(operation.entries.length, operation.cursor + maxEntries);
+    while (operation.cursor < end && Date.now() < deadline) {
+      const entry = operation.entries[operation.cursor];
       await renewLease();
       const currentEntry = currentById.get(entry.resource.id);
       if (currentEntry && currentEntry.version !== entry.version) {
@@ -10325,7 +11051,10 @@ async function advanceCleanup(ctx, db, userId, key, operation) {
     operation.errors = [];
     operation.attempts = 0;
   } catch (error) {
-    if (error.code === "CLOUD_LEASE_LOST") throw error;
+    if (error.code === "CLOUD_LEASE_LOST") {
+      leaseLost = true;
+      throw error;
+    }
     operation.attempts = (operation.attempts || 0) + 1;
     const terminal = ["CLOUD_PLAN_CHANGED", "CLOUD_OWNER_CHANGED"].includes(error.code) || operation.attempts >= 8;
     operation.status = terminal ? "failed" : "pending";
@@ -10341,15 +11070,17 @@ async function advanceCleanup(ctx, db, userId, key, operation) {
     if (terminal)
       for (const count of operation.counts) count.failed = count.remaining;
   } finally {
-    operation.updatedAt = Date.now();
-    await save(db, userId, key, "operation", operation, { leaseToken });
-    if (typeof db.releaseCloudDataRecord === "function")
-      await db.releaseCloudDataRecord(
-        userId,
-        "operation",
-        operation.id,
-        leaseToken
-      );
+    if (!leaseLost) {
+      operation.updatedAt = Date.now();
+      await save(db, userId, key, "operation", operation, { leaseToken });
+      if (typeof db.releaseCloudDataRecord === "function")
+        await db.releaseCloudDataRecord(
+          userId,
+          "operation",
+          operation.id,
+          leaseToken
+        );
+    }
   }
   return operation;
 }
@@ -10364,6 +11095,7 @@ var WORK_INDEX_METHODS = [
   "repairCloudResourceMetadata"
 ];
 var UNREADABLE_RETRY_MS = 15 * 6e4;
+var CLEANUP_TICK_BUDGET_MS = 2e4;
 async function repairLegacyWorkIndex(ctx) {
   const db = ctx.db;
   const name = "management-work-v1";
@@ -10405,7 +11137,9 @@ async function resumeCloudDataCleanups(ctx) {
     await db.cleanupCloudDataRecords("plan", Date.now() - 36e5);
     rows = await db.listCloudDataRecordsAcrossUsers("operation");
   }
+  const deadline = Date.now() + CLEANUP_TICK_BUDGET_MS;
   for (const row of rows) {
+    if (Date.now() >= deadline) break;
     try {
       const key = await deriveUserEncryptionKey(row.userId, ctx.masterKey);
       const operation = JSON.parse(await decryptFromStorage(row.data, key));
@@ -10420,7 +11154,7 @@ async function resumeCloudDataCleanups(ctx) {
         continue;
       }
       if (["pending", "running"].includes(operation.status)) {
-        await advanceCleanup(ctx, db, row.userId, key, operation);
+        await advanceCleanup(ctx, db, row.userId, key, operation, { maxEntries: Infinity, deadline });
       }
     } catch (error) {
       console.warn("[amsg] A cloud cleanup operation could not be resumed");
@@ -10604,7 +11338,7 @@ function createCloudDataHandler(ctx) {
         };
       } else if (path.endsWith("/owner")) {
         const owner = method === "POST" ? input.owner : { type: params.get("ownerType"), id: params.get("ownerId") };
-        if (!validCloudOwner(owner))
+        if (!validOwner(owner))
           throw cloudError("INVALID_CLOUD_OWNER", "\u5F52\u5C5E\u683C\u5F0F\u65E0\u6548");
         if (method === "POST") {
           const beforeRestore = await db.getCloudOwner(userId, owner);
@@ -10653,7 +11387,8 @@ function createCloudDataHandler(ctx) {
         body: {
           success: false,
           error: {
-            code: error.code || "CLOUD_DATA_FAILED",
+            // 只透出 cloudError 造的错（带 status）；驱动抛上来的 pg / D1 错误码不外露。
+            code: error.status ? error.code : "CLOUD_DATA_FAILED",
             message: error.status ? error.message : "\u4E91\u7AEF\u7BA1\u7406\u8BF7\u6C42\u5931\u8D25\uFF1B\u672A\u80FD\u786E\u8BA4\u64CD\u4F5C\u7ED3\u679C\u3002"
           }
         }
@@ -10883,7 +11618,7 @@ function createSingleUserServer(config) {
     }
   };
 }
-var SCHEMA_VERSION = "2.6.0-cloud-data.2";
+var SCHEMA_VERSION = "3.2.0-lease-token";
 function requireIntrospection(db) {
   if (!db || typeof db.describeSchema !== "function") {
     throw new Error(
@@ -11155,6 +11890,9 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       }
       return jsonResponse(result.status, result.body, cors);
     } catch (error) {
+      if (typeof error?.code === "string" && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
+        return jsonResponse(error.status, { success: false, error: { code: error.code, message: error.message } }, cors);
+      }
       console.error("[amsg single-user] fetch() unhandled error:", error && error.message);
       const cause = summarizeErrorCause(error, "request");
       await reportError({ stage: "request", error, cause, path: pathOf(request) });
@@ -11171,14 +11909,17 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
       await reportError({ stage: "config", error, cause, path: null });
       return { ok: false, cause };
     }
-    const cleanup = {};
-    try {
-      await resumeCloudDataCleanups(buildTickContext(cfg));
-    } catch (error) {
-      console.error("[amsg single-user] scheduled(): cloud cleanup failed:", error && error.message);
-      cleanup.cloudCleanupCause = summarizeErrorCause(error, "cloud-cleanup");
-      await reportError({ stage: "cloud-cleanup", error, cause: cleanup.cloudCleanupCause, path: null });
-    }
+    const runCleanup = async () => {
+      try {
+        await resumeCloudDataCleanups(buildTickContext(cfg));
+        return {};
+      } catch (error) {
+        console.error("[amsg single-user] scheduled(): cloud cleanup failed:", error && error.message);
+        const cloudCleanupCause = summarizeErrorCause(error, "cloud-cleanup");
+        await reportError({ stage: "cloud-cleanup", error, cause: cloudCleanupCause, path: null });
+        return { cloudCleanupCause };
+      }
+    };
     if (!pushConfigured(cfg)) {
       console.error("[amsg single-user] scheduled(): VAPID/webpush not configured; skipping tick");
       const cause = summarizeErrorCause(
@@ -11186,17 +11927,19 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
         "config"
       );
       await reportError({ stage: "config", error: null, cause, path: null });
-      return { ok: false, cause, ...cleanup };
+      return { ok: false, cause, ...await runCleanup() };
     }
+    let tick;
     try {
       const summary = await runScheduledTick(buildTickContext(cfg));
-      return { ok: true, summary, ...cleanup };
+      tick = { ok: true, summary };
     } catch (error) {
       console.error("[amsg single-user] scheduled(): tick failed:", error && error.message);
       const cause = summarizeErrorCause(error, "tick");
       await reportError({ stage: "tick", error, cause, path: null });
-      return { ok: false, cause, ...cleanup };
+      tick = { ok: false, cause };
     }
+    return { ...tick, ...await runCleanup() };
   }
   async function runTask2(uuid, env) {
     const cfg = await resolveConfig(env);
@@ -11214,414 +11957,1450 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
   return { fetch: fetch2, scheduled, runTask: runTask2, getSchemaVersion: getSchemaVersion2, ensureSchema: ensureSchema2 };
 }
 
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0-next.11/node_modules/@rei-standard/amsg-shared/dist/index.mjs
-var TEXT_ENCODER2 = new TextEncoder();
-var TEXT_DECODER2 = new TextDecoder("utf-8", { fatal: false });
-function utf83(str) {
-  return TEXT_ENCODER2.encode(String(str));
-}
-var LLM_MESSAGES_ERROR2 = Object.freeze({
-  MESSAGES_NOT_ARRAY: "MESSAGES_NOT_ARRAY",
-  MESSAGE_NOT_OBJECT: "MESSAGE_NOT_OBJECT",
-  INVALID_ROLE: "INVALID_ROLE",
-  TOOL_CALL_MALFORMED: "TOOL_CALL_MALFORMED",
-  TOOL_CONTENT_INVALID: "TOOL_CONTENT_INVALID",
-  TOOL_CALL_ID_MISSING: "TOOL_CALL_ID_MISSING",
-  CONTENT_EMPTY_STRING: "CONTENT_EMPTY_STRING",
-  CONTENT_EMPTY_ARRAY: "CONTENT_EMPTY_ARRAY",
-  CONTENT_INVALID_TYPE: "CONTENT_INVALID_TYPE"
-});
-var UPSTREAM_ERROR_BODY_MAX_BYTES2 = 16 * 1024;
-var CREDENTIAL_LIKE_TOKEN2 = /\b[A-Za-z]{2,6}-[A-Za-z0-9_-]{16,}/g;
-var LONG_OPAQUE_RUN2 = /[A-Za-z0-9+/_.-]{48,}/g;
-var MODEL_ID_LIKE2 = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]{1,12})+$/;
-var MODEL_ID_MAX_CHARS2 = 64;
-var CREDENTIAL_PREFIX_SEGMENTS2 = /* @__PURE__ */ new Set([
-  "sk",
-  "pk",
-  "ak",
-  "api",
-  "apikey",
-  "key",
-  "token",
-  "secret",
-  "auth",
-  "bearer",
-  "session",
-  "sess",
-  "pat",
-  "xai",
-  "gsk"
-]);
-var UUID_SHAPE2 = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/;
-function alternationCount2(segment) {
-  return (segment.match(/[a-z]+|[0-9]+/g) || []).length;
-}
-var MOE_SIZE_SEGMENT2 = /^\d+x\d+b$/;
-var HEX_SEGMENT2 = /^[0-9a-f]+$/;
-var HEX_RUN_MAX_CHARS2 = 15;
-function looksLikeModelId2(token) {
-  if (token.length > MODEL_ID_MAX_CHARS2) return false;
-  if (!MODEL_ID_LIKE2.test(token)) return false;
-  if (UUID_SHAPE2.test(token)) return false;
-  const segments = token.split(/[.-]/);
-  if (CREDENTIAL_PREFIX_SEGMENTS2.has(segments[0])) return false;
-  let hexRunChars = 0;
-  for (const segment of segments) {
-    if (HEX_SEGMENT2.test(segment)) {
-      hexRunChars += segment.length;
-      if (hexRunChars > HEX_RUN_MAX_CHARS2) return false;
-    } else {
-      hexRunChars = 0;
-    }
-  }
-  return segments.every(
-    (segment) => alternationCount2(segment) < 3 || MOE_SIZE_SEGMENT2.test(segment)
-  );
-}
-function redactCredentials2(text2) {
-  let s = text2;
-  s = s.replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]");
-  s = s.replace(CREDENTIAL_LIKE_TOKEN2, (token) => looksLikeModelId2(token) ? token : "[redacted]");
-  s = s.replace(LONG_OPAQUE_RUN2, (run) => {
-    const token = run.replace(/^[._+/-]+/, "").replace(/[._+/-]+$/, "");
-    return looksLikeModelId2(token) ? run : "[redacted]";
+// utils/voiceTextDedup.ts
+function deduplicateVoiceText(text2) {
+  if (/\[html\]|<翻[译譯]>|```/i.test(text2)) return text2;
+  const normalize2 = (s) => s.replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
+  const blocks = [];
+  const spoken = [];
+  const protectedText = text2.replace(/(?:<字幕>([\s\S]*?)<\/字幕>\s*)?<[语語]音[^>]*>([\s\S]*?)<\/[语語]音>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/g, (block, leadingSubtitle, voice, subtitle) => {
+    spoken.push(normalize2(voice), ...[leadingSubtitle, subtitle].filter(Boolean).map(normalize2));
+    return "\nVOICE" + (blocks.push(block) - 1) + "\n";
   });
-  return s;
-}
-var KEY_INFO_PREFIX2 = utf83("WebPush: info\0");
-var CEK_INFO2 = utf83("Content-Encoding: aes128gcm\0");
-var NONCE_INFO2 = utf83("Content-Encoding: nonce\0");
-var VAPID_TOKEN_LIFETIME2 = 12 * 3600;
-var REI_SW_EVENT2 = Object.freeze({
-  CONTENT_RECEIVED: "rei-amsg-content-received",
-  REASONING_RECEIVED: "rei-amsg-reasoning-received",
-  TOOL_REQUEST_RECEIVED: "rei-amsg-tool-request-received",
-  ERROR_RECEIVED: "rei-amsg-error-received",
-  /** 宿主自定义的一条结果（`messageKind: 'result'`），不是聊天内容。 */
-  RESULT_RECEIVED: "rei-amsg-result-received",
-  MULTIPART_EXPIRED: "rei-amsg-multipart-expired",
-  UNKNOWN_RECEIVED: "rei-amsg-unknown-received"
-});
-var MULTIPART_FAILURE_REASON2 = Object.freeze({
-  /** TTL 到期仍未收齐，或收到的分片本身已经过期。 */
-  TTL_EXPIRED: "ttl-expired",
-  /** 分片信封不合规：version / encoding 对不上、index 越界、chunk 不是合法 base64url。 */
-  INVALID_CHUNK: "invalid-chunk",
-  /** 同一个 id 的分片报了不一样的 total / encoding，已收的部分拼不回去。 */
-  CHUNK_CONFLICT: "chunk-conflict",
-  /** 累计字节数超过 maxTotalBytes。 */
-  SIZE_LIMIT_EXCEEDED: "size-limit-exceeded",
-  /** 收齐了但拼不回原 payload（缺片、超限、JSON 解不开）。 */
-  RESTORE_FAILED: "restore-failed",
-  /** 分片仓库（IndexedDB）读写失败。 */
-  STORAGE_FAILED: "storage-failed",
-  /** 接收端把 multipart 关了（`multipart.enabled === false`），分片没法重组。 */
-  DISABLED: "disabled"
-});
-var REI_SW_MESSAGE_TYPE2 = Object.freeze({
-  ENQUEUE_REQUEST: "REI_ENQUEUE_REQUEST",
-  DELIVER: "REI_AMSG_DELIVER",
-  FLUSH_QUEUE: "REI_FLUSH_QUEUE",
-  /**
-   * 入队的点对点回执：谁发的 ENQUEUE_REQUEST 就回给谁一条，一次一条。
-   * 没转 MessagePort 过来时会落到全局的 `navigator.serviceWorker` message
-   * 监听器上。
-   */
-  QUEUE_RESULT: "REI_QUEUE_RESULT",
-  /**
-   * 队列请求被永久拒绝、即将从队列里删掉时广播给所有窗口的一条。
-   *
-   * 跟 QUEUE_RESULT 分开是因为两者的收信人不是一回事：这条是广播，可能来自后台
-   * `sync` 冲刷、说的也可能是另一条八竿子打不着的旧请求。共用一个 type 的话，
-   * 页面等自己那条入队回执时会先收到这一条、当成自己的结果处理。
-   */
-  QUEUE_DROPPED: "REI_QUEUE_DROPPED"
-});
-var REI_AMSG_DELIVER_MESSAGE_TYPE2 = REI_SW_MESSAGE_TYPE2.DELIVER;
-var MESSAGE_KIND2 = Object.freeze({
-  CONTENT: "content",
-  REASONING: "reasoning",
-  TOOL_REQUEST: "tool_request",
-  ERROR: "error",
-  RESULT: "result"
-});
-var MESSAGE_TYPE2 = Object.freeze({
-  INSTANT: "instant",
-  FIXED: "fixed",
-  PROMPTED: "prompted",
-  AUTO: "auto"
-});
-var PUSH_SOURCE2 = Object.freeze({
-  INSTANT: "instant",
-  SCHEDULED: "scheduled"
-});
-var REASONING_CHUNK_ENCODER2 = new TextEncoder();
-var REASONING_CHUNK_DECODER2 = new TextDecoder("utf-8", { fatal: true });
-var REASONING_TAG_RE_G2 = /<(think|thinking|thought)>[\s\S]*?<\/\1>/gi;
-function stripReasoningTags2(content) {
-  if (typeof content !== "string" || !content.includes("<")) return content;
-  return content.replace(REASONING_TAG_RE_G2, "").trim();
+  if (!blocks.length) return text2;
+  return protectedText.split(/\r?\n/).filter((line) => {
+    if (/[<>\[\]\u0002]/.test(line)) return true;
+    const plain = normalize2(line);
+    return plain.length < 12 || !spoken.some((voice) => voice.includes(plain));
+  }).join("\n").replace(/\u0002VOICE(\d+)\u0002/g, (_, i) => blocks[Number(i)]).trim();
 }
 
-// utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-10-22";
-
-// utils/amsgTaskKinds.ts
-var AMSG_TASK_KIND_KEY = "amsgKind";
-var readTaskKind = (metadata) => {
-  const raw = metadata?.[AMSG_TASK_KIND_KEY];
-  return typeof raw === "string" && raw ? raw : null;
-};
-var AMSG_JOB_NAMESPACE = "amsg:job";
-var AMSG_JOB_TTL_DAYS = 3;
-var AMSG_JOB_ID_KEY = "amsgJobId";
-
-// worker/amsg/src/skipDiagnostics.ts
-var BODY_ERROR_MAX_CHARS = 200;
-var CONTENT_EXCERPT_CHARS = 300;
-var REASONING_TAIL_CHARS = 200;
-var BODY_EXCERPT_CHARS = 500;
-var asRecord = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : null;
-var numberOrNull = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
-var clip = (text2, max) => text2.length > max ? `${text2.slice(0, max)}\u2026` : text2;
-var safeStringify = (value) => {
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
-    return String(value);
-  }
-};
-var readFirstMessage = (body) => {
-  const choices = Array.isArray(body?.choices) ? body.choices : [];
-  const choice = asRecord(choices[0]);
-  return { choice, message: asRecord(choice?.message) };
-};
-var readReasoning = (message) => {
-  const value = message?.reasoning_content ?? message?.reasoning ?? message?.thinking;
-  return typeof value === "string" ? value : "";
-};
-var readBodyError = (body, hasChoices) => {
-  if (!body) return null;
-  let text2 = "";
-  const error = body.error;
-  if (typeof error === "string") {
-    text2 = error;
-  } else {
-    const record2 = asRecord(error);
-    if (record2) {
-      const code = typeof record2.code === "string" || typeof record2.code === "number" ? String(record2.code) : typeof record2.type === "string" ? record2.type : "";
-      const message = typeof record2.message === "string" ? record2.message : "";
-      text2 = [code && `[${code}]`, message].filter(Boolean).join(" ") || safeStringify(record2);
-    }
-  }
-  if (!text2 && !hasChoices) {
-    const topLevel = body.message ?? body.msg;
-    if (typeof topLevel === "string") text2 = topLevel;
-  }
-  return text2 ? clip(redactCredentials2(text2), BODY_ERROR_MAX_CHARS) : null;
-};
-var describeLlmResponseShape = (llmResponse, llmOutputText) => {
-  const body = asRecord(llmResponse);
-  const hasChoices = Array.isArray(body?.choices) && body.choices.length > 0;
-  const { choice, message } = readFirstMessage(body);
-  const content = message?.content;
-  const contentType = content === void 0 ? "missing" : content === null ? "null" : typeof content === "string" ? "string" : Array.isArray(content) ? "array" : "other";
-  const contentChars = typeof content === "string" ? content.length : Array.isArray(content) ? content.reduce((sum, part) => {
-    const text2 = asRecord(part)?.text;
-    return sum + (typeof text2 === "string" ? text2.length : 0);
-  }, 0) : 0;
-  const usage = asRecord(body?.usage);
-  const usageDetails = asRecord(usage?.completion_tokens_details);
-  return {
-    model: typeof body?.model === "string" ? body.model : null,
-    hasChoices,
-    finishReason: typeof choice?.finish_reason === "string" ? choice.finish_reason : null,
-    contentType,
-    contentChars,
-    ...Array.isArray(content) ? { contentParts: content.length } : {},
-    visibleChars: stripReasoningTags2(llmOutputText || "").trim().length,
-    reasoningChars: readReasoning(message).length,
-    toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls.length : 0,
-    usage: usage ? {
-      promptTokens: numberOrNull(usage.prompt_tokens),
-      completionTokens: numberOrNull(usage.completion_tokens),
-      reasoningTokens: numberOrNull(usageDetails?.reasoning_tokens)
-    } : null,
-    bodyError: readBodyError(body, hasChoices)
-  };
-};
-var excerptLlmResponse = (llmResponse) => {
-  const body = asRecord(llmResponse);
-  const hasChoices = Array.isArray(body?.choices) && body.choices.length > 0;
-  if (!hasChoices) {
-    return { body: clip(redactCredentials2(safeStringify(llmResponse)), BODY_EXCERPT_CHARS) };
-  }
-  const { message } = readFirstMessage(body);
-  const excerpt = {};
-  const content = message?.content;
-  if (typeof content === "string") {
-    if (content) excerpt.content = clip(redactCredentials2(content), CONTENT_EXCERPT_CHARS);
-  } else if (content != null) {
-    excerpt.content = clip(redactCredentials2(safeStringify(content)), CONTENT_EXCERPT_CHARS);
-  }
-  const reasoning = readReasoning(message);
-  if (reasoning) {
-    const tail = reasoning.length > REASONING_TAIL_CHARS ? `\u2026${reasoning.slice(-REASONING_TAIL_CHARS)}` : reasoning;
-    excerpt.reasoningTail = redactCredentials2(tail);
-  }
-  if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
-    excerpt.toolCalls = clip(redactCredentials2(safeStringify(message.tool_calls)), CONTENT_EXCERPT_CHARS);
-  }
-  return excerpt;
-};
-var rawExcerptEnabled = false;
-var configureSkipDiagnostics = (options) => {
-  rawExcerptEnabled = options.rawExcerpt;
-};
-var isDebugFlagOn = (value) => typeof value === "string" && ["1", "true"].includes(value.trim().toLowerCase());
-var logSkipDiagnostic = (input) => {
-  try {
-    console.warn("[amsg:skip-diag]", {
-      sessionId: input.sessionId ?? null,
-      reason: input.reason,
-      iteration: input.iteration ?? null,
-      ...describeLlmResponseShape(input.llmResponse, input.llmOutputText ?? ""),
-      ...rawExcerptEnabled ? { raw: excerptLlmResponse(input.llmResponse) } : {}
-    });
-  } catch (error) {
-    console.warn("[amsg:skip-diag] \u8BCA\u65AD\u65E5\u5FD7\u6CA1\u8BB0\u4E0B\u6765\uFF08\u8DF3\u8FC7\u7167\u5E38\u751F\u6548\uFF09", error);
-  }
-};
-
-// worker/amsg/src/plateFire.ts
-var discardJob = async (writeState, jobId) => {
-  if (!writeState) return;
-  try {
-    await writeState(AMSG_JOB_NAMESPACE, [{ key: plateJobKey(jobId), value: null }]);
-  } catch (error) {
-    console.warn("[amsg:plate] job \u884C\u6CA1\u5220\u6389\uFF08\u7B49 TTL \u515C\u5E95\uFF09", jobId, error);
-  }
-};
-var plateConsolidateHandler = {
-  async beforeFire({ ctx, charId, taskMeta }) {
-    const jobId = taskMeta[AMSG_JOB_ID_KEY];
-    if (typeof jobId !== "string" || !jobId) {
-      throw new Error(`\u95E8\u724C\u6574\u7406\u4EFB\u52A1\u7684 metadata \u91CC\u6CA1\u6709 ${AMSG_JOB_ID_KEY}`);
-    }
-    const rows = await ctx.readState(AMSG_JOB_NAMESPACE);
-    const row = rows.find((r) => r.key === plateJobKey(jobId));
-    if (!row?.value) {
-      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u5DF2\u4E0D\u5728\uFF08\u8FC7\u671F\u6216\u5DF2\u64A4\u9500\uFF09` };
-    }
-    const discardAndFail = async (message) => {
-      await discardJob(ctx.writeState, jobId);
-      throw new Error(message);
-    };
-    let json;
-    try {
-      json = await unpackStateValue(row.value);
-    } catch (error) {
-      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09\uFF1A${String(error)}`);
-    }
-    const job = parsePlateJobInput(json);
-    if (!job) return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u6790\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`);
-    if (job.charId !== charId) {
-      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684 charId \u4E0E\u4EFB\u52A1\u5BF9\u4E0D\u4E0A`);
-    }
-    if (job.rooms.length === 0) {
-      await discardJob(ctx.writeState, jobId);
-      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u6CA1\u6709\u8981\u6574\u7406\u7684\u623F\u95F4` };
-    }
-    return {
-      messages: buildPlateJobMessages(job),
-      // 跟浏览器那条路同一个超时（叶子里那个常量）。不显式交上去的话这一次 fire 会落到
-      // 库自己的默认值（四分钟），同一件活儿两条路的耐心不一样，而且改那个常量对云端
-      // 毫无影响——「本地什么样云端就什么样」这条线得自己拉齐。
-      totalTimeoutMs: PLATE_LLM_TIMEOUT_MS,
-      state: { jobId, job }
-    };
-  },
-  async llmOutput({ ctx, state }) {
-    const { jobId, job } = state;
-    const items = parsePlateLlmReply(ctx.llmOutputText || "");
-    if (items.length === 0) {
-      console.warn("[amsg:plate] LLM \u6CA1\u8FD4\u56DE\u6709\u6548\u6761\u76EE\uFF0C\u95E8\u724C\u4FDD\u6301\u4E0D\u52A8", jobId);
-      logSkipDiagnostic({
-        sessionId: ctx.sessionId,
-        reason: "plate-empty-generation",
-        iteration: ctx.iteration,
-        llmResponse: ctx.llmResponse,
-        llmOutputText: ctx.llmOutputText
-      });
-      await discardJob(ctx.writeState, jobId);
-      return { decision: "skip-push", reason: "plate-empty-generation" };
-    }
-    if (typeof ctx.emitResult !== "function") {
-      console.warn("[amsg:plate] \u8FD9\u53F0 worker \u4E0D\u652F\u6301 emitResult\uFF0C\u6574\u7406\u7ED3\u679C\u9001\u4E0D\u56DE\u53BB", jobId);
-      await discardJob(ctx.writeState, jobId);
-      return { decision: "skip-push", reason: "plate-emit-result-unsupported" };
-    }
-    try {
-      await ctx.emitResult({
-        ...buildPlateConsolidateResult({ jobId, charId: job.charId, items, rooms: job.rooms, snapshotAt: job.snapshotAt }),
-        // 背景工作，整理完不该把人叫回来看。show:false 的 payload 上游只落收件箱、
-        // 不发推送，客户端下次上线补收。
-        notification: { show: false }
-      });
-    } catch (error) {
-      console.warn("[amsg:plate] \u6574\u7406\u7ED3\u679C\u9001\u4E0D\u8FDB\u6536\u4EF6\u7BB1\uFF08\u591A\u534A\u662F\u6536\u4EF6\u7BB1\u8868\u6CA1\u5EFA\u5168\uFF0C\u53BB\u8BBE\u7F6E\u9875\u70B9\u4E00\u6B21\u300C\u91CD\u65B0\u8FDE\u63A5\u5E76\u9A8C\u8BC1\u300D\uFF09", jobId, error);
-      await discardJob(ctx.writeState, jobId);
-      return { decision: "skip-push", reason: "plate-emit-result-failed" };
-    }
-    console.log("[amsg:plate] \u6574\u7406\u7ED3\u679C\u5DF2\u9001\u8FDB\u6536\u4EF6\u7BB1", {
-      jobId,
-      charId: job.charId,
-      items: items.length,
-      resultKind: PLATE_CONSOLIDATE_RESULT_KIND
-    });
-    await discardJob(ctx.writeState, jobId);
-    return { decision: "skip-push", reason: "plate-result-emitted" };
-  }
-};
-
-// worker/amsg/src/fireKinds.ts
-var FIRE_KIND_HANDLERS = Object.assign(
-  /* @__PURE__ */ Object.create(null),
-  { [PLATE_CONSOLIDATE_KIND]: plateConsolidateHandler }
-);
-var KIND_FIRE_SCRATCH_KEY = "kindFire";
-var putKindFireStash = (scratch, kind, state) => {
-  scratch[KIND_FIRE_SCRATCH_KEY] = { kind, state };
-};
-var getKindFireStash = (scratch) => {
-  const raw = scratch?.[KIND_FIRE_SCRATCH_KEY];
-  if (!raw || typeof raw !== "object") return null;
-  const stash = raw;
-  return typeof stash.kind === "string" ? { kind: stash.kind, state: stash.state } : null;
-};
-
-// utils/amsgFireSkipResult.ts
-var FIRE_SKIP_RESULT_KIND = "fire-skipped";
-var SILENT_REASONS = /* @__PURE__ */ new Set(["schedule-off"]);
-var shouldReportFireSkip = (reason) => !SILENT_REASONS.has(reason);
-function buildFireSkipResult(args) {
-  return {
-    resultKind: FIRE_SKIP_RESULT_KIND,
-    v: 1,
-    charId: args.charId,
-    taskUuid: args.taskUuid,
-    occurrenceMs: args.occurrenceMs,
-    reason: args.reason,
-    ...args.task ? {
-      task: {
-        mode: args.task.mode,
-        ...args.task.promptHint ? { promptHint: args.task.promptHint } : {},
-        recurrenceType: args.task.recurrenceType
+// utils/friendFeedReplyFormat.ts
+var FRIEND_FEED_MAIN_PROMPT_PREFIX = "\u3010\u987A\u4FBF\u56DE\u597D\u53CB\u5708\u3011";
+function extractFriendFeedReplyTags(raw, namespace = "FRIEND_FEED_REPLY") {
+  const marker = new RegExp("\\[\\[" + namespace + "\\s*:", "gi");
+  const actions = [];
+  let text2 = "", cursor = 0, match;
+  while (match = marker.exec(raw)) {
+    text2 += raw.slice(cursor, match.index);
+    let start = marker.lastIndex;
+    while (start < raw.length && /\s/.test(raw[start])) start++;
+    let depth = 0, quoted = false, escaped = false, end = -1;
+    if (raw[start] === "{") for (let i = start; i < raw.length; i++) {
+      const c = raw[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) {
+        end = i + 1;
+        break;
       }
-    } : {}
+    }
+    const close = end >= 0 ? /^\s*\]\]/.exec(raw.slice(end)) : null;
+    if (close) {
+      try {
+        actions.push(JSON.parse(raw.slice(start, end)));
+      } catch {
+      }
+      cursor = end + close[0].length;
+    } else {
+      const fallback = raw[start] === "{" && end < 0 ? -1 : raw.indexOf("]]", end >= 0 ? end : start);
+      cursor = fallback < 0 ? raw.length : fallback + 2;
+    }
+    marker.lastIndex = cursor;
+  }
+  return { text: text2 + raw.slice(cursor), actions };
+}
+
+// node_modules/.pnpm/@rei-standard+amsg-instant@0.12.0-next.0/node_modules/@rei-standard/amsg-instant/dist/index.mjs
+var MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+var WEB_PUSH_MAX_BODY_BYTES2 = 4096;
+var WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2 = 16 + 4 + 1 + 65 + 1 + 16;
+var MAX_PUSH_PAYLOAD_BYTES2 = WEB_PUSH_MAX_BODY_BYTES2 - WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2;
+var PROBE_BYTE_ENCODER = new TextEncoder();
+var LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND).reduce((longest, kind) => kind.length > longest.length ? kind : longest, "");
+var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
+function segmentTextWithProtectedBlocks(text2, options) {
+  if (!text2) return [];
+  const splitAndSanitize = (plainText) => {
+    const chunks = options.splitText(plainText).filter((c) => c !== "");
+    return chunks.map((chunk) => ({
+      raw: chunk,
+      sanitized: options.sanitizeText ? options.sanitizeText(chunk) : chunk,
+      protect: false
+    }));
+  };
+  if (!options.protectedPatterns || options.protectedPatterns.length === 0) {
+    return splitAndSanitize(text2);
+  }
+  const matches = [];
+  for (const p of options.protectedPatterns) {
+    const flags = p.pattern.flags.includes("g") ? p.pattern.flags : p.pattern.flags + "g";
+    const regex = new RegExp(p.pattern.source, flags);
+    let match;
+    while ((match = regex.exec(text2)) !== null) {
+      if (match[0].length === 0) {
+        regex.lastIndex++;
+        continue;
+      }
+      matches.push({
+        index: match.index,
+        length: match[0].length,
+        raw: match[0],
+        matchObj: match,
+        patternDef: p
+      });
+    }
+  }
+  matches.sort((a, b) => {
+    if (a.index !== b.index) return a.index - b.index;
+    return b.length - a.length;
+  });
+  const validMatches = [];
+  let lastEnd = 0;
+  for (const m of matches) {
+    if (m.index >= lastEnd) {
+      validMatches.push(m);
+      lastEnd = m.index + m.length;
+    }
+  }
+  const segments = [];
+  let cursor = 0;
+  const resolveField = (field, raw, match) => typeof field === "function" ? field(raw, match) : field;
+  for (const m of validMatches) {
+    if (m.index > cursor) {
+      const plainText = text2.substring(cursor, m.index);
+      segments.push(...splitAndSanitize(plainText));
+    }
+    const previewStr = resolveField(m.patternDef.preview, m.raw, m.matchObj);
+    const metaData = resolveField(m.patternDef.meta, m.raw, m.matchObj);
+    let sanitized = previewStr;
+    if (sanitized == null) {
+      sanitized = options.sanitizeText ? options.sanitizeText(m.raw) : m.raw;
+    }
+    const pushSeg = {
+      raw: m.raw,
+      sanitized,
+      protect: true
+    };
+    if (metaData !== void 0) {
+      pushSeg.meta = metaData;
+    }
+    segments.push(pushSeg);
+    cursor = m.index + m.length;
+  }
+  if (cursor < text2.length) {
+    const plainText = text2.substring(cursor);
+    segments.push(...splitAndSanitize(plainText));
+  }
+  return segments;
+}
+var SSE_ENCODER = new TextEncoder();
+var SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(": keepalive\n\n");
+var SSE_DONE_BYTES = SSE_ENCODER.encode("event: done\ndata: {}\n\n");
+
+// utils/sanitize.ts
+var stripLiteralBackslashN = (t) => t.replace(/\\n/g, "\n");
+var stripLeakedSourceTags = (t) => t.replace(
+  /\s*\[\s*(?:聊\s*(?:天|chat)|chat|通\s*(?:话|call)|call|约\s*(?:会|date)|date)\s*\]\s*/giu,
+  "\n"
+);
+var stripTimestamps = (t) => t.replace(/\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*/g, "").replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*/gm, "").replace(/（[上下]午\d{1,2}[：:]\d{2}）/g, "").replace(/\(\d{1,2}:\d{2}\s*[AP]M\)/gi, "");
+var stripChineseDate = (t) => t.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, "");
+var stripRoleNamePrefix = (t) => t.replace(/^[\w一-龥]+:\s*/, "");
+var stripBusinessTagsForBubble = (t) => extractFriendFeedReplyTags(extractFriendFeedReplyTags(t).text, "HOME_VISIT_REPLY").text.replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[\s*[记記][录錄]\s*[:：][\s\S]*?\]\]/g, "").replace(/\[schedule_message[^\]]*\]/g, "");
+var stripBusinessTagsForNotification = (t) => stripBusinessTagsForBubble(t).replace(/\[\[(?:READ_NOTE|XHS_[A-Z_]+|LIFE|NEWS_CARD)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[XHS_[A-Z_]+\]\]/g, "");
+var stripAllDoubleBracketTags = (t) => t.replace(/\[\[[\s\S]*?\]\]/g, "");
+var stripQuotes = (t) => t.replace(/\[\[(?:QU[OA]TE|引用)[：:][\s\S]*?\]\]/g, "").replace(/\[(?:QU[OA]TE|引用)[：:][^\]]*\]/g, "").replace(/\[回复\s*[""“][^""”]*?[""”](?:\.{0,3})\]\s*[：:]?\s*/g, "").replace(/\[[^\[\]\n「」]{0,24}引用了[^\[\]\n「」]{0,24}「[^」\n]*?」[^\[\]\n]{0,24}\]\s*/g, "");
+var stripSystemLogLeak = (t) => t.replace(/[\[【]\s*(?:系统|系統|System)\s*(?:提示)?\s*[:：][^\[\]【】]*[\]】]\s*/gi, "").replace(/\[\s*(?:系统|系統)\s*\]\s*/g, "");
+var stripMarkdownHeaders = (t) => t.replace(/^#{1,6}\s+/gm, "");
+var stripMarkdownBold = (t) => t.replace(/\*{2,}/g, "");
+var stripMarkdownDividers = (t) => t.replace(/^\s*---\s*$/gm, "").replace(/^\s*[-*+]\s*$/gm, "");
+var stripBackticks = (t) => t.replace(/`(\[\[[\s\S]*?\]\])`/g, "$1").replace(/``+/g, "").replace(/(^|\s)`(\s|$)/gm, "$1$2");
+var stripLegacyTrans = (t) => t.replace(/%%TRANS%%[\s\S]*/gi, "");
+var collapseWhitespace = (t) => t.replace(/\n{3,}/g, "\n\n").trim();
+var stripThinkBlocks = (t) => t.replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, "").replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, "");
+var stripInnerState = (t) => t.replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, "");
+var replaceMarkdownLinks = (t) => t.replace(/\[([^\]]+)\]\([^)]+\)/g, "[\u94FE\u63A5\uFF1A$1]");
+var replaceSendEmoji = (t) => t.replace(/\[\[SEND_EMOJI[:：]\s*(.+?)\]\]/g, "[\u8868\u60C5\uFF1A$1]");
+var replaceEmojiReverseTag = (t) => t.replace(/\[(?:你|User|用户|System|[\w一-龥]+)\s*发送了表情包[:：]\s*(.*?)\]/g, "[\u8868\u60C5\uFF1A$1]");
+var replaceHtmlBlocks = (t) => t.replace(/\[html\][\s\S]*?\[\/html\]/gi, "[HTML \u5361\u7247]");
+var replaceTranslationForBanner = (t) => t.replace(/<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, "$1").replace(/<译文>[\s\S]*?<\/译文>/g, "").replace(/<\/?(?:翻译|原文)>/g, "");
+var replaceVoiceForBanner = (t) => t.replace(
+  /(?:<字幕>([\s\S]*?)<\/字幕>\s*)?<[语語]音[^>]*>([\s\S]*?)<\/\s*[语語]音\s*>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/g,
+  (_m, pre, inner, post) => (post || pre || inner || "").trim()
+).replace(/<字幕>([\s\S]*?)<\/字幕>/g, "$1").replace(/<\/?字幕>/g, "");
+function repairPairedTag(text2, tokenRe, closeFormOf, closeBeforeTrailingSubtitle) {
+  const kept = [];
+  let cursor = 0;
+  let openForm = null;
+  let tok;
+  while ((tok = tokenRe.exec(text2)) !== null) {
+    const isClose = tok[0].startsWith("</");
+    if (!isClose && /\/\s*>$/.test(tok[0])) {
+      kept.push(text2.slice(cursor, tok.index));
+      cursor = tok.index + tok[0].length;
+      continue;
+    }
+    if (isClose) {
+      if (openForm === null) {
+        kept.push(text2.slice(cursor, tok.index));
+        cursor = tok.index + tok[0].length;
+      } else {
+        openForm = null;
+      }
+    } else if (openForm !== null) {
+      kept.push(text2.slice(cursor, tok.index));
+      cursor = tok.index + tok[0].length;
+    } else {
+      openForm = closeFormOf(tok[0]);
+    }
+  }
+  kept.push(text2.slice(cursor));
+  let result = kept.join("");
+  if (openForm !== null) {
+    const closeTag = `</${openForm}>`;
+    if (closeBeforeTrailingSubtitle) {
+      const trail = result.match(/(\s*<字幕>[\s\S]*?<\/字幕>\s*)$/);
+      if (trail) {
+        const at = result.length - trail[0].length;
+        return result.slice(0, at).replace(/\s+$/, "") + closeTag + trail[0].replace(/\s+$/, "");
+      }
+    }
+    result = result.replace(/\s+$/, "") + closeTag;
+  }
+  return result;
+}
+function normalizeVoiceTags(t) {
+  if (!/[语語]音|字幕/.test(t)) return t;
+  let result = t;
+  result = result.replace(/＜\s*[/／]\s*([语語]音|字幕)\s*＞/g, "</$1>");
+  result = result.replace(/＜\s*((?:[语語]音|字幕)[^<>＜＞]*?)\s*＞/g, "<$1>");
+  result = result.replace(/<\s*[/／]\s*([语語]音|字幕)\s*>/g, "</$1>");
+  result = result.replace(/<([语語]音|字幕)\s*([^<>]*?)\s*>/g, (_m, tag2, attrs) => {
+    if (!attrs) return `<${tag2}>`;
+    const fixed = attrs.replace(/[“”＂]/g, '"').replace(/[‘’]/g, "'").replace(/＝/g, "=").trim();
+    return `<${tag2} ${fixed}>`;
+  });
+  result = repairPairedTag(result, /<\/?[语語]音[^>]*>/g, (tok) => /語/.test(tok) ? "\u8A9E\u97F3" : "\u8BED\u97F3", true);
+  result = repairPairedTag(result, /<\/?字幕[^>]*>/g, () => "\u5B57\u5E55", false);
+  result = result.replace(/(<[语語]音[^>]*>)([\s\S]*?)(<\/[语語]音>)/g, (block, open, inner, close) => {
+    const subtitles = [];
+    const speech = inner.replace(/<字幕>([\s\S]*?)<\/字幕>/g, (_m, sub) => {
+      if (sub.trim()) subtitles.push(sub.trim());
+      return "";
+    });
+    if (subtitles.length === 0) return block;
+    return `${open}${speech.trim()}${close}
+<\u5B57\u5E55>${subtitles.join("\n")}</\u5B57\u5E55>`;
+  });
+  return result;
+}
+var simpTransTag = (tag2) => tag2.replace(/譯/g, "\u8BD1");
+function normalizeTranslationTags(t) {
+  if (!/[<＜]\s*[/／]?\s*(?:翻[译譯]|原文|[译譯]文)/.test(t)) return t;
+  let result = t;
+  result = result.replace(/[<＜]\s*[/／]\s*(翻[译譯]|原文|[译譯]文)\s*[>＞]/g, (_m, tag2) => `</${simpTransTag(tag2)}>`);
+  result = result.replace(/[<＜]\s*(翻[译譯]|原文|[译譯]文)\s*[>＞]/g, (_m, tag2) => `<${simpTransTag(tag2)}>`);
+  result = result.replace(
+    /[<＜]\s*([/／]?)\s*(翻[译譯]|原文|[译譯]文)\s*(?=$|\n|[<＜])/g,
+    (_m, slash, tag2) => `<${slash ? "/" : ""}${simpTransTag(tag2)}>`
+  );
+  result = repairPairedTag(result, /<\/?原文[^>]*>/g, () => "\u539F\u6587", false);
+  result = repairPairedTag(result, /<\/?译文[^>]*>/g, () => "\u8BD1\u6587", false);
+  result = repairPairedTag(result, /<\/?翻译[^>]*>/g, () => "\u7FFB\u8BD1", false);
+  const HOLD = String.fromCharCode(3);
+  const blocks = [];
+  const hold = (m) => {
+    blocks.push(m);
+    return `${HOLD}${blocks.length - 1}${HOLD}`;
+  };
+  result = result.replace(/<翻译>\s*<原文>[\s\S]*?<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, hold);
+  result = result.replace(
+    /(?:<翻译>\s*)?<原文>([\s\S]*?)<\/原文>\s*<译文>([\s\S]*?)<\/译文>\s*(?:<\/翻译>)?/g,
+    (_m, a, b) => hold(`<\u7FFB\u8BD1><\u539F\u6587>${a.trim()}</\u539F\u6587><\u8BD1\u6587>${b.trim()}</\u8BD1\u6587></\u7FFB\u8BD1>`)
+  );
+  result = result.replace(
+    /<翻译>\s*(?!<原文>)((?:(?!<\/?翻译>)[\s\S])*?)<\/翻译>\s*<译文>([\s\S]*?)<\/译文>/g,
+    (_m, a, b) => hold(`<\u7FFB\u8BD1><\u539F\u6587>${a.trim()}</\u539F\u6587><\u8BD1\u6587>${b.trim()}</\u8BD1\u6587></\u7FFB\u8BD1>`)
+  );
+  result = result.replace(/<译文>[\s\S]*?<\/译文>/g, "");
+  result = result.replace(/[<＜]\s*[/／]?\s*(?:翻[译譯]|原文|[译譯]文)\s*[>＞]?/g, "");
+  result = result.replace(new RegExp(`${HOLD}(\\d+)${HOLD}`, "g"), (_m, n) => blocks[Number(n)] || "");
+  return result;
+}
+var extractTranslationOriginal = (t) => {
+  let result = t.replace(
+    /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g,
+    "$1"
+  );
+  result = result.replace(/<译文>[\s\S]*?<\/译文>/g, "");
+  result = result.replace(/<\/?(?:翻译|原文)>/g, "");
+  return result;
+};
+function sanitizeForNotification(text2) {
+  let result = text2;
+  result = stripLiteralBackslashN(result);
+  result = stripThinkBlocks(result);
+  result = replaceHtmlBlocks(result);
+  result = replaceEmojiReverseTag(result);
+  result = replaceSendEmoji(result);
+  result = normalizeTranslationTags(result);
+  result = extractTranslationOriginal(result);
+  result = stripTimestamps(result);
+  result = stripChineseDate(result);
+  result = stripRoleNamePrefix(result);
+  result = stripSystemLogLeak(result);
+  result = stripLeakedSourceTags(result);
+  result = stripInnerState(result);
+  result = stripBusinessTagsForNotification(result);
+  result = stripQuotes(result);
+  result = replaceMarkdownLinks(result);
+  result = stripMarkdownHeaders(result);
+  result = stripMarkdownBold(result);
+  result = stripMarkdownDividers(result);
+  result = stripBackticks(result);
+  result = stripLegacyTrans(result);
+  result = collapseWhitespace(result);
+  return result;
+}
+function sanitizeIntoSegments(text2) {
+  let cleaned = stripLiteralBackslashN(text2);
+  cleaned = stripThinkBlocks(cleaned);
+  cleaned = deduplicateVoiceText(normalizeVoiceTags(cleaned));
+  cleaned = normalizeTranslationTags(cleaned);
+  const ATOM_MARKER = String.fromCharCode(2);
+  const atomBlocks = [];
+  const atomSegments = segmentTextWithProtectedBlocks(cleaned, {
+    splitText: (plainText) => [plainText],
+    protectedPatterns: [
+      {
+        pattern: /\[html\][\s\S]*?\[\/html\]/i,
+        preview: "[HTML \u5361\u7247]"
+      },
+      {
+        pattern: /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/,
+        preview: (_raw, match) => (match[1] || "").trim() || "[\u7FFB\u8BD1]"
+      },
+      {
+        // 语音块 + 紧邻的 <字幕> 块是一个原子单元 (字幕是这条语音的中文对照, 拆开
+        // 就配不上了)。字幕前置/后置都容忍; banner 预览优先用字幕 (用户读得懂中文)。
+        // 闭合容许空格 + 简繁互换 (normalizeVoiceTags 已修, 这里不再依赖 \1 回引)。
+        pattern: /(?:<字幕>([\s\S]*?)<\/字幕>\s*)?<[语語]音[^>]*>([\s\S]*?)<\/\s*[语語]音\s*>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/,
+        preview: (_raw, match) => (match[3] || match[1] || match[2] || "").trim() || "[\u8BED\u97F3]"
+      }
+    ]
+  });
+  cleaned = atomSegments.map((seg) => {
+    if (!seg.protect) return seg.raw;
+    const idx = atomBlocks.length;
+    atomBlocks.push({
+      raw: seg.raw,
+      sanitized: typeof seg.sanitized === "string" ? seg.sanitized : sanitizeTextForBanner(seg.raw)
+    });
+    return `
+${ATOM_MARKER}B${idx}${ATOM_MARKER}
+`;
+  }).join("");
+  cleaned = extractTranslationOriginal(cleaned);
+  cleaned = stripInnerState(cleaned);
+  cleaned = stripBusinessTagsForNotification(cleaned);
+  cleaned = stripTimestamps(cleaned);
+  cleaned = stripChineseDate(cleaned);
+  cleaned = stripRoleNamePrefix(cleaned);
+  cleaned = stripLeakedSourceTags(cleaned);
+  cleaned = stripLegacyTrans(cleaned);
+  cleaned = stripMarkdownDividers(cleaned);
+  const rawChunks = chunkText(cleaned);
+  const SOLO_RE = new RegExp(`^${ATOM_MARKER}B(\\d+)${ATOM_MARKER}$`);
+  const GLOBAL_RE = new RegExp(`${ATOM_MARKER}B(\\d+)${ATOM_MARKER}`, "g");
+  const segments = [];
+  let pendingQuoteRaw = "";
+  for (const rawChunk of rawChunks) {
+    const soloMatch = rawChunk.trim().match(SOLO_RE);
+    if (soloMatch) {
+      const blk = atomBlocks[Number(soloMatch[1])];
+      if (blk) segments.push({ raw: blk.raw, sanitized: blk.sanitized });
+      continue;
+    }
+    const parts = splitOnSendEmoji(rawChunk);
+    for (const part of parts) {
+      if (part.kind === "emoji") {
+        segments.push({
+          raw: `[[SEND_EMOJI: ${part.name}]]`,
+          sanitized: `[\u8868\u60C5\uFF1A${part.name}]`
+        });
+        continue;
+      }
+      let rawText = part.text.replace(
+        GLOBAL_RE,
+        (_m, n) => atomBlocks[Number(n)]?.raw || ""
+      );
+      rawText = rawText.trim();
+      if (!rawText) continue;
+      const sanitized = sanitizeTextForBanner(rawText).trim();
+      if (!sanitized) {
+        if (!stripQuotes(rawText).trim()) pendingQuoteRaw += `${rawText}
+`;
+        continue;
+      }
+      if (!stripAllDoubleBracketTags(sanitized).trim()) continue;
+      segments.push({
+        raw: pendingQuoteRaw ? `${pendingQuoteRaw}${rawText}` : rawText,
+        sanitized
+      });
+      pendingQuoteRaw = "";
+    }
+  }
+  return segments;
+}
+function sanitizeTextForBanner(text2) {
+  let result = text2;
+  result = replaceHtmlBlocks(result);
+  result = replaceTranslationForBanner(result);
+  result = replaceVoiceForBanner(result);
+  result = stripQuotes(result);
+  result = stripSystemLogLeak(result);
+  result = replaceEmojiReverseTag(result);
+  result = replaceMarkdownLinks(result);
+  result = stripMarkdownHeaders(result);
+  result = stripMarkdownBold(result);
+  result = stripBackticks(result);
+  result = collapseWhitespace(result);
+  return result;
+}
+function chunkText(text2) {
+  return text2.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
+}
+function splitOnSendEmoji(chunk) {
+  const re = /\[\[SEND_EMOJI[:：]\s*(.*?)\]\]/g;
+  const parts = [];
+  let lastIndex = 0;
+  let m;
+  while ((m = re.exec(chunk)) !== null) {
+    if (m.index > lastIndex) {
+      parts.push({ kind: "text", text: chunk.slice(lastIndex, m.index) });
+    }
+    parts.push({ kind: "emoji", name: m[1].trim() });
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < chunk.length) {
+    parts.push({ kind: "text", text: chunk.slice(lastIndex) });
+  }
+  if (parts.length === 0 && chunk) parts.push({ kind: "text", text: chunk });
+  return parts;
+}
+
+// utils/transferFormat.ts
+function parseTransferAmount(raw) {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
+  if (typeof raw !== "string") return null;
+  let s = raw.replace(/[０-９．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 65248));
+  s = s.replace(/[¥￥$＄]/g, "").replace(/(?:元|块钱|块|圆|RMB|CNY|credits?)/gi, "").replace(/[,，\s]/g, "");
+  if (!/^\d+(?:\.\d+)?$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+function formatTransferAmount(n) {
+  return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100);
+}
+var RECORD_TRANSFER_RE = /\[\[\s*[记記][录錄]\s*[:：]\s*TRANSFER[^\]]*\]\]/gi;
+var ACTION_SEND_KV_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER\s*((?:\|[^\]]*)?)\s*\]\]/gi;
+var ACTION_SEND_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER\s*[:：]\s*([^\]]*?)\s*\]\]/gi;
+var FORGED_TO_VALUES = /* @__PURE__ */ new Set(["char", "self", "me", "\u89D2\u8272", "\u81EA\u5DF1", "\u6211", "\u81EA\u5206", "\u672C\u4EBA"]);
+function parseKvArgs(argStr) {
+  const out = {};
+  for (const part of argStr.split(/[|｜]/)) {
+    const seg = part.trim();
+    if (!seg) continue;
+    const eq = seg.search(/[=＝]/);
+    if (eq < 0) {
+      if (!("amount" in out) && parseTransferAmount(seg) !== null) out.amount = seg;
+      continue;
+    }
+    const k = seg.slice(0, eq).trim().toLowerCase();
+    const v = seg.slice(eq + 1).trim();
+    if (k) out[k] = v;
+  }
+  return out;
+}
+function kvToSendEvent(argStr) {
+  const kv = parseKvArgs(argStr);
+  const to = (kv.to ?? kv["\u7ED9"] ?? "").toLowerCase();
+  if (to && FORGED_TO_VALUES.has(to)) return null;
+  const amount = parseTransferAmount(kv.amount ?? kv["\u91D1\u989D"]);
+  return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
+}
+var ACTION_ACCEPT_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER_ACCEPT\s*\]\]/gi;
+var ACTION_RETURN_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER_RETURN\s*\]\]/gi;
+var SYSTEM_LOG_RE = /[\[【]\s*(?:系统|系統|System)\s*(?:提示)?\s*[:：]\s*([^\[\]【】]*?)\s*[\]】]/gi;
+var BARE_TRANSFER_RE = /\[\s*转[账帐]\s*[:：]?\s*([^\[\]]{0,24}?)\s*\]/gi;
+var AMOUNT_FRAGMENT = String.raw`[¥￥$＄]?\s*([0-9０-９][0-9０-９.,，]*)\s*(?:元|块钱|块|圆)?`;
+var LOG_SEND_RE = new RegExp(String.raw`^(?:你|我)\s*(?:向|给).*?转(?:[账帐]了?|了)\s*${AMOUNT_FRAGMENT}`);
+var LOG_ACCEPT_RE = /^你(?:接收|接受|收下|领取)了.*?转[账帐]/;
+var LOG_RETURN_RE = /^你退回了.*?转[账帐]/;
+var LOG_FORGED_RE = /(?:向|给)你转[账帐]|(?:接收|接受|收下|领取|退回)了你的转[账帐]/;
+var LOG_IS_TRANSFER_RE = /转[账帐]|转了?\s*[¥￥$＄]?\s*[0-9０-９]/;
+function classifySystemLog(inner) {
+  const s = inner.trim();
+  if (!LOG_IS_TRANSFER_RE.test(s)) return void 0;
+  if (LOG_ACCEPT_RE.test(s)) return { kind: "accept" };
+  if (LOG_RETURN_RE.test(s)) return { kind: "return" };
+  const m = s.match(LOG_SEND_RE);
+  if (m) {
+    const amount = parseTransferAmount(m[1]);
+    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
+  }
+  if (LOG_FORGED_RE.test(s)) return null;
+  return null;
+}
+function collect(text2, re, toEvent, hits) {
+  re.lastIndex = 0;
+  let m;
+  while ((m = re.exec(text2)) !== null) {
+    const start = m.index;
+    const end = start + m[0].length;
+    if (hits.some((h) => start < h.end && end > h.start)) continue;
+    const event = toEvent(m);
+    if (event === void 0) continue;
+    hits.push({ start, end, event });
+  }
+}
+function extractTransferCommands(content) {
+  const src = String(content ?? "");
+  if (!src) return { text: "", events: [], consumed: 0 };
+  const hits = [];
+  collect(src, RECORD_TRANSFER_RE, () => null, hits);
+  collect(src, ACTION_SEND_KV_RE, (m) => kvToSendEvent(m[1] ?? ""), hits);
+  collect(src, ACTION_SEND_RE, (m) => {
+    const amount = parseTransferAmount(m[1]);
+    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
+  }, hits);
+  collect(src, ACTION_ACCEPT_RE, () => ({ kind: "accept" }), hits);
+  collect(src, ACTION_RETURN_RE, () => ({ kind: "return" }), hits);
+  collect(src, SYSTEM_LOG_RE, (m) => classifySystemLog(m[1] ?? ""), hits);
+  collect(src, BARE_TRANSFER_RE, (m) => {
+    const amount = parseTransferAmount(m[1]);
+    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
+  }, hits);
+  hits.sort((a, b) => a.start - b.start);
+  let text2 = "";
+  let cursor = 0;
+  for (const h of hits) {
+    text2 += src.slice(cursor, h.start);
+    cursor = h.end;
+  }
+  text2 += src.slice(cursor);
+  return {
+    text: text2.trim(),
+    events: hits.map((h) => h.event).filter((e) => e !== null),
+    consumed: hits.length
   };
 }
+
+// utils/scheduleChangeParse.ts
+var KEYWORD_RE = /^\s*(?:ACTION\s*[:：]\s*CHANGE_SCHEDULE|change[\s_-]*(?:schedule|schedue)|modify[\s_-]*schedule|修改(?:未来)?日程|更改(?:未来)?日程|改日程)(?=\s|[:：|=→>\-（(]|\d|$)/iu;
+var parseDirectiveBody = (input) => {
+  const body = input.replace(/^[\s【\[]+|[\s】\]]+$/gu, "").trim();
+  const keyword = body.match(KEYWORD_RE);
+  if (!keyword) return { recognized: false };
+  const rest = body.slice(keyword[0].length).replace(/^\s*[:：|=→>\-]+\s*/u, "");
+  const time = rest.match(/[（(]?\s*(\d{1,2})\s*(?:[:：点时])\s*(\d{1,2})?\s*(?:分)?\s*[）)]?/u);
+  if (!time || time.index == null) return { recognized: true, directive: null };
+  const hour = Number(time[1]);
+  const minute = time[2] == null || time[2] === "" ? 0 : Number(time[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return { recognized: true, directive: null };
+  }
+  const activity = rest.slice(time.index + time[0].length).replace(/^\s*(?:[:：|=→>\-]+)\s*/u, "").replace(/[】\]]+\s*$/gu, "").trim();
+  if (!activity) return { recognized: true, directive: null };
+  return {
+    recognized: true,
+    directive: {
+      startTime: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+      // 日程卡本来就是短标题；截断异常长输出，避免一条标签撑坏 UI / prompt。
+      activity: activity.slice(0, 120)
+    }
+  };
+};
+var extractScheduleChangeDirectives = (text2) => {
+  const directives = [];
+  let malformedCount = 0;
+  const consumeBody = (body, original) => {
+    const parsed = parseDirectiveBody(body);
+    if (!parsed.recognized) return original;
+    if (parsed.directive) directives.push(parsed.directive);
+    else malformedCount += 1;
+    return "";
+  };
+  let cleanedText = (text2 || "").replace(
+    /(?:【{1,2}|\[{1,2})([^【】\[\]\r\n]{1,360})(?:】{1,2}|\]{1,2})/gu,
+    (whole, body) => consumeBody(body ?? "", whole)
+  );
+  cleanedText = cleanedText.replace(
+    /^[ \t]*(?:【【?|\[\[?)?[ \t]*(?:ACTION[ \t]*[:：][ \t]*CHANGE_SCHEDULE|change[ \t_-]*(?:schedule|schedue)|modify[ \t_-]*schedule|修改(?:未来)?日程|更改(?:未来)?日程|改日程)[ \t]*[:：|]?[^\r\n]{0,360}/gimu,
+    (whole) => consumeBody(whole, whole)
+  );
+  const recognizedSomething = directives.length > 0 || malformedCount > 0;
+  if (!recognizedSomething) {
+    return { cleanedText: text2 || "", directives, malformedCount };
+  }
+  return {
+    cleanedText: cleanedText.replace(/[ \t]+\r?\n/gu, "\n").replace(/\n{3,}/gu, "\n\n").trim(),
+    directives,
+    malformedCount
+  };
+};
+
+// worker/amsg/src/classifier.ts
+var DATA_TAGS = [
+  // [[RECALL: 2024-05]] / [[RECALL: 2024年5]]
+  {
+    re: /\[\[RECALL:\s*(\d{4})[-/年](\d{1,2})\]\]/g,
+    toolName: "recall",
+    toArgs: (m) => ({ year: m[1], month: m[2].padStart(2, "0") })
+  },
+  // [[SEARCH: query]]
+  {
+    re: /\[\[SEARCH:\s*(.+?)\]\]/g,
+    toolName: "web_search",
+    toArgs: (m) => ({ query: m[1].trim() })
+  },
+  // [[READ_DIARY: 2024-05-19]] / [[READ_DIARY: 今天]]
+  {
+    re: /\[\[READ_DIARY:\s*(.+?)\]\]/g,
+    toolName: "notion_read_diary",
+    toArgs: (m) => ({ date: m[1].trim() })
+  },
+  // [[FS_READ_DIARY: 2024-05-19]]
+  {
+    re: /\[\[FS_READ_DIARY:\s*(.+?)\]\]/g,
+    toolName: "feishu_read_diary",
+    toArgs: (m) => ({ date: m[1].trim() })
+  },
+  // [[READ_NOTE: keyword]]
+  {
+    re: /\[\[READ_NOTE:\s*(.+?)\]\]/g,
+    toolName: "read_note",
+    toArgs: (m) => ({ keyword: m[1].trim() })
+  },
+  // [[XHS_SEARCH: keyword]]
+  {
+    re: /\[\[XHS_SEARCH:\s*(.+?)\]\]/g,
+    toolName: "xhs_search",
+    toArgs: (m) => ({ keyword: m[1].trim() })
+  },
+  // [[XHS_BROWSE]] / [[XHS_BROWSE: category]]
+  {
+    re: /\[\[XHS_BROWSE(?::\s*(.+?))?\]\]/g,
+    toolName: "xhs_browse",
+    toArgs: (m) => m[1] ? { category: m[1].trim() } : {}
+  },
+  // [[XHS_DETAIL: noteId]]
+  {
+    re: /\[\[XHS_DETAIL:\s*(.+?)\]\]/g,
+    toolName: "xhs_detail",
+    toArgs: (m) => ({ noteId: m[1].trim() })
+  },
+  // [[XHS_MY_PROFILE]]
+  {
+    re: /\[\[XHS_MY_PROFILE\]\]/g,
+    toolName: "xhs_my_profile",
+    toArgs: () => ({})
+  }
+];
+var DATA_TOOL_NAMES = Object.freeze([...new Set(DATA_TAGS.map((spec) => spec.toolName))]);
+var SIDE_EFFECT_TAGS = [
+  // [[ACTION:POKE]]
+  {
+    re: /\[\[ACTION:POKE\]\]/g,
+    toDirective: () => ({ type: "poke" })
+  },
+  // 转账 (TRANSFER / TRANSFER_ACCEPT / TRANSFER_RETURN) 不在这张表里 —— 见 classifyLLMOutput
+  // 里的 extractTransferCommands, 那份解析跟客户端共用一份源码, 且要认模仿历史日志的口语形态。
+  // [[ACTION:ADD_EVENT|title|date]]
+  {
+    re: /\[\[ACTION:ADD_EVENT\s*\|\s*(.*?)\s*\|\s*(.*?)\]\]/g,
+    toDirective: (m) => ({ type: "add_event", title: m[1], date: m[2] })
+  },
+  // [schedule_message | time | fixed | text]  (note: 单方括号, 跟原 chatParser 一致)
+  {
+    re: /\[schedule_message\s*\|\s*(.+?)\s*\|\s*fixed\s*\|\s*(.+?)\]/g,
+    toDirective: (m) => ({ type: "schedule_message", time: m[1], text: m[2] })
+  },
+  // [[MUSIC_ACTION:verb]] 或 [[MUSIC_ACTION:verb|arg1|arg2]]
+  {
+    re: /\[\[MUSIC_ACTION:(join|add|add_new|join_and_add|join_and_add_new)(?:\|([^\]]*))?\]\]/g,
+    toDirective: (m) => ({
+      type: "music_action",
+      verb: m[1],
+      args: m[2] ? m[2].split("|").map((s) => s.trim()) : []
+    })
+  },
+  // [[XHS_LIKE: noteId]]
+  {
+    re: /\[\[XHS_LIKE:\s*(.+?)\]\]/g,
+    toDirective: (m) => ({ type: "xhs_like", noteId: m[1].trim() })
+  },
+  // [[XHS_FAV: noteId]]
+  {
+    re: /\[\[XHS_FAV:\s*(.+?)\]\]/g,
+    toDirective: (m) => ({ type: "xhs_fav", noteId: m[1].trim() })
+  },
+  // [[XHS_COMMENT: noteId | text]]
+  {
+    re: /\[\[XHS_COMMENT:\s*([^|]+?)\s*\|\s*([^\]]+?)\]\]/g,
+    toDirective: (m) => ({ type: "xhs_comment", noteId: m[1].trim(), text: m[2].trim() })
+  },
+  // [[XHS_REPLY: noteId | commentId | text]]
+  {
+    re: /\[\[XHS_REPLY:\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^\]]+?)\]\]/g,
+    toDirective: (m) => ({
+      type: "xhs_reply",
+      noteId: m[1].trim(),
+      commentId: m[2].trim(),
+      text: m[3].trim()
+    })
+  },
+  // [[XHS_POST: title | content | tags]]   (用 s flag 兼容多行 content)
+  {
+    re: /\[\[XHS_POST:\s*([^|]+?)\s*\|\s*([\s\S]+?)\s*\|\s*([^\]]+?)\]\]/g,
+    toDirective: (m) => ({
+      type: "xhs_post",
+      title: m[1].trim(),
+      content: m[2].trim(),
+      tags: m[3].trim()
+    })
+  },
+  // [[XHS_SHARE: 3]]
+  {
+    re: /\[\[XHS_SHARE:\s*(\d+)\]\]/g,
+    toDirective: (m) => ({ type: "xhs_share", idx: Number(m[1]) })
+  },
+  // [[LIFE:MED|布洛芬]] 生活记录代记 — 跟 chatParser.ts 的 `\[\[LIFE:[^\]]*\]\]` 同口径,
+  // 冒号后整段原样带走, 不在这里拆 verb/args (那份解析在 lifeRecords.parseLifeDirective)。
+  {
+    re: /\[\[LIFE:([^\]]*)\]\]/g,
+    toDirective: (m) => ({ type: "life_record", body: m[1] })
+  },
+  // [[NEWS_CARD: 来源|标题]] 分享热点卡片 — 跟 chatParser.ts:NEWS_CARD_RE 同口径。
+  {
+    re: /\[\[NEWS_CARD:\s*([^\]]*?)\s*\]\]/g,
+    toDirective: (m) => ({ type: "news_card", body: m[1] })
+  },
+  // 写日记 — 长形态: [[DIARY_START: title|mood]]\n content \n[[DIARY_END]]
+  // 短形态: [[DIARY: title|content]] 或 [[DIARY: content]] (无 title)
+  // 行为跟 applyAssistantPostProcessing.ts:465-495 字节对齐:
+  //   - 长形态 header 含 `|` → title|mood 切, 不含 `|` → 整段 = title
+  //   - 短形态 raw 含 `|` → title|content 切, 不含 `|` → 整段 = content (title 留空, 客户端兜底)
+  // 多行 content 用 [\s\S]*? 跨行, 别用 `s` flag (worker 端 esbuild target 默认 ok 但避免冗余)
+  {
+    re: /\[\[DIARY_START:\s*(.+?)\]\]\n?([\s\S]*?)\[\[DIARY_END\]\]/g,
+    toDirective: (m) => parseDiaryLong(m, "notion_write_diary")
+  },
+  {
+    re: /\[\[DIARY:\s*([\s\S]+?)\]\]/g,
+    toDirective: (m) => parseDiaryShort(m, "notion_write_diary")
+  },
+  // 飞书写日记 — 同形态, FS_ 前缀
+  {
+    re: /\[\[FS_DIARY_START:\s*(.+?)\]\]\n?([\s\S]*?)\[\[FS_DIARY_END\]\]/g,
+    toDirective: (m) => parseDiaryLong(m, "feishu_write_diary")
+  },
+  {
+    re: /\[\[FS_DIARY:\s*([\s\S]+?)\]\]/g,
+    toDirective: (m) => parseDiaryShort(m, "feishu_write_diary")
+  }
+];
+function parseDiaryLong(m, type) {
+  const header = m[1].trim();
+  const content = (m[2] || "").trim();
+  let title = "";
+  let mood = "";
+  if (header.includes("|")) {
+    const parts = header.split("|");
+    title = parts[0].trim();
+    mood = parts.slice(1).join("|").trim();
+  } else {
+    title = header;
+  }
+  return { type, title, content, mood: mood || void 0 };
+}
+function parseDiaryShort(m, type) {
+  const raw = m[1].trim();
+  let title = "";
+  let content = "";
+  if (raw.includes("|")) {
+    const parts = raw.split("|");
+    title = parts[0].trim();
+    content = parts.slice(1).join("|").trim();
+  } else {
+    content = raw;
+  }
+  return { type, title, content };
+}
+function classifyLLMOutput(text2) {
+  const social = extractFriendFeedReplyTags(text2);
+  const visits = extractFriendFeedReplyTags(social.text, "HOME_VISIT_REPLY");
+  text2 = visits.text;
+  const toolCalls = [];
+  for (const spec of DATA_TAGS) {
+    const matches = Array.from(text2.matchAll(spec.re));
+    for (const m of matches) {
+      const args = spec.toArgs(m);
+      if (!args) continue;
+      toolCalls.push({
+        id: `call_${spec.toolName}_${toolCalls.length}_${Date.now().toString(36)}`,
+        type: "function",
+        function: { name: spec.toolName, arguments: JSON.stringify(args) }
+      });
+    }
+  }
+  if (toolCalls.length > 0) {
+    let prefix = text2;
+    for (const spec of DATA_TAGS) prefix = prefix.replace(spec.re, "");
+    prefix = prefix.trim();
+    if (social.actions.length) prefix += "\n" + social.actions.map((action) => "[[FRIEND_FEED_REPLY:" + JSON.stringify(action) + "]]").join("\n");
+    if (visits.actions.length) prefix += "\n" + visits.actions.map((action) => "[[HOME_VISIT_REPLY:" + JSON.stringify(action) + "]]").join("\n");
+    const sanitizedPrefix = sanitizeForNotification(prefix);
+    return { kind: "tool-request", prefix, sanitizedPrefix, toolCalls };
+  }
+  const directives = social.actions.map((action) => ({ type: "friend_feed_reply", action }));
+  directives.push(...visits.actions.map((action) => ({ type: "home_visit_reply", action })));
+  const { text: textAfterTransfers, events: transferEvents } = extractTransferCommands(visits.text);
+  for (const ev of transferEvents) {
+    if (ev.kind === "send") {
+      const amount = parseTransferAmount(ev.amount);
+      if (amount !== null) directives.push({ type: "transfer", amount });
+    } else if (ev.kind === "accept") {
+      directives.push({ type: "transfer_accept" });
+    } else {
+      directives.push({ type: "transfer_return" });
+    }
+  }
+  const scheduleParsed = extractScheduleChangeDirectives(textAfterTransfers);
+  const textAfterSchedule = scheduleParsed.cleanedText;
+  for (const d of scheduleParsed.directives) {
+    directives.push({ type: "change_schedule", time: d.startTime, activity: d.activity });
+  }
+  for (const spec of SIDE_EFFECT_TAGS) {
+    const matches = Array.from(textAfterSchedule.matchAll(spec.re));
+    for (const m of matches) {
+      const d = spec.toDirective(m);
+      if (d) directives.push(d);
+    }
+  }
+  const dedupedDirectives = [];
+  const seenDirectives = /* @__PURE__ */ new Set();
+  for (const d of directives) {
+    const key = JSON.stringify(d);
+    if (seenDirectives.has(key)) {
+      console.warn("[classifier] \u540C\u4E00\u6761\u6D88\u606F\u91CC\u91CD\u590D\u7684\u526F\u4F5C\u7528, \u53EA\u4FDD\u7559\u7B2C\u4E00\u4E2A:", key);
+      continue;
+    }
+    seenDirectives.add(key);
+    dedupedDirectives.push(d);
+  }
+  let cleanedText = textAfterSchedule;
+  for (const spec of DATA_TAGS) cleanedText = cleanedText.replace(spec.re, "");
+  for (const spec of SIDE_EFFECT_TAGS) cleanedText = cleanedText.replace(spec.re, "");
+  cleanedText = cleanedText.trim();
+  const sanitizedBody = sanitizeForNotification(cleanedText);
+  return { kind: "finish", cleanedText, sanitizedBody, directives: dedupedDirectives };
+}
+
+// utils/mcpFireCore.ts
+var DEFAULT_MAX_TOOL_NAME_LEN = 64;
+var MCP_FIRE_NAME_PREFIX = "mcp__";
+var MCP_FIRE_NAME_BUDGET = DEFAULT_MAX_TOOL_NAME_LEN - MCP_FIRE_NAME_PREFIX.length;
+var sanitizeMcpToolName = (name, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => {
+  const len = Math.max(1, maxLen);
+  return (name || "tool").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, len);
+};
+var withMcpDedupeSuffix = (base, i, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => {
+  const suffix = `_${i}`;
+  return base.slice(0, Math.max(0, maxLen - suffix.length)) + suffix;
+};
+var serverSlug = (server, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => sanitizeMcpToolName(server.name, maxLen).slice(0, 20);
+var buildMcpNameMap = (servers, opts = {}) => {
+  const maxLen = opts.maxNameLen ?? DEFAULT_MAX_TOOL_NAME_LEN;
+  const resolve = /* @__PURE__ */ new Map();
+  for (const server of servers) {
+    for (const t of server.tools || []) {
+      let exposed = sanitizeMcpToolName(t.name, maxLen);
+      if (resolve.has(exposed)) {
+        const prefixed = sanitizeMcpToolName(`${serverSlug(server, maxLen)}_${t.name}`, maxLen);
+        exposed = prefixed;
+        let i = 2;
+        while (resolve.has(exposed)) exposed = withMcpDedupeSuffix(prefixed, i++, maxLen);
+      }
+      resolve.set(exposed, { server, toolName: t.name, tool: t });
+    }
+  }
+  return resolve;
+};
+var MCP_RESULT_MAX_CHARS = 2e4;
+var formatMcpToolResult = (data) => {
+  let s;
+  try {
+    s = typeof data === "string" ? data : JSON.stringify(data);
+  } catch {
+    s = String(data);
+  }
+  return s.length > MCP_RESULT_MAX_CHARS ? `${s.slice(0, MCP_RESULT_MAX_CHARS)}\u2026[\u7ED3\u679C\u8FC7\u957F\u5DF2\u622A\u65AD, \u5168\u6587\u5171 ${s.length} \u5B57\u7B26]` : s;
+};
+var stripTextFakedMcpCalls = (content, calls) => {
+  let cleaned = content;
+  for (const call of calls) cleaned = cleaned.split(call.matched).join("");
+  return cleaned.replace(/\n{3,}/g, "\n\n").trim();
+};
+var escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+var stripQuotes2 = (s) => {
+  const t = s.trim();
+  const m = t.match(/^(['"`「『])([\s\S]*)(['"`」』])$/);
+  return m ? m[2] : t;
+};
+var positionalKeys = (schema) => {
+  const props = schema?.properties ? Object.keys(schema.properties) : [];
+  const req = Array.isArray(schema?.required) ? schema.required.filter((k) => props.includes(k)) : [];
+  return [...req, ...props.filter((k) => !req.includes(k))];
+};
+var coerceBySchema = (value, schema, key) => {
+  const type = schema?.properties?.[key]?.type;
+  const v = stripQuotes2(value);
+  if (type === "number" || type === "integer") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return type === "integer" ? Math.trunc(n) : n;
+  }
+  if (type === "boolean") {
+    if (/^(true|是|开)$/i.test(v)) return true;
+    if (/^(false|否|关)$/i.test(v)) return false;
+  }
+  return v;
+};
+var splitTopLevel = (s) => {
+  const out = [];
+  let depth = 0, cur = "", quote = "";
+  for (const ch of s) {
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "{" || ch === "[") depth++;
+    if (ch === "}" || ch === "]") depth--;
+    if (ch === "," && depth === 0) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+};
+var parseFakedArgs = (inner, schema) => {
+  const t = inner.trim();
+  if (!t) return {};
+  if (t.startsWith("{")) {
+    try {
+      return JSON.parse(t);
+    } catch {
+    }
+    try {
+      return JSON.parse(t.replace(/,\s*([}\]])/g, "$1").replace(/'/g, '"').replace(/([{,]\s*)([a-zA-Z_]\w*)\s*:/g, '$1"$2":'));
+    } catch {
+    }
+  }
+  const parts = splitTopLevel(t);
+  if (parts.every((p) => /^\s*[A-Za-z_]\w*\s*[=:]/.test(p))) {
+    const args2 = {};
+    for (const p of parts) {
+      const m = p.match(/^\s*([A-Za-z_]\w*)\s*[=:]\s*([\s\S]*)$/);
+      if (m) args2[m[1]] = coerceBySchema(m[2], schema, m[1]);
+    }
+    return args2;
+  }
+  const keys = positionalKeys(schema);
+  const args = {};
+  parts.forEach((p, i) => {
+    const key = keys[i];
+    if (key) args[key] = coerceBySchema(p, schema, key);
+  });
+  return args;
+};
+var extractTextFakedMcpCalls = (content, resolve, opts = {}) => {
+  if (!content || !resolve.size) return [];
+  const lookup = /* @__PURE__ */ new Map();
+  for (const [exposed, hit] of resolve) {
+    lookup.set(exposed, { exposed, hit });
+    lookup.set(hit.toolName, { exposed, hit });
+    if (opts.alsoMatchPrefix) lookup.set(`${opts.alsoMatchPrefix}${exposed}`, { exposed, hit });
+  }
+  const found = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const [name, { exposed, hit }] of lookup) {
+    const schema = hit.tool.inputSchema;
+    const esc = escapeRegExp(name);
+    const parenRe = new RegExp(`(^|[^\\w./])${esc}\\s*\\(([^)]*)\\)`, "g");
+    for (const m of content.matchAll(parenRe)) {
+      const matched = m[0].slice(m[1].length);
+      const key = `${exposed}|${matched}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      found.push({
+        exposedName: exposed,
+        server: hit.server,
+        toolName: hit.toolName,
+        args: parseFakedArgs(m[2], schema),
+        matched,
+        index: (m.index ?? 0) + m[1].length
+      });
+    }
+    const colonRe = new RegExp(`(^|\\n)\\s*[>*-]*\\s*\`?${esc}\`?\\s*[:\uFF1A]\\s*([^\\n]+)`, "g");
+    for (const m of content.matchAll(colonRe)) {
+      const matched = m[0].slice(m[1].length);
+      const key = `${exposed}|${matched.trim()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const keys = positionalKeys(schema);
+      const value = stripQuotes2(m[2].replace(/[。！？!?…\s]+$/, ""));
+      found.push({
+        exposedName: exposed,
+        server: hit.server,
+        toolName: hit.toolName,
+        args: keys.length ? { [keys[0]]: coerceBySchema(value, schema, keys[0]) } : {},
+        matched,
+        index: (m.index ?? 0) + m[1].length
+      });
+    }
+  }
+  return found.sort((a, b) => a.index - b.index).map(({ index: _index, ...call }) => call);
+};
+var MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION = "2025-11-25";
+var MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS = [
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26"
+];
+var MCP_REQUEST_TIMEOUT_MS = 6e4;
+var createMcpSessionState = () => ({
+  sessionId: null,
+  initialized: false,
+  initPromise: null,
+  protocolVersion: null,
+  serverInfo: null,
+  serverCapabilities: null,
+  nextId: 0
+});
+var buildRpcRequest = (session, method, params, isNotification = false) => {
+  const req = { jsonrpc: "2.0", method, params };
+  if (!isNotification) req.id = ++session.nextId;
+  return req;
+};
+var parseSse = (text2) => {
+  const dataLines = [];
+  for (const line of text2.split("\n")) {
+    if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5));
+  }
+  for (let i = dataLines.length - 1; i >= 0; i--) {
+    try {
+      return JSON.parse(dataLines[i]);
+    } catch {
+    }
+  }
+  return null;
+};
+var parseResp = (text2, contentType) => {
+  if (contentType.includes("text/event-stream") || /^\s*(event:|data:)/.test(text2)) {
+    const parsed = parseSse(text2);
+    if (parsed) return parsed;
+  }
+  try {
+    return JSON.parse(text2);
+  } catch {
+    const m = text2.match(/\{[\s\S]*\}/);
+    if (m) {
+      try {
+        return JSON.parse(m[0]);
+      } catch {
+      }
+    }
+    throw new Error(`MCP: \u65E0\u6CD5\u89E3\u6790\u54CD\u5E94: ${text2.slice(0, 300)}`);
+  }
+};
+var readSseResponse = async (resp, expectedId) => {
+  const reader = resp.body?.getReader();
+  if (!reader) return parseResp(await resp.text(), "text/event-stream");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const parseEvent = (event) => {
+    const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+    if (!data || data === "[DONE]") return null;
+    try {
+      const parsed = JSON.parse(data);
+      return expectedId == null || parsed.id === expectedId ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const parsed = parseEvent(event);
+        if (parsed) return parsed;
+      }
+      if (done) {
+        const parsed = parseEvent(buffer);
+        if (parsed) return parsed;
+        throw new Error("MCP SSE \u6D41\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u6536\u5230\u672C\u6B21\u8BF7\u6C42\u7684\u54CD\u5E94");
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {
+    });
+  }
+};
+var postCore = async (target, session, body, timeoutMs, expectResponse = true) => {
+  target.signal?.throwIfAborted();
+  const headers = target.headers(session.sessionId, session.protocolVersion);
+  let resp;
+  const controller = new AbortController();
+  const abort = () => controller.abort(target.signal?.reason);
+  target.signal?.addEventListener("abort", abort, { once: true });
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    try {
+      resp = await fetch(target.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+    } catch (e) {
+      target.signal?.throwIfAborted();
+      if (controller.signal.aborted) {
+        throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
+      }
+      const hint = target.fetchErrorHint || "";
+      throw new Error(`MCP \u8BF7\u6C42\u5931\u8D25: ${e?.message || e}\u3002${hint}`);
+    }
+    const readText = async () => {
+      try {
+        return await resp.text();
+      } catch (e) {
+        target.signal?.throwIfAborted();
+        if (controller.signal.aborted) {
+          throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
+        }
+        throw e;
+      }
+    };
+    const newSid = resp.headers.get("Mcp-Session-Id") || resp.headers.get("mcp-session-id");
+    if (newSid) session.sessionId = newSid;
+    if (resp.status === 401 || resp.status === 403) {
+      const txt = await readText().catch(() => "");
+      throw new Error(`MCP \u9274\u6743\u5931\u8D25 (${resp.status}): Token \u53EF\u80FD\u65E0\u6548\u6216\u8FC7\u671F\u3002${txt.slice(0, 120)}`);
+    }
+    if (resp.status === 202) return { response: null };
+    if (!resp.ok) {
+      const txt = await readText().catch(() => "");
+      throw new Error(`MCP HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+    }
+    if (!expectResponse) return { response: null };
+    const ct = resp.headers.get("content-type") || "";
+    try {
+      if (ct.includes("text/event-stream")) {
+        return { response: await readSseResponse(resp, body.id) };
+      }
+      const text2 = await readText();
+      return { response: parseResp(text2, ct) };
+    } catch (e) {
+      target.signal?.throwIfAborted();
+      if (controller.signal.aborted) {
+        throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
+      }
+      throw e;
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    target.signal?.removeEventListener("abort", abort);
+  }
+};
+var formatMcpRpcError = (err6) => {
+  const code = err6?.code !== void 0 ? `[${err6.code}]: ` : "";
+  const message = err6?.message || "\u672A\u77E5\u9519\u8BEF";
+  let dataText = "";
+  if (err6?.data !== void 0 && err6?.data !== null && err6?.data !== "") {
+    if (typeof err6.data === "string") {
+      dataText = err6.data.trim();
+    } else {
+      try {
+        dataText = JSON.stringify(err6.data);
+      } catch {
+        dataText = String(err6.data);
+      }
+    }
+  }
+  const suffix = dataText && !message.includes(dataText) ? `\uFF08${dataText}\uFF09` : "";
+  return `${code}${message}${suffix}`;
+};
+var initializeCore = async (target, session, timeoutMs) => {
+  const initReq = buildRpcRequest(session, "initialize", {
+    protocolVersion: MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "sullyos", title: "SullyOS", version: "1.0.0" }
+  });
+  const { response } = await postCore(target, session, initReq, timeoutMs);
+  if (response?.error) throw new Error(`Initialize \u5931\u8D25 ${formatMcpRpcError(response.error)}`);
+  const negotiated = String(
+    response?.result?.protocolVersion || MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION
+  );
+  if (!MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS.includes(negotiated)) {
+    throw new Error(
+      `MCP \u534F\u8BAE\u7248\u672C\u4E0D\u517C\u5BB9\uFF1A\u670D\u52A1\u5668\u9009\u62E9\u4E86 ${negotiated}\u3002SullyOS \u7684 Streamable HTTP \u63A5\u7EBF\u652F\u6301 ${MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS.join(" / ")}\uFF1B2024-11-05 \u5C5E\u4E8E\u65E7 HTTP+SSE \u53CC\u7AEF\u70B9\uFF0C2026-07-28 \u5219\u9700\u8981\u65B0\u7684\u65E0\u63E1\u624B\u751F\u547D\u5468\u671F\u3002`
+    );
+  }
+  session.protocolVersion = negotiated;
+  session.serverInfo = response?.result?.serverInfo || null;
+  session.serverCapabilities = response?.result?.capabilities || null;
+  const notif = buildRpcRequest(session, "notifications/initialized", {}, true);
+  await postCore(target, session, notif, timeoutMs, false).catch(() => {
+  });
+  session.initialized = true;
+};
+var ensureInitializedCore = async (target, session, timeoutMs) => {
+  if (session.initialized) return;
+  if (!session.initPromise) {
+    session.initPromise = initializeCore(target, session, timeoutMs).catch((e) => {
+      session.initPromise = null;
+      throw e;
+    });
+  }
+  await session.initPromise;
+};
+var isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+var resolveLocalSchemaRef = (schema, rootSchema) => {
+  const ref = typeof schema?.$ref === "string" ? schema.$ref : "";
+  if (!ref.startsWith("#/")) return schema;
+  const resolved = ref.slice(2).split("/").reduce((current, part) => {
+    const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
+    return current?.[key];
+  }, rootSchema);
+  return resolved || schema;
+};
+var schemaAccepts = (schema, kind) => {
+  const types = Array.isArray(schema?.type) ? schema.type : [schema?.type];
+  if (types.includes(kind)) return true;
+  if (kind === "object" && schema?.properties) return true;
+  if (kind === "array" && schema?.items) return true;
+  return [...schema?.oneOf || [], ...schema?.anyOf || []].some((item) => schemaAccepts(item, kind));
+};
+var normalizeMcpValueBySchema = (value, rawSchema, rootSchema, depth) => {
+  if (!rawSchema || depth > 20) return value;
+  const schema = resolveLocalSchemaRef(rawSchema, rootSchema);
+  const acceptsObject = schemaAccepts(schema, "object");
+  const acceptsArray = schemaAccepts(schema, "array");
+  let normalized = value;
+  if (typeof normalized === "string" && (acceptsObject || acceptsArray)) {
+    for (let i = 0; i < 3 && typeof normalized === "string"; i++) {
+      const text2 = normalized.trim();
+      if (!text2) break;
+      try {
+        normalized = JSON.parse(text2);
+      } catch {
+        break;
+      }
+    }
+    const decodedMatchesSchema = acceptsObject && isRecord(normalized) || acceptsArray && Array.isArray(normalized);
+    if (!decodedMatchesSchema) normalized = value;
+  }
+  const alternatives = [...schema?.oneOf || [], ...schema?.anyOf || []];
+  if (alternatives.length) {
+    const matching = alternatives.find(
+      (item) => isRecord(normalized) && schemaAccepts(item, "object") || Array.isArray(normalized) && schemaAccepts(item, "array")
+    );
+    if (matching) normalized = normalizeMcpValueBySchema(normalized, matching, rootSchema, depth + 1);
+  }
+  if (isRecord(normalized) && acceptsObject) {
+    const result = { ...normalized };
+    const properties = schema?.properties || {};
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (key in result) result[key] = normalizeMcpValueBySchema(result[key], childSchema, rootSchema, depth + 1);
+    }
+    if (schema?.additionalProperties && typeof schema.additionalProperties === "object") {
+      for (const key of Object.keys(result)) {
+        if (!(key in properties)) {
+          result[key] = normalizeMcpValueBySchema(result[key], schema.additionalProperties, rootSchema, depth + 1);
+        }
+      }
+    }
+    for (const item of schema?.allOf || []) {
+      const merged = normalizeMcpValueBySchema(result, item, rootSchema, depth + 1);
+      if (isRecord(merged)) Object.assign(result, merged);
+    }
+    return result;
+  }
+  if (Array.isArray(normalized) && acceptsArray && schema?.items) {
+    return normalized.map((item) => normalizeMcpValueBySchema(item, schema.items, rootSchema, depth + 1));
+  }
+  return normalized;
+};
+var normalizeMcpToolArguments = (args, inputSchema) => normalizeMcpValueBySchema(args, inputSchema, inputSchema, 0);
+var targetHost = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+};
+var callMcpToolCore = async (target, session, toolName, args = {}, opts = {}) => {
+  target = { ...target, signal: opts.signal ?? target.signal };
+  target.signal?.throwIfAborted();
+  const timeoutMs = opts.timeoutMs ?? MCP_REQUEST_TIMEOUT_MS;
+  const normalizedArgs = normalizeMcpToolArguments(args, opts.inputSchema);
+  const finish = (result) => {
+    let resultPreview = "";
+    if (result.success) {
+      try {
+        resultPreview = JSON.stringify(result.data).slice(0, 800);
+      } catch {
+        resultPreview = String(result.data).slice(0, 800);
+      }
+    }
+    console.info("\u{1F50C} [MCP] tools/call \u5B8C\u6210", {
+      server: opts.serverLabel ?? targetHost(target.url),
+      tool: toolName,
+      args: normalizedArgs,
+      success: result.success,
+      ...result.success ? { result: resultPreview } : { error: result.error }
+    });
+    return result;
+  };
+  try {
+    await ensureInitializedCore(target, session, timeoutMs);
+    const body = buildRpcRequest(session, "tools/call", { name: toolName, arguments: normalizedArgs });
+    let response;
+    try {
+      ({ response } = await postCore(target, session, body, timeoutMs));
+    } catch (e) {
+      if (/HTTP (400|404)/.test(e?.message || "")) {
+        Object.assign(session, createMcpSessionState());
+        await ensureInitializedCore(target, session, timeoutMs);
+        ({ response } = await postCore(
+          target,
+          session,
+          buildRpcRequest(session, "tools/call", { name: toolName, arguments: normalizedArgs }),
+          timeoutMs
+        ));
+      } else {
+        throw e;
+      }
+    }
+    if (!response) return finish({ success: false, error: "\u7A7A\u54CD\u5E94" });
+    if (response.error) return finish({ success: false, error: `MCP \u9519\u8BEF ${formatMcpRpcError(response.error)}` });
+    const result = response.result;
+    if (result?.resultType === "input_required") {
+      return finish({
+        success: false,
+        error: "\u8FD9\u4E2A\u5DE5\u5177\u9700\u8981\u5728\u6267\u884C\u9014\u4E2D\u8865\u5145\u786E\u8BA4\u6216\u8F93\u5165\uFF1BSullyOS \u5F53\u524D\u4E0D\u4F1A\u66FF\u4F60\u81EA\u52A8\u56DE\u7B54\uFF0C\u8BF7\u56DE\u5230\u804A\u5929\u4E2D\u660E\u786E\u8981\u6C42\u540E\u91CD\u8BD5\u3002",
+        data: result
+      });
+    }
+    if (result?.content && Array.isArray(result.content)) {
+      const textParts = result.content.filter((c) => c?.type === "text").map((c) => c.text || "");
+      const fullText = textParts.join("\n").trim();
+      if (result.isError) return finish({ success: false, error: fullText || "MCP \u5DE5\u5177\u6267\u884C\u5931\u8D25", rawText: fullText });
+      try {
+        return finish({ success: true, data: JSON.parse(fullText), rawText: fullText });
+      } catch {
+        return finish({ success: true, data: fullText, rawText: fullText });
+      }
+    }
+    return finish({ success: true, data: result });
+  } catch (e) {
+    target.signal?.throwIfAborted();
+    return finish({ success: false, error: e?.message || String(e) });
+  }
+};
+var buildMcpDirectHeaders = (server, sessionId, protocolVersion = null) => {
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream"
+  };
+  for (const item of server.customHeaders || []) {
+    const name = String(item?.name || "").trim();
+    const value = String(item?.value || "").trim();
+    if (name && value) headers[name] = value;
+  }
+  if (server.token) headers["Authorization"] = `Bearer ${server.token}`;
+  if (sessionId) headers["Mcp-Session-Id"] = sessionId;
+  if (protocolVersion) headers["MCP-Protocol-Version"] = protocolVersion;
+  return headers;
+};
+var filterMcpServersForChar = (servers, charId) => (servers || []).filter(
+  (s) => !!s.url && (s.tools?.length || 0) > 0 && (!s.charIds?.length || s.charIds.includes(charId))
+);
+var buildMcpFireTools = (resolve) => {
+  const multiServer = new Set([...resolve.values()].map(({ server }) => server.id)).size > 1;
+  const tools = [];
+  for (const [exposed, { server, tool }] of resolve) {
+    const desc = (tool.description || "").trim();
+    tools.push({
+      type: "function",
+      function: {
+        name: `${MCP_FIRE_NAME_PREFIX}${exposed}`,
+        description: multiServer ? `[${server.name}] ${desc}`.trim() : desc,
+        parameters: tool.inputSchema || { type: "object", properties: {} }
+      }
+    });
+  }
+  return tools;
+};
+var buildMcpFireBlock = (resolve, opts) => {
+  if (!resolve.size) return "";
+  const userName = opts.userName || "\u7528\u6237";
+  const multiServer = new Set([...resolve.values()].map(({ server }) => server.id)).size > 1;
+  const lines = [];
+  for (const [exposed, { server, tool }] of resolve) {
+    const desc = (tool.description || "").trim();
+    if (opts.mode === "native") {
+      lines.push(`- ${exposed}${desc ? `\uFF1A${desc}` : ""}${multiServer ? `\uFF08\u6765\u6E90: ${server.name}\uFF09` : ""}`);
+      continue;
+    }
+    const schema = tool.inputSchema || {};
+    const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const args = Object.entries(schema.properties || {}).map(([name, d]) => `${name}${required.has(name) ? "*" : ""}:${d?.type || "any"}`);
+    lines.push(`- ${exposed}(${args.join(", ")})${desc ? `\uFF1A${desc}` : ""}${multiServer ? `\uFF08\u6765\u6E90: ${server.name}\uFF09` : ""}`);
+  }
+  const howTo = opts.mode === "native" ? "\u9700\u8981\u65F6\u76F4\u63A5\u901A\u8FC7\u7CFB\u7EDF\u7684\u5DE5\u5177\u8C03\u7528\u63A5\u53E3\u53D1\u8D77\uFF08\u7CFB\u7EDF\u4F1A\u81EA\u52A8\u6267\u884C\u5E76\u628A\u7ED3\u679C\u7ED9\u4F60\uFF09\uFF0C\u4E0D\u8981\u628A\u5DE5\u5177\u540D\u548C\u53C2\u6570\u5199\u8FDB\u6B63\u6587\u3002" : '\u9700\u8981\u5DE5\u5177\u65F6\uFF0C\u5355\u72EC\u8F93\u51FA\u4E00\u884C tool_name({"\u53C2\u6570":"\u503C"})\uFF0C\u7CFB\u7EDF\u4F1A\u4EE3\u4E3A\u6267\u884C\u5E76\u628A\u7ED3\u679C\u7ED9\u4F60\uFF0C\u7136\u540E\u4F60\u7EE7\u7EED\u5199\u3002* \u8868\u793A\u5FC5\u586B\u53C2\u6570\u3002';
+  return [
+    "",
+    "---",
+    `\u3010\u5916\u90E8\u5DE5\u5177 \u2014\u2014 ${userName} \u5728\u8BBE\u7F6E\u91CC\u7ED9\u4F60\u8FDE\u4E86 MCP \u5DE5\u5177\u670D\u52A1\u5668\uFF0C\u4E3B\u52A8\u6D88\u606F\u91CC\u4E5F\u53EF\u4EE5\u7528\u3011`,
+    howTo,
+    "\u7EAA\u5F8B\uFF1A\u4E0D\u9700\u8981\u5C31\u522B\u786C\u8C03\uFF1B\u6CA1\u6536\u5230\u7CFB\u7EDF\u8FD4\u56DE\u524D\u4E0D\u8981\u58F0\u79F0\u5DE5\u5177\u6210\u529F\uFF0C\u4E5F\u4E0D\u8981\u7F16\u9020\u7ED3\u679C\uFF1B\u5DE5\u5177\u5931\u8D25\u5C31\u6362\u4E2A\u65B9\u5F0F\u6216\u5982\u5B9E\u5E26\u8FC7\uFF1B\u7ED3\u679C\u53EA\u6311\u76F8\u5173\u90E8\u5206\u7528\u89D2\u8272\u8BED\u6C14\u8F6C\u8FF0\uFF0C\u522B\u590D\u8BFB JSON\u3002",
+    "\u591A\u6B65\u4EFB\u52A1\uFF1A\u5148\u505A\u5FC5\u8981\u68C0\u67E5\uFF0C\u968F\u540E\u7ACB\u523B\u8C03\u7528\u80FD\u63A8\u8FDB\u76EE\u6807\u7684\u52A8\u4F5C\u5DE5\u5177\uFF1B\u4E0D\u8981\u53CD\u590D\u8BFB\u53D6\u540C\u4E00\u4EFD\u8BF4\u660E\u6216\u72B6\u6001\u3002\u6267\u884C\u52A8\u4F5C\u540E\u53EF\u4EE5\u518D\u6B21\u68C0\u67E5\u65B0\u72B6\u6001\uFF0C\u5E76\u7EE7\u7EED\u5230\u76EE\u6807\u5B8C\u6210\u6216\u5DE5\u5177\u660E\u786E\u5931\u8D25\u3002",
+    `\u526F\u4F5C\u7528\u64CD\u4F5C\uFF1A${userName} \u5728\u6700\u65B0\u6D88\u606F\u91CC\u5DF2\u7ECF\u660E\u786E\u8981\u6C42\u6267\u884C\u7684\u89C6\u4E3A\u5DF2\u786E\u8BA4\uFF1B\u6CA1\u6709\u660E\u786E\u8981\u6C42\u65F6\u624D\u5148\u786E\u8BA4\u3002`,
+    "\u53EF\u7528\u5DE5\u5177\uFF1A",
+    ...lines,
+    "---"
+  ].join("\n");
+};
 
 // utils/amsg2ExpireGuard.ts
 var FIRE_GRACE_MS = 9e4;
@@ -11635,6 +13414,8 @@ var AMSG2_SCHEDULE_SECRECY_NOTE = "\u4E0D\u8981\u5411\u7528\u6237\u590D\u8FF0\u6
 var AMSG2_SCHEDULE_NOT_YET_NOTE = "\u6392\u5728\u672A\u6765\u7684\u4E8B\u5230\u70B9\u81EA\u5DF1\u4F1A\u54CD\uFF0C\u4E0D\u7528\u4F60\u73B0\u5728\u63D0\u524D\u66FF\u5B83\u5F00\u53E3\u2014\u2014\u8FD8\u6CA1\u5230\u90A3\u4E2A\u65F6\u523B\u7684\u5C31\u8BA9\u5B83\u5B89\u9759\u5F85\u7740\uFF0C\u522B\u6BCF\u8F6E\u90FD\u62FF\u5B83\u8D77\u8BDD\u5934\u3001\u8FFD\u7740\u95EE\u8FDB\u5C55\u3002\u5BF9\u65B9\u81EA\u5DF1\u63D0\u8D77\uFF0C\u6216\u8005\u771F\u5230\u4E86\u90A3\u4E2A\u70B9\uFF0C\u624D\u662F\u8BF4\u5B83\u7684\u65F6\u5019\u3002";
 var describeExpirePolicy = (policy) => policy === "force" ? "\u5230\u70B9\u5FC5\u53D1" : "\u5230\u70B9\u770B\u60C5\u51B5";
 var describeTaskMode = (task) => {
+  if (task.away) return "\u79BB\u5F00\u540E\u6D88\u606F";
+  if (task.dateLeave) return "\u89C1\u9762\u79BB\u5F00\u63D0\u9192";
   if (task.mode === "fixed") return "\u56FA\u5B9A\u6D88\u606F";
   if (task.mode === "prompted") return `\u63D0\u793A\u65B9\u5411\u300C${task.promptHint || ""}\u300D`;
   return task.promptHint ? `\u81EA\u52A8\uFF08\u7075\u611F\uFF1A${task.promptHint}\uFF09` : "\u81EA\u52A8";
@@ -11831,6 +13612,10 @@ var buildTaskInstruction = (mode, promptHint) => {
     promptHint?.trim() ? `\u53EF\u9009\u7075\u611F\u8865\u5145\uFF1A${promptHint.trim()}` : "\u53EF\u9009\u7075\u611F\u8865\u5145\uFF1A\u65E0"
   ].join("\n");
 };
+var AMSG_AWAY_MESSAGE_META = "amsgAwayMessage";
+var AMSG_AWAY_DELAY_META = "amsgAwayDelayMinutes";
+var AMSG_DATE_LEAVE_META = "amsgDateLeave";
+var AMSG_DATE_LEAVE_DELAY_META = "amsgDateLeaveDelayMinutes";
 var pad22 = (n) => n.toString().padStart(2, "0");
 var hasExplicitOffset = (s) => /(?:Z|[+-]\d{2}:?\d{2})$/i.test(s.trim());
 var wallClockIso = (ms, tz) => {
@@ -11947,10 +13732,10 @@ var parseFireRenewSendAt = (raw, nowMs, tz) => {
   }
   return { sendAt: new Date(sendAtMs).toISOString() };
 };
-var escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+var escapeRegExp2 = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 var extractFireScheduleTextCalls = (content) => {
   if (!content) return [];
-  const re = new RegExp(`(^|[^\\w./])${escapeRegExp(AMSG_FIRE_SCHEDULE_TOOL)}\\s*\\(([^)]*)\\)`, "g");
+  const re = new RegExp(`(^|[^\\w./])${escapeRegExp2(AMSG_FIRE_SCHEDULE_TOOL)}\\s*\\(([^)]*)\\)`, "g");
   const calls = [];
   const executable = content.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g, (match) => " ".repeat(match.length));
   for (const m of executable.matchAll(re)) {
@@ -11966,13 +13751,750 @@ var extractFireScheduleTextCalls = (content) => {
   return calls;
 };
 
+// utils/vrWorld/sarEnvelopeCore.ts
+var planFromSARModuleSnapshot = (snapshot) => {
+  if (!snapshot || !snapshot.character && !snapshot.user) return null;
+  const character2 = snapshot.character;
+  const user = snapshot.user;
+  const hasActiveEffect = character2?.phase === "active" || user?.phase === "active";
+  const hasAfterglow = character2?.phase === "afterglow" || user?.phase === "afterglow";
+  return { character: character2, user, hasActiveEffect, hasAfterglow, requiresEnvelope: hasActiveEffect };
+};
+var isPlainSARChatActionOnlyChunk = (text2) => {
+  const clean = text2.trim();
+  if (!clean) return false;
+  return /^(?:(?:（[^（）]*）|\([^()]*\)|\*[^*\n]+\*)\s*)+[。！？!?…～~—-]*$/s.test(clean);
+};
+var isSARChatActionOnlyChunk = (text2) => {
+  const bilingualParts = text2.split(/%%BILINGUAL%%/i).map((part) => part.trim()).filter(Boolean);
+  return bilingualParts.length > 0 && bilingualParts.every(isPlainSARChatActionOnlyChunk);
+};
+var isSARChatHtmlPlaceholder = (text2) => /^\[HTML\s*卡片\]$/i.test(text2.trim());
+var consumeSARChatSurfaceChunk = (canonicalChunk, surfaceChunks, startIndex) => {
+  let index = Math.max(0, startIndex);
+  if (isSARChatHtmlPlaceholder(canonicalChunk)) {
+    if (surfaceChunks[index] && isSARChatHtmlPlaceholder(surfaceChunks[index])) index += 1;
+    return { nextIndex: index };
+  }
+  if (isSARChatActionOnlyChunk(canonicalChunk)) {
+    if (surfaceChunks[index] && isSARChatActionOnlyChunk(surfaceChunks[index])) index += 1;
+    return { nextIndex: index };
+  }
+  while (surfaceChunks[index] && (isSARChatActionOnlyChunk(surfaceChunks[index]) || isSARChatHtmlPlaceholder(surfaceChunks[index]))) index += 1;
+  const surface = surfaceChunks[index];
+  return { surface, nextIndex: surface === void 0 ? index : index + 1 };
+};
+var tag = (raw, name) => {
+  const match = raw.match(new RegExp(`<${name}>\\s*([\\s\\S]*?)\\s*</${name}>`, "i"));
+  const value = match?.[1]?.trim();
+  return value || void 0;
+};
+var parseSARModuleReply = (raw, plan) => {
+  if (!plan.requiresEnvelope) return { canonical: raw, enveloped: false };
+  const body = tag(raw, "SAR_MODULE_OUTPUT") || raw;
+  const canonical = tag(body, "CHAR_TRUE");
+  if (!canonical) return { canonical: raw.trim(), enveloped: false };
+  return {
+    canonical,
+    assistantSurface: plan.character?.phase === "active" ? tag(body, "CHAR_SURFACE") : void 0,
+    userSurface: plan.user?.phase === "active" ? tag(body, "USER_SURFACE") : void 0,
+    enveloped: true
+  };
+};
+var createSARModuleSurfaceMeta = (state, surface) => {
+  const clean = surface.trim();
+  if (!clean || state.phase !== "active") return void 0;
+  return {
+    version: 1,
+    runId: state.runId,
+    moduleId: state.moduleId,
+    moduleTitle: state.moduleTitle,
+    target: state.target,
+    phase: "active",
+    surface: clean,
+    canonicalField: "content",
+    surfaceField: "metadata.sarModuleSurface.surface"
+  };
+};
+
+// worker/amsg/src/sarEnvelope.ts
+var AMSG_SAR_META_KEY = "amsgSar";
+var amsgSarUserSurfaceKey = (clientTaskId) => `sar_user_surface:${clientTaskId}`;
+var amsgSarSnapshotKey = (clientTaskId) => `sar_snapshot:${clientTaskId}`;
+var amsgSarSurfaceKey = (clientTaskId, segmentIndex) => `sar_surface:${clientTaskId}:${segmentIndex}`;
+var SAR_SURFACE_BANNER_MAX = 100;
+var clipSarSurfaceBanner = (banner) => {
+  const chars = Array.from(banner);
+  return chars.length <= SAR_SURFACE_BANNER_MAX ? banner : `${chars.slice(0, SAR_SURFACE_BANNER_MAX - 1).join("")}\u2026`;
+};
+var isPlainObject2 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+var isSurfaceSource = (value) => isPlainObject2(value) && typeof value.phase === "string";
+var readSarSnapshot = (metadata) => {
+  const raw = metadata?.[AMSG_SAR_META_KEY];
+  if (!isPlainObject2(raw) || raw.v !== 1) return null;
+  if (raw.character !== void 0 && !isSurfaceSource(raw.character)) return null;
+  if (raw.user !== void 0 && !isSurfaceSource(raw.user)) return null;
+  return raw;
+};
+var stripSarSnapshot = (metadata) => {
+  const { [AMSG_SAR_META_KEY]: _snapshot, ...rest } = metadata ?? {};
+  return rest;
+};
+var SURFACE_BLOCK_RE = /<(CHAR_SURFACE|USER_SURFACE)>[\s\S]*?(?:<\/\1>|(?=<\/?(?:SAR_MODULE_OUTPUT|CHAR_TRUE|CHAR_SURFACE|USER_SURFACE)>)|$)/gi;
+var PLACEHOLDER = String.fromCharCode(5);
+var PLACEHOLDER_RE = new RegExp(`${PLACEHOLDER}(\\d+)${PLACEHOLDER}`, "g");
+var maskSarSurfaceBlocks = (text2) => {
+  const blocks = [];
+  const masked = text2.replace(SURFACE_BLOCK_RE, (block) => {
+    blocks.push(block);
+    return `${PLACEHOLDER}${blocks.length - 1}${PLACEHOLDER}`;
+  });
+  return {
+    masked,
+    restore: (value) => blocks.length === 0 ? value : value.replace(PLACEHOLDER_RE, (_m, n) => blocks[Number(n)] ?? "")
+  };
+};
+var ENVELOPE_TAG_RE = /<\/?(?:SAR_MODULE_OUTPUT|CHAR_TRUE|CHAR_SURFACE|USER_SURFACE)>/gi;
+var stripEnvelopeTags = (text2) => text2.replace(ENVELOPE_TAG_RE, "").trim();
+var closeOpenTag = (text2, name, stoppers) => {
+  const open = new RegExp(`<${name}>`, "i").exec(text2);
+  if (!open || new RegExp(`</${name}>`, "i").test(text2)) return text2;
+  const after = open.index + open[0].length;
+  const stop = new RegExp(stoppers.join("|"), "i").exec(text2.slice(after));
+  const at = stop ? after + stop.index : text2.length;
+  return `${text2.slice(0, at)}</${name}>${text2.slice(at)}`;
+};
+var repairEnvelope = (text2) => {
+  let repaired = closeOpenTag(text2, "CHAR_TRUE", ["<CHAR_SURFACE>", "<USER_SURFACE>", "</SAR_MODULE_OUTPUT>"]);
+  repaired = closeOpenTag(repaired, "CHAR_SURFACE", ["<USER_SURFACE>", "<CHAR_TRUE>", "</SAR_MODULE_OUTPUT>"]);
+  repaired = closeOpenTag(repaired, "USER_SURFACE", ["<CHAR_SURFACE>", "<CHAR_TRUE>", "</SAR_MODULE_OUTPUT>"]);
+  return repaired;
+};
+var parseSarEnvelopeRounds = (rounds, plan) => {
+  const texts = rounds.filter((round) => round.trim().length > 0);
+  if (!plan.requiresEnvelope) return { canonical: texts.join("\n"), enveloped: false, pieces: [] };
+  const pieces = [];
+  let enveloped = false;
+  let userSurface;
+  for (const text2 of texts) {
+    const parsed = parseSARModuleReply(repairEnvelope(text2), plan);
+    if (parsed.enveloped) {
+      enveloped = true;
+      if (parsed.userSurface) userSurface = parsed.userSurface;
+    }
+    const canonical = stripEnvelopeTags(parsed.canonical);
+    if (!canonical) continue;
+    const surface = parsed.enveloped && parsed.assistantSurface ? stripEnvelopeTags(parsed.assistantSurface) : "";
+    pieces.push({ canonical, ...surface ? { surface } : {} });
+  }
+  return {
+    canonical: pieces.map((p) => p.canonical).join("\n"),
+    enveloped,
+    pieces,
+    ...userSurface ? { userSurface } : {}
+  };
+};
+var isEmojiSegment = (seg) => /^\[\[SEND_EMOJI[:：]/i.test(seg.raw.trim());
+var isHtmlSegment = (seg) => /^\[html\][\s\S]*\[\/html\]$/i.test(seg.raw.trim());
+var TRANSLATION_BLOCK_RE = /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>([\s\S]*?)<\/译文>\s*<\/翻译>/;
+var alignKey = (seg) => {
+  const translation = seg.raw.match(TRANSLATION_BLOCK_RE);
+  if (translation) {
+    const original = translation[1].trim();
+    const translated = translation[2].trim();
+    return original && translated ? `${original}
+%%BILINGUAL%%
+${translated}` : original || translated;
+  }
+  return seg.sanitized;
+};
+var segmentSurface = (surfaceText) => {
+  const prepared = surfaceText.replace(/\[html\][\s\S]*?\[\/html\]/gi, "\n").replace(/\[\[[\s\S]*?\]\]/g, "");
+  return sanitizeIntoSegments(prepared).filter((seg) => !isEmojiSegment(seg) && !isHtmlSegment(seg));
+};
+var alignSarSurfaceSegments = (canonicalSegments, surfaceText) => {
+  const surfaceSegs = segmentSurface(surfaceText);
+  const surfaceKeys = surfaceSegs.map(alignKey);
+  let index = 0;
+  return canonicalSegments.map((seg) => {
+    if (isEmojiSegment(seg) || isHtmlSegment(seg)) return void 0;
+    const consumed = consumeSARChatSurfaceChunk(alignKey(seg), surfaceKeys, index);
+    index = consumed.nextIndex;
+    if (consumed.surface === void 0) return void 0;
+    const matched = surfaceSegs[consumed.nextIndex - 1];
+    return matched ? { surface: matched.raw, banner: matched.sanitized } : void 0;
+  });
+};
+var segmentCanonical = (text2) => {
+  const scan = classifyLLMOutput(text2);
+  return sanitizeIntoSegments(scan.kind === "finish" ? scan.cleanedText : scan.prefix);
+};
+var buildSarSurfaceSlots = (parse, segments) => {
+  const none = segments.map(() => void 0);
+  if (!parse.pieces.some((p) => p.surface)) return none;
+  if (parse.pieces.length === 1) return alignSarSurfaceSegments(segments, parse.pieces[0].surface ?? "");
+  const counts = parse.pieces.map((p) => segmentCanonical(p.canonical).length);
+  if (counts.reduce((a, b) => a + b, 0) !== segments.length) {
+    return alignSarSurfaceSegments(
+      segments,
+      parse.pieces.map((p) => p.surface).filter((s) => !!s).join("\n")
+    );
+  }
+  const slots = [];
+  let offset = 0;
+  parse.pieces.forEach((piece, i) => {
+    const slice = segments.slice(offset, offset + counts[i]);
+    offset += counts[i];
+    slots.push(...piece.surface ? alignSarSurfaceSegments(slice, piece.surface) : slice.map(() => void 0));
+  });
+  return slots;
+};
+
+// worker/amsg/src/agentic.ts
+var createFireSessionState = () => ({
+  narrations: [],
+  toolCalls: [],
+  duplicateToolCalls: 0,
+  mcpCallSeq: 0,
+  xhsShareNotes: null,
+  finalReasoning: null
+});
+var MAX_DUPLICATE_TOOL_CALLS = 2;
+var DEFAULT_TOOL_ITERATIONS = 5;
+var MCP_MAX_TOOL_ITERATIONS = 12;
+var resolveToolIterationBudget = (hasMcp) => hasMcp ? MCP_MAX_TOOL_ITERATIONS : DEFAULT_TOOL_ITERATIONS;
+var XHS_SHARE_TAG_RE = /\[\[XHS_SHARE:\s*\d+\]\]/;
+var XHS_DESC_MAX = 120;
+function buildXhsSessionPayload(directives, notes, xsecTokens) {
+  if (directives.length === 0) return null;
+  const sharedIdx = /* @__PURE__ */ new Set();
+  const refNoteIds = /* @__PURE__ */ new Set();
+  for (const d of directives) {
+    if (d.type === "xhs_share") sharedIdx.add(d.idx);
+    else if (d.type === "xhs_like" || d.type === "xhs_fav") refNoteIds.add(d.noteId);
+    else if (d.type === "xhs_comment" || d.type === "xhs_reply") refNoteIds.add(d.noteId);
+  }
+  if (sharedIdx.size === 0 && refNoteIds.size === 0) return null;
+  const pickedNotes = [];
+  for (const idx of [...sharedIdx].sort((a, b) => a - b)) {
+    const note = idx >= 1 ? notes?.[idx - 1] : void 0;
+    if (!note) continue;
+    pickedNotes.push({ idx, note: { ...note, desc: (note.desc || "").slice(0, XHS_DESC_MAX) } });
+  }
+  const pickedTokens = (xsecTokens ?? []).filter(([noteId]) => refNoteIds.has(noteId));
+  if (pickedNotes.length === 0 && pickedTokens.length === 0) return null;
+  return { notes: pickedNotes, xsecTokens: pickedTokens };
+}
+function attachSceneSong(directives, sceneSong) {
+  if (!sceneSong) return directives;
+  return directives.map((d) => d.type === "music_action" ? { ...d, song: sceneSong } : d);
+}
+var resolveNativeFireToolName = (raw, manageToolNames, mcpResolve) => {
+  const candidates = [raw];
+  const lastSegment = raw.split(/[:./]/).pop();
+  if (lastSegment && lastSegment !== raw) candidates.push(lastSegment);
+  for (const c of candidates) {
+    if (!c) continue;
+    if (c.startsWith(MCP_FIRE_NAME_PREFIX) && mcpResolve?.has(c.slice(MCP_FIRE_NAME_PREFIX.length))) {
+      return { kind: "mcp", name: c };
+    }
+    if (manageToolNames.has(c)) return { kind: "manage", name: c };
+    if (mcpResolve?.has(c)) return { kind: "mcp", name: `${MCP_FIRE_NAME_PREFIX}${c}` };
+  }
+  return null;
+};
+var classifyNativeToolCalls = (rawToolCalls, manageToolNames, mcpResolve) => {
+  const out = { manage: [], mcp: [], dropped: [] };
+  const calls = Array.isArray(rawToolCalls) ? rawToolCalls : [];
+  for (const tc of calls) {
+    const raw = tc?.function?.name;
+    const resolved = typeof raw === "string" && raw ? resolveNativeFireToolName(raw, manageToolNames, mcpResolve) : null;
+    if (!resolved) {
+      out.dropped.push(typeof raw === "string" && raw ? raw : null);
+      continue;
+    }
+    const call = resolved.name === raw ? tc : { ...tc, function: { ...tc.function, name: resolved.name } };
+    (resolved.kind === "mcp" ? out.mcp : out.manage).push(call);
+  }
+  return out;
+};
+function processLLMRound(state, llmOutputText, build, mcp, schedule, iteration, maxToolIterations = DEFAULT_TOOL_ITERATIONS) {
+  const isFinalRound = typeof iteration === "number" && iteration >= maxToolIterations - 1;
+  const sarPlan = planFromSARModuleSnapshot(build.sar ?? null);
+  const sarMask = sarPlan?.requiresEnvelope ? maskSarSurfaceBlocks(llmOutputText) : null;
+  const roundText = sarMask ? sarMask.masked : llmOutputText;
+  const restoreSurfaces = (text2) => sarMask ? sarMask.restore(text2) : text2;
+  const nativeToolCalls = mcp?.nativeToolCalls ?? [];
+  const textCalls = mcp?.resolve.size ? extractTextFakedMcpCalls(roundText, mcp.resolve, { alsoMatchPrefix: MCP_FIRE_NAME_PREFIX }) : [];
+  const nativeScheduleCalls = schedule?.nativeToolCalls ?? [];
+  const hasNativeSchedule = nativeScheduleCalls.some(
+    (tc) => tc?.function?.name === AMSG_FIRE_SCHEDULE_TOOL
+  );
+  const scheduleTextCalls = schedule ? extractFireScheduleTextCalls(roundText) : [];
+  const scheduleCalls = [
+    ...nativeScheduleCalls,
+    ...(hasNativeSchedule ? [] : scheduleTextCalls).map((c) => ({
+      id: `sched_${state.mcpCallSeq++}`,
+      type: "function",
+      function: { name: AMSG_FIRE_SCHEDULE_TOOL, arguments: JSON.stringify(c.args) }
+    }))
+  ];
+  const strippedText = scheduleTextCalls.length ? stripTextFakedMcpCalls(roundText, scheduleTextCalls) : roundText;
+  const scanText = textCalls.length ? stripTextFakedMcpCalls(strippedText, textCalls) : strippedText;
+  const mcpToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : textCalls.map((c) => ({
+    // id 只需在一轮的 assistant/tool 消息配对里唯一；本次 fire 内自增，绝不重号。
+    id: `mcp_${state.mcpCallSeq++}`,
+    type: "function",
+    // exposedName 恒为裸名（alsoMatchPrefix 的命中也回裸名），统一补前缀即可。
+    function: { name: `${MCP_FIRE_NAME_PREFIX}${c.exposedName}`, arguments: JSON.stringify(c.args) }
+  }));
+  const extraToolCalls = [...mcpToolCalls, ...scheduleCalls];
+  const result = classifyLLMOutput(scanText);
+  const isToolRound = result.kind === "tool-request" || extraToolCalls.length > 0;
+  if (isToolRound) {
+    const narration = result.kind === "tool-request" ? result.prefix : scanText;
+    if (state.duplicateToolCalls < MAX_DUPLICATE_TOOL_CALLS && !isFinalRound) {
+      if (narration.trim()) state.narrations.push(restoreSurfaces(narration));
+      if (state.xhsShareNotes === null && XHS_SHARE_TAG_RE.test(narration)) {
+        state.xhsShareNotes = [...build.xhsNotes ?? []];
+      }
+      return {
+        decision: "tool-request",
+        toolCalls: result.kind === "tool-request" ? [...result.toolCalls, ...extraToolCalls] : extraToolCalls
+      };
+    }
+  }
+  const thisRound = isToolRound ? "" : restoreSurfaces(scanText);
+  const rounds = [...state.narrations, thisRound].filter((part) => part.trim().length > 0);
+  const fullText = rounds.join("\n");
+  const sarParse = sarPlan?.requiresEnvelope ? parseSarEnvelopeRounds(rounds, sarPlan) : null;
+  const finalScan = sarParse ? classifyLLMOutput(sarParse.canonical) : fullText === scanText ? result : classifyLLMOutput(fullText);
+  const cleanedText = finalScan.kind === "finish" ? finalScan.cleanedText : finalScan.prefix;
+  const directives = attachSceneSong(
+    finalScan.kind === "finish" ? finalScan.directives : [],
+    build.sceneSong
+  );
+  const xhsSession = buildXhsSessionPayload(
+    directives,
+    state.xhsShareNotes ?? build.xhsNotes,
+    build.xhsXsecTokens
+  );
+  const finishMeta = directives.length > 0 ? { directives, ...xhsSession ? { xhsSession } : {} } : void 0;
+  const declined = fullText.includes(AMSG_SILENT_MARK);
+  const segments = declined ? [] : sanitizeIntoSegments(cleanedText);
+  if (segments.length === 0) {
+    const scheduleChanges = directives.filter((d) => d.type === "change_schedule").map((d) => ({ startTime: d.time, activity: d.activity }));
+    return {
+      decision: "skip-push",
+      reason: declined ? "declined" : finishMeta ? "side-effects-only" : "empty-generation",
+      ...!declined && directives.some((d) => d.type !== "change_schedule") && finishMeta ? { sideEffects: finishMeta } : {},
+      ...scheduleChanges.length > 0 ? { scheduleChanges } : {}
+    };
+  }
+  const sarCharacter = build.sar?.character;
+  const surfaceSlots = sarParse && sarCharacter?.phase === "active" ? buildSarSurfaceSlots(sarParse, segments) : [];
+  const sarLastMeta = {
+    ...build.sar ? { [AMSG_SAR_META_KEY]: build.sar } : {},
+    ...sarParse?.userSurface ? { amsgSarUserSurface: sarParse.userSurface } : {}
+  };
+  const lastMeta = finishMeta || Object.keys(sarLastMeta).length > 0 ? { ...finishMeta ?? {}, ...sarLastMeta } : void 0;
+  const lastIdx = segments.length - 1;
+  return {
+    decision: "finish",
+    pushPayloads: segments.map((seg, i) => {
+      const slot = surfaceSlots[i];
+      const surfaceMeta = slot && sarCharacter ? createSARModuleSurfaceMeta(sarCharacter, slot.surface) : void 0;
+      const extra = {
+        ...surfaceMeta ? { amsgSarSurface: surfaceMeta } : {},
+        ...i === lastIdx ? lastMeta ?? {} : {}
+      };
+      return buildScheduledPush(
+        seg.raw,
+        build,
+        Object.keys(extra).length > 0 ? extra : void 0,
+        // 外显横幅截短：这条 push 还要装外显 meta，别把单段正文的字节预算吃掉一半。
+        surfaceMeta && slot ? clipSarSurfaceBanner(slot.banner) : seg.sanitized
+      );
+    })
+  };
+}
+function buildScheduledPush(message, build, extraMeta, bannerBody) {
+  const title = `\u6765\u81EA ${build.contactName}`;
+  return {
+    messageKind: "content",
+    messageType: build.messageType,
+    source: "scheduled",
+    message,
+    title,
+    contactName: build.contactName,
+    avatarUrl: build.avatarUrl,
+    messageSubtype: "chat",
+    taskId: build.taskId,
+    metadata: {
+      // SAR 快照不许摊进每一条（它只随最后一条经 extraMeta 回去）；调用方已摘过，这里兜一道。
+      ...stripSarSnapshot(build.metadata),
+      amsgOccurrenceMs: build.occurrenceMs,
+      ...extraMeta ?? {}
+    },
+    ...bannerBody !== void 0 ? { notification: { title, body: bannerBody } } : {}
+  };
+}
+
+// utils/amsgBundleVersion.ts
+var AMSG_BUNDLE_VERSION = "2026-11-11.2";
+
+// worker/amsg/src/reproduction.ts
+async function writeDiagnosticStage(writeState, runId, event, fields = {}) {
+  if (!writeState) return;
+  const entry = { ...fields, runId, side: "worker", event, ts: (/* @__PURE__ */ new Date()).toISOString(), workerVersion: AMSG_BUNDLE_VERSION };
+  try {
+    await writeState(DIAGNOSTIC_NAMESPACE, [{ key: `${runId}:${crypto.randomUUID()}`, value: JSON.stringify(entry) }]);
+  } catch {
+  }
+}
+var reproductionHandler = {
+  async beforeFire({ ctx, taskMeta }) {
+    const runId = diagnosticRunId(taskMeta);
+    if (!runId) throw new Error("\u8BCA\u65AD\u4EFB\u52A1\u7F16\u53F7\u7F3A\u5931\u6216\u65E0\u6548");
+    const state = { runId, startedAt: Date.now(), taskId: ctx.task.id == null ? null : String(ctx.task.id) };
+    ctx.scratch.diagnostic = state;
+    await writeDiagnosticStage(ctx.writeState, runId, "fire-start", { taskId: state.taskId });
+    return {
+      state,
+      messages: [
+        { role: "system", content: "\u4F60\u6B63\u5728\u6A21\u62DF\u4E00\u6B21\u4E3B\u52A8\u6D88\u606F\uFF0C\u7528\u4E8E\u68C0\u67E5\u751F\u6210\u3001\u5206\u6BB5\u548C\u7CFB\u7EDF\u901A\u77E5\u3002\u4F60\u4E0D\u662F\u7528\u6237\u7684\u89D2\u8272\uFF0C\u4E0D\u8BFB\u53D6\u6216\u4FEE\u6539\u4EFB\u4F55\u8BB0\u5FC6\u3002\u53EA\u8F93\u51FA\u4E09\u53E5\u7B80\u77ED\u7684\u4E2D\u6587\u95EE\u5019\uFF0C\u6BCF\u53E5\u5355\u72EC\u4E00\u6BB5\uFF0C\u4EE5\u7A7A\u884C\u5206\u9694\u3002\u4E0D\u8981\u8F93\u51FA\u5DE5\u5177\u8C03\u7528\u3001\u52A8\u4F5C\u6807\u7B7E\u3001\u4EE3\u7801\u3001\u601D\u8003\u8FC7\u7A0B\u6216\u4E2A\u4EBA\u4FE1\u606F\u3002\u603B\u5171\u4E0D\u8D85\u8FC7120\u5B57\u3002" },
+        { role: "user", content: "\u8BF7\u4E3B\u52A8\u53D1\u6765\u8FD9\u6B21\u6D4B\u8BD5\u95EE\u5019\uFF0C\u5E76\u5728\u6700\u540E\u4E00\u53E5\u63D0\u9192\u6211\u68C0\u67E5\u7CFB\u7EDF\u901A\u77E5\u3002" }
+      ]
+    };
+  },
+  async llmOutput({ ctx, state }) {
+    const diagnostic = state;
+    const decision = processLLMRound(createFireSessionState(), stripReasoningTags(ctx.llmOutputText || ""), {
+      contactName: "\u4E3B\u52A8\u6D88\u606F\u590D\u73B0",
+      avatarUrl: null,
+      taskId: diagnostic.taskId,
+      messageType: "auto",
+      occurrenceMs: diagnostic.startedAt,
+      metadata: { charId: DIAGNOSTIC_CHAR_ID, amsgKind: "diagnostic", amsgDiagnosticRunId: diagnostic.runId }
+    }, null, null, 0, 1);
+    await writeDiagnosticStage(ctx.writeState, diagnostic.runId, "llm-output", {
+      durationMs: Date.now() - diagnostic.startedAt,
+      outputChars: (ctx.llmOutputText || "").length,
+      decision: decision.decision,
+      chunks: decision.decision === "finish" ? decision.pushPayloads.length : 0
+    });
+    if (decision.decision === "tool-request") return { decision: "skip-push", reason: "diagnostic-tools-disabled" };
+    if (decision.decision === "skip-push") return { decision: "skip-push", reason: decision.reason };
+    return { decision: "finish", pushPayloads: decision.pushPayloads.map((payload) => ({
+      ...payload,
+      metadata: { charId: DIAGNOSTIC_CHAR_ID, amsgKind: "diagnostic", amsgDiagnosticRunId: diagnostic.runId }
+    })) };
+  }
+};
+async function settleReproduction(info) {
+  const state = info.scratch.diagnostic;
+  if (!state) return false;
+  await writeDiagnosticStage(info.writeState, state.runId, "fire-settled", {
+    status: info.status,
+    sentCount: info.sentCount,
+    willRetry: info.willRetry,
+    llmCalls: info.llmCalls,
+    outboxed: info.outboxed,
+    ...info.error ? safeDiagnosticError(info.error) : {}
+  });
+  return true;
+}
+function traceDiagnosticTransport(transport, env) {
+  const record2 = async (payload, event, fields) => {
+    const runId = diagnosticRunId(payload?.metadata);
+    if (!runId || !env.DB || !env.AMSG_MASTER_KEY || typeof payload.taskUuid !== "string") return;
+    try {
+      const db = env.DB;
+      const task = await db.prepare("SELECT user_id FROM scheduled_messages WHERE uuid = ?").bind(payload.taskUuid).first();
+      if (!task) return;
+      const key = await deriveUserEncryptionKey(task.user_id, env.AMSG_MASTER_KEY);
+      const entry = { ...fields, runId, side: "worker", event, ts: typeof fields.ts === "string" ? fields.ts : (/* @__PURE__ */ new Date()).toISOString(), messageId: payload.messageId, chunk: payload.messageIndex, total: payload.totalMessages, workerVersion: AMSG_BUNDLE_VERSION };
+      const value = await encryptForStorage(JSON.stringify(entry), key);
+      await db.prepare("INSERT INTO client_state (user_id, namespace, key, value, updated_at) SELECT user_id, ?, ?, ?, ? FROM scheduled_messages WHERE uuid = ? AND user_id = ?").bind(DIAGNOSTIC_NAMESPACE, `${runId}:${crypto.randomUUID()}`, value, Date.now(), payload.taskUuid, task.user_id).run();
+    } catch {
+    }
+  };
+  return { ...transport, async sendNotification(subscription, raw) {
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+    }
+    const startedAt = Date.now();
+    const attempt = { ts: new Date(startedAt).toISOString() };
+    try {
+      const result = await transport.sendNotification(subscription, raw);
+      const durationMs = Date.now() - startedAt;
+      await record2(payload, "push-attempt", attempt);
+      await record2(payload, "push-accepted", { durationMs, httpStatus: result?.statusCode ?? result?.status ?? null });
+      return result;
+    } catch (error) {
+      const durationMs = Date.now() - startedAt;
+      await record2(payload, "push-attempt", attempt);
+      await record2(payload, "push-rejected", { durationMs, ...safeDiagnosticError(error) });
+      throw error;
+    }
+  } };
+}
+
+// worker/amsg/src/skipDiagnostics.ts
+var BODY_ERROR_MAX_CHARS = 200;
+var CONTENT_EXCERPT_CHARS = 300;
+var REASONING_TAIL_CHARS = 200;
+var BODY_EXCERPT_CHARS = 500;
+var asRecord = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : null;
+var numberOrNull = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+var clip = (text2, max) => text2.length > max ? `${text2.slice(0, max)}\u2026` : text2;
+var safeStringify = (value) => {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+};
+var readFirstMessage = (body) => {
+  const choices = Array.isArray(body?.choices) ? body.choices : [];
+  const choice = asRecord(choices[0]);
+  return { choice, message: asRecord(choice?.message) };
+};
+var readReasoning = (message) => {
+  const value = message?.reasoning_content ?? message?.reasoning ?? message?.thinking;
+  return typeof value === "string" ? value : "";
+};
+var readBodyError = (body, hasChoices) => {
+  if (!body) return null;
+  let text2 = "";
+  const error = body.error;
+  if (typeof error === "string") {
+    text2 = error;
+  } else {
+    const record2 = asRecord(error);
+    if (record2) {
+      const code = typeof record2.code === "string" || typeof record2.code === "number" ? String(record2.code) : typeof record2.type === "string" ? record2.type : "";
+      const message = typeof record2.message === "string" ? record2.message : "";
+      text2 = [code && `[${code}]`, message].filter(Boolean).join(" ") || safeStringify(record2);
+    }
+  }
+  if (!text2 && !hasChoices) {
+    const topLevel = body.message ?? body.msg;
+    if (typeof topLevel === "string") text2 = topLevel;
+  }
+  return text2 ? clip(redactCredentials(text2), BODY_ERROR_MAX_CHARS) : null;
+};
+var describeLlmResponseShape = (llmResponse, llmOutputText) => {
+  const body = asRecord(llmResponse);
+  const hasChoices = Array.isArray(body?.choices) && body.choices.length > 0;
+  const { choice, message } = readFirstMessage(body);
+  const content = message?.content;
+  const contentType = content === void 0 ? "missing" : content === null ? "null" : typeof content === "string" ? "string" : Array.isArray(content) ? "array" : "other";
+  const contentChars = typeof content === "string" ? content.length : Array.isArray(content) ? content.reduce((sum, part) => {
+    const text2 = asRecord(part)?.text;
+    return sum + (typeof text2 === "string" ? text2.length : 0);
+  }, 0) : 0;
+  const usage = asRecord(body?.usage);
+  const usageDetails = asRecord(usage?.completion_tokens_details);
+  return {
+    model: typeof body?.model === "string" ? body.model : null,
+    hasChoices,
+    finishReason: typeof choice?.finish_reason === "string" ? choice.finish_reason : null,
+    contentType,
+    contentChars,
+    ...Array.isArray(content) ? { contentParts: content.length } : {},
+    visibleChars: stripReasoningTags(llmOutputText || "").trim().length,
+    reasoningChars: readReasoning(message).length,
+    toolCalls: Array.isArray(message?.tool_calls) ? message.tool_calls.length : 0,
+    usage: usage ? {
+      promptTokens: numberOrNull(usage.prompt_tokens),
+      completionTokens: numberOrNull(usage.completion_tokens),
+      reasoningTokens: numberOrNull(usageDetails?.reasoning_tokens)
+    } : null,
+    bodyError: readBodyError(body, hasChoices)
+  };
+};
+var excerptLlmResponse = (llmResponse) => {
+  const body = asRecord(llmResponse);
+  const hasChoices = Array.isArray(body?.choices) && body.choices.length > 0;
+  if (!hasChoices) {
+    return { body: clip(redactCredentials(safeStringify(llmResponse)), BODY_EXCERPT_CHARS) };
+  }
+  const { message } = readFirstMessage(body);
+  const excerpt = {};
+  const content = message?.content;
+  if (typeof content === "string") {
+    if (content) excerpt.content = clip(redactCredentials(content), CONTENT_EXCERPT_CHARS);
+  } else if (content != null) {
+    excerpt.content = clip(redactCredentials(safeStringify(content)), CONTENT_EXCERPT_CHARS);
+  }
+  const reasoning = readReasoning(message);
+  if (reasoning) {
+    const tail = reasoning.length > REASONING_TAIL_CHARS ? `\u2026${reasoning.slice(-REASONING_TAIL_CHARS)}` : reasoning;
+    excerpt.reasoningTail = redactCredentials(tail);
+  }
+  if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+    excerpt.toolCalls = clip(redactCredentials(safeStringify(message.tool_calls)), CONTENT_EXCERPT_CHARS);
+  }
+  return excerpt;
+};
+var rawExcerptEnabled = false;
+var configureSkipDiagnostics = (options) => {
+  rawExcerptEnabled = options.rawExcerpt;
+};
+var isDebugFlagOn = (value) => typeof value === "string" && ["1", "true"].includes(value.trim().toLowerCase());
+var logSkipDiagnostic = (input) => {
+  try {
+    console.warn("[amsg:skip-diag]", {
+      sessionId: input.sessionId ?? null,
+      reason: input.reason,
+      iteration: input.iteration ?? null,
+      ...describeLlmResponseShape(input.llmResponse, input.llmOutputText ?? ""),
+      ...rawExcerptEnabled ? { raw: excerptLlmResponse(input.llmResponse) } : {}
+    });
+  } catch (error) {
+    console.warn("[amsg:skip-diag] \u8BCA\u65AD\u65E5\u5FD7\u6CA1\u8BB0\u4E0B\u6765\uFF08\u8DF3\u8FC7\u7167\u5E38\u751F\u6548\uFF09", error);
+  }
+};
+
+// worker/amsg/src/plateFire.ts
+var discardJob = async (writeState, jobId) => {
+  if (!writeState) return;
+  try {
+    await writeState(AMSG_JOB_NAMESPACE, [{ key: plateJobKey(jobId), value: null }]);
+  } catch (error) {
+    console.warn("[amsg:plate] job \u884C\u6CA1\u5220\u6389\uFF08\u7B49 TTL \u515C\u5E95\uFF09", jobId, error);
+  }
+};
+var plateConsolidateHandler = {
+  async beforeFire({ ctx, charId, taskMeta }) {
+    const jobId = taskMeta[AMSG_JOB_ID_KEY];
+    if (typeof jobId !== "string" || !jobId) {
+      throw new Error(`\u95E8\u724C\u6574\u7406\u4EFB\u52A1\u7684 metadata \u91CC\u6CA1\u6709 ${AMSG_JOB_ID_KEY}`);
+    }
+    const rows = await ctx.readState(AMSG_JOB_NAMESPACE);
+    const row = rows.find((r) => r.key === plateJobKey(jobId));
+    if (!row?.value) {
+      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u5DF2\u4E0D\u5728\uFF08\u8FC7\u671F\u6216\u5DF2\u64A4\u9500\uFF09` };
+    }
+    const discardAndFail = async (message) => {
+      await discardJob(ctx.writeState, jobId);
+      throw new Error(message);
+    };
+    let json;
+    try {
+      json = await unpackStateValue(row.value);
+    } catch (error) {
+      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09\uFF1A${String(error)}`);
+    }
+    const job = parsePlateJobInput(json);
+    if (!job) return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u6790\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`);
+    if (job.charId !== charId) {
+      return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684 charId \u4E0E\u4EFB\u52A1\u5BF9\u4E0D\u4E0A`);
+    }
+    if (job.rooms.length === 0) {
+      await discardJob(ctx.writeState, jobId);
+      return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u6CA1\u6709\u8981\u6574\u7406\u7684\u623F\u95F4` };
+    }
+    return {
+      messages: buildPlateJobMessages(job),
+      // 跟浏览器那条路同一个超时（叶子里那个常量）。不显式交上去的话这一次 fire 会落到
+      // 库自己的默认值（四分钟），同一件活儿两条路的耐心不一样，而且改那个常量对云端
+      // 毫无影响——「本地什么样云端就什么样」这条线得自己拉齐。
+      totalTimeoutMs: PLATE_LLM_TIMEOUT_MS,
+      state: { jobId, job }
+    };
+  },
+  async llmOutput({ ctx, state }) {
+    const { jobId, job } = state;
+    const items = parsePlateLlmReply(ctx.llmOutputText || "");
+    if (items.length === 0) {
+      console.warn("[amsg:plate] LLM \u6CA1\u8FD4\u56DE\u6709\u6548\u6761\u76EE\uFF0C\u95E8\u724C\u4FDD\u6301\u4E0D\u52A8", jobId);
+      logSkipDiagnostic({
+        sessionId: ctx.sessionId,
+        reason: "plate-empty-generation",
+        iteration: ctx.iteration,
+        llmResponse: ctx.llmResponse,
+        llmOutputText: ctx.llmOutputText
+      });
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-empty-generation" };
+    }
+    if (typeof ctx.emitResult !== "function") {
+      console.warn("[amsg:plate] \u8FD9\u53F0 worker \u4E0D\u652F\u6301 emitResult\uFF0C\u6574\u7406\u7ED3\u679C\u9001\u4E0D\u56DE\u53BB", jobId);
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-emit-result-unsupported" };
+    }
+    try {
+      await ctx.emitResult({
+        ...buildPlateConsolidateResult({ jobId, charId: job.charId, items, rooms: job.rooms, snapshotAt: job.snapshotAt }),
+        // 背景工作，整理完不该把人叫回来看。show:false 的 payload 上游只落收件箱、
+        // 不发推送，客户端下次上线补收。
+        notification: { show: false }
+      });
+    } catch (error) {
+      console.warn("[amsg:plate] \u6574\u7406\u7ED3\u679C\u9001\u4E0D\u8FDB\u6536\u4EF6\u7BB1\uFF08\u591A\u534A\u662F\u6536\u4EF6\u7BB1\u8868\u6CA1\u5EFA\u5168\uFF0C\u53BB\u8BBE\u7F6E\u9875\u70B9\u4E00\u6B21\u300C\u91CD\u65B0\u8FDE\u63A5\u5E76\u9A8C\u8BC1\u300D\uFF09", jobId, error);
+      await discardJob(ctx.writeState, jobId);
+      return { decision: "skip-push", reason: "plate-emit-result-failed" };
+    }
+    console.log("[amsg:plate] \u6574\u7406\u7ED3\u679C\u5DF2\u9001\u8FDB\u6536\u4EF6\u7BB1", {
+      jobId,
+      charId: job.charId,
+      items: items.length,
+      resultKind: PLATE_CONSOLIDATE_RESULT_KIND
+    });
+    await discardJob(ctx.writeState, jobId);
+    return { decision: "skip-push", reason: "plate-result-emitted" };
+  }
+};
+
+// worker/amsg/src/fireKinds.ts
+var FIRE_KIND_HANDLERS = Object.assign(
+  /* @__PURE__ */ Object.create(null),
+  { [PLATE_CONSOLIDATE_KIND]: plateConsolidateHandler, diagnostic: reproductionHandler }
+);
+var KIND_FIRE_SCRATCH_KEY = "kindFire";
+var putKindFireStash = (scratch, kind, state) => {
+  scratch[KIND_FIRE_SCRATCH_KEY] = { kind, state };
+};
+var getKindFireStash = (scratch) => {
+  const raw = scratch?.[KIND_FIRE_SCRATCH_KEY];
+  if (!raw || typeof raw !== "object") return null;
+  const stash = raw;
+  return typeof stash.kind === "string" ? { kind: stash.kind, state: stash.state } : null;
+};
+
+// utils/amsgFireSkipResult.ts
+var FIRE_SKIP_RESULT_KIND = "fire-skipped";
+var SILENT_REASONS = /* @__PURE__ */ new Set(["schedule-off"]);
+var shouldReportFireSkip = (reason) => !SILENT_REASONS.has(reason);
+function buildFireSkipResult(args) {
+  return {
+    resultKind: FIRE_SKIP_RESULT_KIND,
+    v: 1,
+    charId: args.charId,
+    taskUuid: args.taskUuid,
+    occurrenceMs: args.occurrenceMs,
+    reason: args.reason,
+    ...args.task ? {
+      task: {
+        mode: args.task.mode,
+        ...args.task.promptHint ? { promptHint: args.task.promptHint } : {},
+        recurrenceType: args.task.recurrenceType
+      }
+    } : {}
+  };
+}
+
 // utils/amsgChatPresence.ts
 var AMSG_CHAT_PRESENCE_KEY = "chat_presence";
 var CHAT_PRESENCE_TTL_MS = 45e3;
 var parseAmsgChatPresence = (raw) => {
   try {
     const value = raw ? JSON.parse(raw) : null;
-    return value?.v === 1 && typeof value.charId === "string" && typeof value.activeAt === "number" && (value.lastUserMessageAt === null || typeof value.lastUserMessageAt === "number") ? value : null;
+    return value?.v === 1 && typeof value.charId === "string" && typeof value.activeAt === "number" && (value.lastUserMessageAt === null || typeof value.lastUserMessageAt === "number") && (value.scene === void 0 || value.scene === "date") ? value : null;
   } catch {
     return null;
   }
@@ -11980,6 +14502,11 @@ var parseAmsgChatPresence = (raw) => {
 var isFreshChatPresence = (value, charId, nowMs) => Boolean(
   value && value.v === 1 && value.charId === charId && value.activeAt <= nowMs + 1e4 && nowMs - value.activeAt <= CHAT_PRESENCE_TTL_MS
 );
+var chattedDuringFire = (value, charId, nowMs, seenLastUserMessageAt) => {
+  if (!value || value.charId !== charId) return false;
+  if (isFreshChatPresence(value, charId, nowMs)) return true;
+  return value.lastUserMessageAt != null && (seenLastUserMessageAt == null || value.lastUserMessageAt > seenLastUserMessageAt);
+};
 
 // utils/realtimeWorldCore.ts
 var readJson = async (res) => {
@@ -12833,7 +15360,8 @@ var buildUserHolidayBlock = async (args) => {
   }, nowMs, args.userName);
 };
 var buildRealtimeWorldBlock = async (args) => {
-  const { toolConfig: cfg, nowMs, globalRows } = args;
+  const { nowMs, globalRows } = args;
+  const cfg = weatherForCharacter(args.toolConfig, args.charId);
   const specialDates = args.timeAwarenessEnabled ? checkSpecialDates(args.tzId, nowMs) : [];
   if (!cfg.weatherEnabled && !cfg.newsEnabled) {
     return renderRealtimeWorldBlock({ specialDates });
@@ -12874,8 +15402,6 @@ var TIME_FRAMING_CONVERSATIONAL = "\u65F6\u95F4\u662F\u4F60\u6B64\u523B\u6240\u5
 
 // worker/amsg/src/instantChat.ts
 var INSTANT_TOTAL_TIMEOUT_MS = 6e5;
-var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
-var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
 var buildInstantTimelyBlock = (args) => {
   const blocks = args.blocks.filter((block) => block.trim());
   if (!args.timeAwarenessEnabled && blocks.length === 0) return "";
@@ -13184,6 +15710,27 @@ var handleInstantChat = async (args) => {
   });
 };
 
+// utils/amsgSelfUpdateState.ts
+var findCfTokenRejection = (text2) => /\d+: invalid (access|api) token/i.exec(text2)?.[0] ?? null;
+var cfTokenRejectedMessage = (detail, hasAccountId) => `Cloudflare \u4E0D\u8BA4\u8FD9\u679A CF_API_TOKEN\uFF08${detail}\uFF09\uFF0C\u591A\u534A\u5DF2\u7ECF\u8FC7\u671F\u6216\u88AB\u5220\u4E86\u3002\u53BB Cloudflare \u65B0\u5EFA\u4E00\u679A\uFF08\u53EA\u52FE Workers Scripts \u2192 Edit\uFF09\uFF0C\u66FF\u6362 Worker \u91CC\u7684 CF_API_TOKEN\u3002` + (hasAccountId ? "" : "\u5982\u679C\u5B83\u662F cfat_ \u5F00\u5934\u7684\u8D26\u53F7\u4EE4\u724C\uFF0C\u6362\u6210\u666E\u901A API Token\uFF0C\u6216\u8005\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID\u3002");
+var OUTCOMES = /* @__PURE__ */ new Set(["updated", "up_to_date", "failed"]);
+var SOURCES = /* @__PURE__ */ new Set(["cron", "client", "manual"]);
+var parseAmsgSelfUpdateState = (raw) => {
+  const value = raw;
+  if (!value || typeof value !== "object") return null;
+  if (typeof value.lastCheckAt !== "string" || Number.isNaN(Date.parse(value.lastCheckAt))) return null;
+  if (typeof value.lastOutcome !== "string" || !OUTCOMES.has(value.lastOutcome)) return null;
+  const error = value.lastError;
+  return {
+    lastCheckAt: value.lastCheckAt,
+    lastSource: typeof value.lastSource === "string" && SOURCES.has(value.lastSource) ? value.lastSource : "cron",
+    lastOutcome: value.lastOutcome,
+    bundleHash: typeof value.bundleHash === "string" && value.bundleHash ? value.bundleHash : null,
+    lastUpdatedAt: typeof value.lastUpdatedAt === "string" ? value.lastUpdatedAt : null,
+    lastError: error && typeof error === "object" && typeof error.code === "string" ? { code: error.code, message: typeof error.message === "string" ? error.message : "" } : null
+  };
+};
+
 // worker/amsg/src/selfUpdate.ts
 var CF_API = "https://api.cloudflare.com/client/v4";
 var BUNDLE_URL = "https://raw.githubusercontent.com/Tosd0/sullyos-workers/main/amsg/worker.bundle.js";
@@ -13257,18 +15804,20 @@ async function locateScript(env, token, scriptName) {
   if (configured) {
     const settings = await cf(token, settingsPath(configured));
     if (!settings.ok) {
+      const rejected = findCfTokenRejection(settings.detail);
       return {
         ok: false,
-        message: `\u5728 CF_ACCOUNT_ID \u6307\u5B9A\u7684\u8D26\u53F7\u91CC\u8BFB\u4E0D\u5230\u8FD9\u4E2A Worker \u7684\u914D\u7F6E\uFF08${settings.detail}\uFF09\u3002`
+        message: rejected ? cfTokenRejectedMessage(rejected, true) : `\u5728 CF_ACCOUNT_ID \u6307\u5B9A\u7684\u8D26\u53F7\u91CC\u8BFB\u4E0D\u5230\u8FD9\u4E2A Worker \u7684\u914D\u7F6E\uFF08${settings.detail}\uFF09\u3002`
       };
     }
     return { ok: true, accountId: configured, settings: settings.result };
   }
   const listed = await cf(token, "/accounts");
   if (!listed.ok) {
+    const rejected = findCfTokenRejection(listed.detail);
     return {
       ok: false,
-      message: `\u95EE\u4E0D\u5230\u8D26\u53F7\u5217\u8868\uFF08${listed.detail}\uFF09\u3002\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID \u53D8\u91CF\u5373\u53EF\u8DF3\u8FC7\u8FD9\u4E00\u6B65\u3002`
+      message: rejected ? cfTokenRejectedMessage(rejected, false) : `\u95EE\u4E0D\u5230\u8D26\u53F7\u5217\u8868\uFF08${listed.detail}\uFF09\u3002\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID \u53D8\u91CF\u5373\u53EF\u8DF3\u8FC7\u8FD9\u4E00\u6B65\u3002`
     };
   }
   const accounts = Array.isArray(listed.result) ? listed.result : [];
@@ -13434,25 +15983,6 @@ async function handleSelfUpdate(request, env) {
   if (!fetched.ok) return fail("BUNDLE_INVALID", fetched.message);
   return performSelfUpdate(env, gate.token, scriptName, fetched.bundle);
 }
-
-// utils/amsgSelfUpdateState.ts
-var OUTCOMES = /* @__PURE__ */ new Set(["updated", "up_to_date", "failed"]);
-var SOURCES = /* @__PURE__ */ new Set(["cron", "client", "manual"]);
-var parseAmsgSelfUpdateState = (raw) => {
-  const value = raw;
-  if (!value || typeof value !== "object") return null;
-  if (typeof value.lastCheckAt !== "string" || Number.isNaN(Date.parse(value.lastCheckAt))) return null;
-  if (typeof value.lastOutcome !== "string" || !OUTCOMES.has(value.lastOutcome)) return null;
-  const error = value.lastError;
-  return {
-    lastCheckAt: value.lastCheckAt,
-    lastSource: typeof value.lastSource === "string" && SOURCES.has(value.lastSource) ? value.lastSource : "cron",
-    lastOutcome: value.lastOutcome,
-    bundleHash: typeof value.bundleHash === "string" && value.bundleHash ? value.bundleHash : null,
-    lastUpdatedAt: typeof value.lastUpdatedAt === "string" ? value.lastUpdatedAt : null,
-    lastError: error && typeof error === "object" && typeof error.code === "string" ? { code: error.code, message: typeof error.message === "string" ? error.message : "" } : null
-  };
-};
 
 // utils/amsgTickReport.ts
 var TICK_STALL_MS = 5 * 6e4;
@@ -13990,577 +16520,6 @@ async function handleCronTriggerWrite(env, request, enabled) {
   }
   return { ok: true, enabled };
 }
-
-// utils/mcpFireCore.ts
-var DEFAULT_MAX_TOOL_NAME_LEN = 64;
-var MCP_FIRE_NAME_PREFIX = "mcp__";
-var MCP_FIRE_NAME_BUDGET = DEFAULT_MAX_TOOL_NAME_LEN - MCP_FIRE_NAME_PREFIX.length;
-var sanitizeMcpToolName = (name, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => {
-  const len = Math.max(1, maxLen);
-  return (name || "tool").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, len);
-};
-var withMcpDedupeSuffix = (base, i, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => {
-  const suffix = `_${i}`;
-  return base.slice(0, Math.max(0, maxLen - suffix.length)) + suffix;
-};
-var serverSlug = (server, maxLen = DEFAULT_MAX_TOOL_NAME_LEN) => sanitizeMcpToolName(server.name, maxLen).slice(0, 20);
-var buildMcpNameMap = (servers, opts = {}) => {
-  const maxLen = opts.maxNameLen ?? DEFAULT_MAX_TOOL_NAME_LEN;
-  const resolve = /* @__PURE__ */ new Map();
-  for (const server of servers) {
-    for (const t of server.tools || []) {
-      let exposed = sanitizeMcpToolName(t.name, maxLen);
-      if (resolve.has(exposed)) {
-        const prefixed = sanitizeMcpToolName(`${serverSlug(server, maxLen)}_${t.name}`, maxLen);
-        exposed = prefixed;
-        let i = 2;
-        while (resolve.has(exposed)) exposed = withMcpDedupeSuffix(prefixed, i++, maxLen);
-      }
-      resolve.set(exposed, { server, toolName: t.name, tool: t });
-    }
-  }
-  return resolve;
-};
-var MCP_RESULT_MAX_CHARS = 2e4;
-var formatMcpToolResult = (data) => {
-  let s;
-  try {
-    s = typeof data === "string" ? data : JSON.stringify(data);
-  } catch {
-    s = String(data);
-  }
-  return s.length > MCP_RESULT_MAX_CHARS ? `${s.slice(0, MCP_RESULT_MAX_CHARS)}\u2026[\u7ED3\u679C\u8FC7\u957F\u5DF2\u622A\u65AD, \u5168\u6587\u5171 ${s.length} \u5B57\u7B26]` : s;
-};
-var stripTextFakedMcpCalls = (content, calls) => {
-  let cleaned = content;
-  for (const call of calls) cleaned = cleaned.split(call.matched).join("");
-  return cleaned.replace(/\n{3,}/g, "\n\n").trim();
-};
-var escapeRegExp2 = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
-var stripQuotes = (s) => {
-  const t = s.trim();
-  const m = t.match(/^(['"`「『])([\s\S]*)(['"`」』])$/);
-  return m ? m[2] : t;
-};
-var positionalKeys = (schema) => {
-  const props = schema?.properties ? Object.keys(schema.properties) : [];
-  const req = Array.isArray(schema?.required) ? schema.required.filter((k) => props.includes(k)) : [];
-  return [...req, ...props.filter((k) => !req.includes(k))];
-};
-var coerceBySchema = (value, schema, key) => {
-  const type = schema?.properties?.[key]?.type;
-  const v = stripQuotes(value);
-  if (type === "number" || type === "integer") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return type === "integer" ? Math.trunc(n) : n;
-  }
-  if (type === "boolean") {
-    if (/^(true|是|开)$/i.test(v)) return true;
-    if (/^(false|否|关)$/i.test(v)) return false;
-  }
-  return v;
-};
-var splitTopLevel = (s) => {
-  const out = [];
-  let depth = 0, cur = "", quote = "";
-  for (const ch of s) {
-    if (quote) {
-      cur += ch;
-      if (ch === quote) quote = "";
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      cur += ch;
-      continue;
-    }
-    if (ch === "{" || ch === "[") depth++;
-    if (ch === "}" || ch === "]") depth--;
-    if (ch === "," && depth === 0) {
-      out.push(cur);
-      cur = "";
-      continue;
-    }
-    cur += ch;
-  }
-  if (cur.trim()) out.push(cur);
-  return out;
-};
-var parseFakedArgs = (inner, schema) => {
-  const t = inner.trim();
-  if (!t) return {};
-  if (t.startsWith("{")) {
-    try {
-      return JSON.parse(t);
-    } catch {
-    }
-    try {
-      return JSON.parse(t.replace(/,\s*([}\]])/g, "$1").replace(/'/g, '"').replace(/([{,]\s*)([a-zA-Z_]\w*)\s*:/g, '$1"$2":'));
-    } catch {
-    }
-  }
-  const parts = splitTopLevel(t);
-  if (parts.every((p) => /^\s*[A-Za-z_]\w*\s*[=:]/.test(p))) {
-    const args2 = {};
-    for (const p of parts) {
-      const m = p.match(/^\s*([A-Za-z_]\w*)\s*[=:]\s*([\s\S]*)$/);
-      if (m) args2[m[1]] = coerceBySchema(m[2], schema, m[1]);
-    }
-    return args2;
-  }
-  const keys = positionalKeys(schema);
-  const args = {};
-  parts.forEach((p, i) => {
-    const key = keys[i];
-    if (key) args[key] = coerceBySchema(p, schema, key);
-  });
-  return args;
-};
-var extractTextFakedMcpCalls = (content, resolve, opts = {}) => {
-  if (!content || !resolve.size) return [];
-  const lookup = /* @__PURE__ */ new Map();
-  for (const [exposed, hit] of resolve) {
-    lookup.set(exposed, { exposed, hit });
-    lookup.set(hit.toolName, { exposed, hit });
-    if (opts.alsoMatchPrefix) lookup.set(`${opts.alsoMatchPrefix}${exposed}`, { exposed, hit });
-  }
-  const found = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const [name, { exposed, hit }] of lookup) {
-    const schema = hit.tool.inputSchema;
-    const esc = escapeRegExp2(name);
-    const parenRe = new RegExp(`(^|[^\\w./])${esc}\\s*\\(([^)]*)\\)`, "g");
-    for (const m of content.matchAll(parenRe)) {
-      const matched = m[0].slice(m[1].length);
-      const key = `${exposed}|${matched}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      found.push({
-        exposedName: exposed,
-        server: hit.server,
-        toolName: hit.toolName,
-        args: parseFakedArgs(m[2], schema),
-        matched,
-        index: (m.index ?? 0) + m[1].length
-      });
-    }
-    const colonRe = new RegExp(`(^|\\n)\\s*[>*-]*\\s*\`?${esc}\`?\\s*[:\uFF1A]\\s*([^\\n]+)`, "g");
-    for (const m of content.matchAll(colonRe)) {
-      const matched = m[0].slice(m[1].length);
-      const key = `${exposed}|${matched.trim()}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const keys = positionalKeys(schema);
-      const value = stripQuotes(m[2].replace(/[。！？!?…\s]+$/, ""));
-      found.push({
-        exposedName: exposed,
-        server: hit.server,
-        toolName: hit.toolName,
-        args: keys.length ? { [keys[0]]: coerceBySchema(value, schema, keys[0]) } : {},
-        matched,
-        index: (m.index ?? 0) + m[1].length
-      });
-    }
-  }
-  return found.sort((a, b) => a.index - b.index).map(({ index: _index, ...call }) => call);
-};
-var MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION = "2025-11-25";
-var MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS = [
-  "2025-11-25",
-  "2025-06-18",
-  "2025-03-26"
-];
-var MCP_REQUEST_TIMEOUT_MS = 6e4;
-var createMcpSessionState = () => ({
-  sessionId: null,
-  initialized: false,
-  initPromise: null,
-  protocolVersion: null,
-  serverInfo: null,
-  serverCapabilities: null,
-  nextId: 0
-});
-var buildRpcRequest = (session, method, params, isNotification = false) => {
-  const req = { jsonrpc: "2.0", method, params };
-  if (!isNotification) req.id = ++session.nextId;
-  return req;
-};
-var parseSse = (text2) => {
-  const dataLines = [];
-  for (const line of text2.split("\n")) {
-    if (line.startsWith("data: ")) dataLines.push(line.slice(6));
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5));
-  }
-  for (let i = dataLines.length - 1; i >= 0; i--) {
-    try {
-      return JSON.parse(dataLines[i]);
-    } catch {
-    }
-  }
-  return null;
-};
-var parseResp = (text2, contentType) => {
-  if (contentType.includes("text/event-stream") || /^\s*(event:|data:)/.test(text2)) {
-    const parsed = parseSse(text2);
-    if (parsed) return parsed;
-  }
-  try {
-    return JSON.parse(text2);
-  } catch {
-    const m = text2.match(/\{[\s\S]*\}/);
-    if (m) {
-      try {
-        return JSON.parse(m[0]);
-      } catch {
-      }
-    }
-    throw new Error(`MCP: \u65E0\u6CD5\u89E3\u6790\u54CD\u5E94: ${text2.slice(0, 300)}`);
-  }
-};
-var readSseResponse = async (resp, expectedId) => {
-  const reader = resp.body?.getReader();
-  if (!reader) return parseResp(await resp.text(), "text/event-stream");
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const parseEvent = (event) => {
-    const data = event.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
-    if (!data || data === "[DONE]") return null;
-    try {
-      const parsed = JSON.parse(data);
-      return expectedId == null || parsed.id === expectedId ? parsed : null;
-    } catch {
-      return null;
-    }
-  };
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
-      const events = buffer.split(/\r?\n\r?\n/);
-      buffer = events.pop() || "";
-      for (const event of events) {
-        const parsed = parseEvent(event);
-        if (parsed) return parsed;
-      }
-      if (done) {
-        const parsed = parseEvent(buffer);
-        if (parsed) return parsed;
-        throw new Error("MCP SSE \u6D41\u7ED3\u675F\uFF0C\u4F46\u6CA1\u6709\u6536\u5230\u672C\u6B21\u8BF7\u6C42\u7684\u54CD\u5E94");
-      }
-    }
-  } finally {
-    await reader.cancel().catch(() => {
-    });
-  }
-};
-var postCore = async (target, session, body, timeoutMs, expectResponse = true) => {
-  target.signal?.throwIfAborted();
-  const headers = target.headers(session.sessionId, session.protocolVersion);
-  let resp;
-  const controller = new AbortController();
-  const abort = () => controller.abort(target.signal?.reason);
-  target.signal?.addEventListener("abort", abort, { once: true });
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    try {
-      resp = await fetch(target.url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-    } catch (e) {
-      target.signal?.throwIfAborted();
-      if (controller.signal.aborted) {
-        throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
-      }
-      const hint = target.fetchErrorHint || "";
-      throw new Error(`MCP \u8BF7\u6C42\u5931\u8D25: ${e?.message || e}\u3002${hint}`);
-    }
-    const readText = async () => {
-      try {
-        return await resp.text();
-      } catch (e) {
-        target.signal?.throwIfAborted();
-        if (controller.signal.aborted) {
-          throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
-        }
-        throw e;
-      }
-    };
-    const newSid = resp.headers.get("Mcp-Session-Id") || resp.headers.get("mcp-session-id");
-    if (newSid) session.sessionId = newSid;
-    if (resp.status === 401 || resp.status === 403) {
-      const txt = await readText().catch(() => "");
-      throw new Error(`MCP \u9274\u6743\u5931\u8D25 (${resp.status}): Token \u53EF\u80FD\u65E0\u6548\u6216\u8FC7\u671F\u3002${txt.slice(0, 120)}`);
-    }
-    if (resp.status === 202) return { response: null };
-    if (!resp.ok) {
-      const txt = await readText().catch(() => "");
-      throw new Error(`MCP HTTP ${resp.status}: ${txt.slice(0, 200)}`);
-    }
-    if (!expectResponse) return { response: null };
-    const ct = resp.headers.get("content-type") || "";
-    try {
-      if (ct.includes("text/event-stream")) {
-        return { response: await readSseResponse(resp, body.id) };
-      }
-      const text2 = await readText();
-      return { response: parseResp(text2, ct) };
-    } catch (e) {
-      target.signal?.throwIfAborted();
-      if (controller.signal.aborted) {
-        throw new Error(`MCP \u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(timeoutMs / 1e3)} \u79D2\uFF09`);
-      }
-      throw e;
-    }
-  } finally {
-    clearTimeout(timeoutId);
-    target.signal?.removeEventListener("abort", abort);
-  }
-};
-var initializeCore = async (target, session, timeoutMs) => {
-  const initReq = buildRpcRequest(session, "initialize", {
-    protocolVersion: MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION,
-    capabilities: {},
-    clientInfo: { name: "sullyos", title: "SullyOS", version: "1.0.0" }
-  });
-  const { response } = await postCore(target, session, initReq, timeoutMs);
-  if (response?.error) throw new Error(`Initialize \u5931\u8D25: ${response.error.message}`);
-  const negotiated = String(
-    response?.result?.protocolVersion || MCP_LATEST_HANDSHAKE_PROTOCOL_VERSION
-  );
-  if (!MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS.includes(negotiated)) {
-    throw new Error(
-      `MCP \u534F\u8BAE\u7248\u672C\u4E0D\u517C\u5BB9\uFF1A\u670D\u52A1\u5668\u9009\u62E9\u4E86 ${negotiated}\u3002SullyOS \u7684 Streamable HTTP \u63A5\u7EBF\u652F\u6301 ${MCP_SUPPORTED_HANDSHAKE_PROTOCOL_VERSIONS.join(" / ")}\uFF1B2024-11-05 \u5C5E\u4E8E\u65E7 HTTP+SSE \u53CC\u7AEF\u70B9\uFF0C2026-07-28 \u5219\u9700\u8981\u65B0\u7684\u65E0\u63E1\u624B\u751F\u547D\u5468\u671F\u3002`
-    );
-  }
-  session.protocolVersion = negotiated;
-  session.serverInfo = response?.result?.serverInfo || null;
-  session.serverCapabilities = response?.result?.capabilities || null;
-  const notif = buildRpcRequest(session, "notifications/initialized", {}, true);
-  await postCore(target, session, notif, timeoutMs, false).catch(() => {
-  });
-  session.initialized = true;
-};
-var ensureInitializedCore = async (target, session, timeoutMs) => {
-  if (session.initialized) return;
-  if (!session.initPromise) {
-    session.initPromise = initializeCore(target, session, timeoutMs).catch((e) => {
-      session.initPromise = null;
-      throw e;
-    });
-  }
-  await session.initPromise;
-};
-var isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-var resolveLocalSchemaRef = (schema, rootSchema) => {
-  const ref = typeof schema?.$ref === "string" ? schema.$ref : "";
-  if (!ref.startsWith("#/")) return schema;
-  const resolved = ref.slice(2).split("/").reduce((current, part) => {
-    const key = part.replace(/~1/g, "/").replace(/~0/g, "~");
-    return current?.[key];
-  }, rootSchema);
-  return resolved || schema;
-};
-var schemaAccepts = (schema, kind) => {
-  const types = Array.isArray(schema?.type) ? schema.type : [schema?.type];
-  if (types.includes(kind)) return true;
-  if (kind === "object" && schema?.properties) return true;
-  if (kind === "array" && schema?.items) return true;
-  return [...schema?.oneOf || [], ...schema?.anyOf || []].some((item) => schemaAccepts(item, kind));
-};
-var normalizeMcpValueBySchema = (value, rawSchema, rootSchema, depth) => {
-  if (!rawSchema || depth > 20) return value;
-  const schema = resolveLocalSchemaRef(rawSchema, rootSchema);
-  const acceptsObject = schemaAccepts(schema, "object");
-  const acceptsArray = schemaAccepts(schema, "array");
-  let normalized = value;
-  if (typeof normalized === "string" && (acceptsObject || acceptsArray)) {
-    for (let i = 0; i < 3 && typeof normalized === "string"; i++) {
-      const text2 = normalized.trim();
-      if (!text2) break;
-      try {
-        normalized = JSON.parse(text2);
-      } catch {
-        break;
-      }
-    }
-    const decodedMatchesSchema = acceptsObject && isRecord(normalized) || acceptsArray && Array.isArray(normalized);
-    if (!decodedMatchesSchema) normalized = value;
-  }
-  const alternatives = [...schema?.oneOf || [], ...schema?.anyOf || []];
-  if (alternatives.length) {
-    const matching = alternatives.find(
-      (item) => isRecord(normalized) && schemaAccepts(item, "object") || Array.isArray(normalized) && schemaAccepts(item, "array")
-    );
-    if (matching) normalized = normalizeMcpValueBySchema(normalized, matching, rootSchema, depth + 1);
-  }
-  if (isRecord(normalized) && acceptsObject) {
-    const result = { ...normalized };
-    const properties = schema?.properties || {};
-    for (const [key, childSchema] of Object.entries(properties)) {
-      if (key in result) result[key] = normalizeMcpValueBySchema(result[key], childSchema, rootSchema, depth + 1);
-    }
-    if (schema?.additionalProperties && typeof schema.additionalProperties === "object") {
-      for (const key of Object.keys(result)) {
-        if (!(key in properties)) {
-          result[key] = normalizeMcpValueBySchema(result[key], schema.additionalProperties, rootSchema, depth + 1);
-        }
-      }
-    }
-    for (const item of schema?.allOf || []) {
-      const merged = normalizeMcpValueBySchema(result, item, rootSchema, depth + 1);
-      if (isRecord(merged)) Object.assign(result, merged);
-    }
-    return result;
-  }
-  if (Array.isArray(normalized) && acceptsArray && schema?.items) {
-    return normalized.map((item) => normalizeMcpValueBySchema(item, schema.items, rootSchema, depth + 1));
-  }
-  return normalized;
-};
-var normalizeMcpToolArguments = (args, inputSchema) => normalizeMcpValueBySchema(args, inputSchema, inputSchema, 0);
-var targetHost = (url) => {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "";
-  }
-};
-var callMcpToolCore = async (target, session, toolName, args = {}, opts = {}) => {
-  target = { ...target, signal: opts.signal ?? target.signal };
-  target.signal?.throwIfAborted();
-  const timeoutMs = opts.timeoutMs ?? MCP_REQUEST_TIMEOUT_MS;
-  const normalizedArgs = normalizeMcpToolArguments(args, opts.inputSchema);
-  const finish = (result) => {
-    let resultPreview = "";
-    if (result.success) {
-      try {
-        resultPreview = JSON.stringify(result.data).slice(0, 800);
-      } catch {
-        resultPreview = String(result.data).slice(0, 800);
-      }
-    }
-    console.info("\u{1F50C} [MCP] tools/call \u5B8C\u6210", {
-      server: opts.serverLabel ?? targetHost(target.url),
-      tool: toolName,
-      args: normalizedArgs,
-      success: result.success,
-      ...result.success ? { result: resultPreview } : { error: result.error }
-    });
-    return result;
-  };
-  try {
-    await ensureInitializedCore(target, session, timeoutMs);
-    const body = buildRpcRequest(session, "tools/call", { name: toolName, arguments: normalizedArgs });
-    let response;
-    try {
-      ({ response } = await postCore(target, session, body, timeoutMs));
-    } catch (e) {
-      if (/HTTP (400|404)/.test(e?.message || "")) {
-        Object.assign(session, createMcpSessionState());
-        await ensureInitializedCore(target, session, timeoutMs);
-        ({ response } = await postCore(
-          target,
-          session,
-          buildRpcRequest(session, "tools/call", { name: toolName, arguments: normalizedArgs }),
-          timeoutMs
-        ));
-      } else {
-        throw e;
-      }
-    }
-    if (!response) return finish({ success: false, error: "\u7A7A\u54CD\u5E94" });
-    if (response.error) return finish({ success: false, error: `MCP \u9519\u8BEF [${response.error.code}]: ${response.error.message}` });
-    const result = response.result;
-    if (result?.resultType === "input_required") {
-      return finish({
-        success: false,
-        error: "\u8FD9\u4E2A\u5DE5\u5177\u9700\u8981\u5728\u6267\u884C\u9014\u4E2D\u8865\u5145\u786E\u8BA4\u6216\u8F93\u5165\uFF1BSullyOS \u5F53\u524D\u4E0D\u4F1A\u66FF\u4F60\u81EA\u52A8\u56DE\u7B54\uFF0C\u8BF7\u56DE\u5230\u804A\u5929\u4E2D\u660E\u786E\u8981\u6C42\u540E\u91CD\u8BD5\u3002",
-        data: result
-      });
-    }
-    if (result?.content && Array.isArray(result.content)) {
-      const textParts = result.content.filter((c) => c?.type === "text").map((c) => c.text || "");
-      const fullText = textParts.join("\n").trim();
-      if (result.isError) return finish({ success: false, error: fullText || "MCP \u5DE5\u5177\u6267\u884C\u5931\u8D25", rawText: fullText });
-      try {
-        return finish({ success: true, data: JSON.parse(fullText), rawText: fullText });
-      } catch {
-        return finish({ success: true, data: fullText, rawText: fullText });
-      }
-    }
-    return finish({ success: true, data: result });
-  } catch (e) {
-    target.signal?.throwIfAborted();
-    return finish({ success: false, error: e?.message || String(e) });
-  }
-};
-var buildMcpDirectHeaders = (server, sessionId, protocolVersion = null) => {
-  const headers = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream"
-  };
-  for (const item of server.customHeaders || []) {
-    const name = String(item?.name || "").trim();
-    const value = String(item?.value || "").trim();
-    if (name && value) headers[name] = value;
-  }
-  if (server.token) headers["Authorization"] = `Bearer ${server.token}`;
-  if (sessionId) headers["Mcp-Session-Id"] = sessionId;
-  if (protocolVersion) headers["MCP-Protocol-Version"] = protocolVersion;
-  return headers;
-};
-var filterMcpServersForChar = (servers, charId) => (servers || []).filter(
-  (s) => !!s.url && (s.tools?.length || 0) > 0 && (!s.charIds?.length || s.charIds.includes(charId))
-);
-var buildMcpFireTools = (resolve) => {
-  const multiServer = new Set([...resolve.values()].map(({ server }) => server.id)).size > 1;
-  const tools = [];
-  for (const [exposed, { server, tool }] of resolve) {
-    const desc = (tool.description || "").trim();
-    tools.push({
-      type: "function",
-      function: {
-        name: `${MCP_FIRE_NAME_PREFIX}${exposed}`,
-        description: multiServer ? `[${server.name}] ${desc}`.trim() : desc,
-        parameters: tool.inputSchema || { type: "object", properties: {} }
-      }
-    });
-  }
-  return tools;
-};
-var buildMcpFireBlock = (resolve, opts) => {
-  if (!resolve.size) return "";
-  const userName = opts.userName || "\u7528\u6237";
-  const multiServer = new Set([...resolve.values()].map(({ server }) => server.id)).size > 1;
-  const lines = [];
-  for (const [exposed, { server, tool }] of resolve) {
-    const desc = (tool.description || "").trim();
-    if (opts.mode === "native") {
-      lines.push(`- ${exposed}${desc ? `\uFF1A${desc}` : ""}${multiServer ? `\uFF08\u6765\u6E90: ${server.name}\uFF09` : ""}`);
-      continue;
-    }
-    const schema = tool.inputSchema || {};
-    const required = new Set(Array.isArray(schema.required) ? schema.required : []);
-    const args = Object.entries(schema.properties || {}).map(([name, d]) => `${name}${required.has(name) ? "*" : ""}:${d?.type || "any"}`);
-    lines.push(`- ${exposed}(${args.join(", ")})${desc ? `\uFF1A${desc}` : ""}${multiServer ? `\uFF08\u6765\u6E90: ${server.name}\uFF09` : ""}`);
-  }
-  const howTo = opts.mode === "native" ? "\u9700\u8981\u65F6\u76F4\u63A5\u901A\u8FC7\u7CFB\u7EDF\u7684\u5DE5\u5177\u8C03\u7528\u63A5\u53E3\u53D1\u8D77\uFF08\u7CFB\u7EDF\u4F1A\u81EA\u52A8\u6267\u884C\u5E76\u628A\u7ED3\u679C\u7ED9\u4F60\uFF09\uFF0C\u4E0D\u8981\u628A\u5DE5\u5177\u540D\u548C\u53C2\u6570\u5199\u8FDB\u6B63\u6587\u3002" : '\u9700\u8981\u5DE5\u5177\u65F6\uFF0C\u5355\u72EC\u8F93\u51FA\u4E00\u884C tool_name({"\u53C2\u6570":"\u503C"})\uFF0C\u7CFB\u7EDF\u4F1A\u4EE3\u4E3A\u6267\u884C\u5E76\u628A\u7ED3\u679C\u7ED9\u4F60\uFF0C\u7136\u540E\u4F60\u7EE7\u7EED\u5199\u3002* \u8868\u793A\u5FC5\u586B\u53C2\u6570\u3002';
-  return [
-    "",
-    "---",
-    `\u3010\u5916\u90E8\u5DE5\u5177 \u2014\u2014 ${userName} \u5728\u8BBE\u7F6E\u91CC\u7ED9\u4F60\u8FDE\u4E86 MCP \u5DE5\u5177\u670D\u52A1\u5668\uFF0C\u4E3B\u52A8\u6D88\u606F\u91CC\u4E5F\u53EF\u4EE5\u7528\u3011`,
-    howTo,
-    "\u7EAA\u5F8B\uFF1A\u4E0D\u9700\u8981\u5C31\u522B\u786C\u8C03\uFF1B\u6CA1\u6536\u5230\u7CFB\u7EDF\u8FD4\u56DE\u524D\u4E0D\u8981\u58F0\u79F0\u5DE5\u5177\u6210\u529F\uFF0C\u4E5F\u4E0D\u8981\u7F16\u9020\u7ED3\u679C\uFF1B\u5DE5\u5177\u5931\u8D25\u5C31\u6362\u4E2A\u65B9\u5F0F\u6216\u5982\u5B9E\u5E26\u8FC7\uFF1B\u7ED3\u679C\u53EA\u6311\u76F8\u5173\u90E8\u5206\u7528\u89D2\u8272\u8BED\u6C14\u8F6C\u8FF0\uFF0C\u522B\u590D\u8BFB JSON\u3002",
-    "\u591A\u6B65\u4EFB\u52A1\uFF1A\u5148\u505A\u5FC5\u8981\u68C0\u67E5\uFF0C\u968F\u540E\u7ACB\u523B\u8C03\u7528\u80FD\u63A8\u8FDB\u76EE\u6807\u7684\u52A8\u4F5C\u5DE5\u5177\uFF1B\u4E0D\u8981\u53CD\u590D\u8BFB\u53D6\u540C\u4E00\u4EFD\u8BF4\u660E\u6216\u72B6\u6001\u3002\u6267\u884C\u52A8\u4F5C\u540E\u53EF\u4EE5\u518D\u6B21\u68C0\u67E5\u65B0\u72B6\u6001\uFF0C\u5E76\u7EE7\u7EED\u5230\u76EE\u6807\u5B8C\u6210\u6216\u5DE5\u5177\u660E\u786E\u5931\u8D25\u3002",
-    `\u526F\u4F5C\u7528\u64CD\u4F5C\uFF1A${userName} \u672C\u8F6E\u5DF2\u7ECF\u660E\u786E\u8981\u6C42\u6267\u884C\u7684\u89C6\u4E3A\u5DF2\u786E\u8BA4\uFF1B\u6CA1\u6709\u660E\u786E\u8981\u6C42\u65F6\u624D\u5148\u786E\u8BA4\u3002`,
-    "\u53EF\u7528\u5DE5\u5177\uFF1A",
-    ...lines,
-    "---"
-  ].join("\n");
-};
 
 // utils/realtimeFetchCore.ts
 var performSearch = async (query, apiKey, signal) => {
@@ -16301,6 +18260,12 @@ async function dispatchAgenticTool(toolName, args, ctx) {
   }
 }
 
+// utils/replyScope.ts
+var buildReplyScopeRule = (trigger) => {
+  const start = trigger === "user" ? "\u4ECE\u7528\u6237\u6700\u65B0\u53D1\u6765\u7684\u90A3\u6761\u6D88\u606F\u5F00\u59CB" : "\u4ECE\u4F60\u6536\u5230\u8FD9\u4EFD\u8BF4\u660E\u5F00\u59CB\uFF08\u4F60\u4E4B\u524D\u5B89\u6392\u7684\u4E3B\u52A8\u6D88\u606F\u5230\u70B9\u4E86\uFF09";
+  return `[\u8FD9\u6B21\u56DE\u590D\u7684\u8303\u56F4\uFF1A${start}\uFF0C\u5230\u4F60\u7ED9\u51FA\u4E00\u6761\u4E0D\u518D\u8C03\u7528\u5DE5\u5177\u7684\u6B63\u6587\u4E3A\u6B62\u3002\u8FD9\u671F\u95F4\u4F60\u6BCF\u8C03\u7528\u4E00\u6B21\u5DE5\u5177\u3001\u62FF\u5230\u4E00\u6B21\u7ED3\u679C\uFF0C\u90FD\u53EA\u662F\u8FD9\u6B21\u56DE\u590D\u91CC\u7684\u4E00\u6B65\uFF0C\u4E0D\u662F\u65B0\u7684\u4E00\u6B21\uFF1B\u4F60\u5728\u8FD9\u671F\u95F4\u5199\u4E0B\u7684\u8BDD\u90FD\u7B97\u8FD9\u6B21\u56DE\u590D\u7684\u4E00\u90E8\u5206\uFF0C\u540E\u9762\u4E0D\u5FC5\u91CD\u590D\u3002]`;
+};
+
 // utils/agenticToolFeedback.ts
 var toolCallFingerprint = (name, args) => {
   const normalize2 = (value) => {
@@ -16397,1194 +18362,6 @@ var buildDuplicateToolMessage = (name) => [
   "[\u7CFB\u7EDF: \u8FD9\u4E00\u6B21\u6CA1\u6709\u518D\u6267\u884C\u3002\u522B\u518D\u91CD\u590D\u540C\u6837\u7684\u8C03\u7528\u4E86\u2014\u2014\u73B0\u5728\u628A\u8981\u53D1\u7684\u6D88\u606F\u5199\u51FA\u6765\uFF0C",
   "\u6216\u8005\u6362\u4E00\u4E2A\u8FD8\u6CA1\u7528\u8FC7\u7684\u5DE5\u5177\u3002\u524D\u9762\u5DF2\u7ECF\u8BF4\u51FA\u53BB\u7684\u5185\u5BB9\u548C\u6807\u7B7E\u4E0D\u8981\u91CD\u5199\uFF0C\u63A5\u7740\u5F80\u4E0B\u5199\u5C31\u884C\u3002]"
 ].join("\n");
-
-// utils/voiceTextDedup.ts
-function deduplicateVoiceText(text2) {
-  if (/\[html\]|<翻[译譯]>|```/i.test(text2)) return text2;
-  const normalize2 = (s) => s.replace(/[\s\p{P}\p{S}]/gu, "").toLowerCase();
-  const blocks = [];
-  const spoken = [];
-  const protectedText = text2.replace(/<[语語]音[^>]*>([\s\S]*?)<\/[语語]音>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/g, (block, voice, subtitle) => {
-    spoken.push(normalize2(voice), ...subtitle ? [normalize2(subtitle)] : []);
-    return "\nVOICE" + (blocks.push(block) - 1) + "\n";
-  });
-  if (!blocks.length) return text2;
-  return protectedText.split(/\r?\n/).filter((line) => {
-    if (/[<>\[\]\u0002]/.test(line)) return true;
-    const plain = normalize2(line);
-    return plain.length < 12 || !spoken.some((voice) => voice.includes(plain));
-  }).join("\n").replace(/\u0002VOICE(\d+)\u0002/g, (_, i) => blocks[Number(i)]).trim();
-}
-
-// ../../../Users/tntobsidian/Documents/GitHub/SullyOS/node_modules/.pnpm/@rei-standard+amsg-instant@0.11.0-next.9/node_modules/@rei-standard/amsg-instant/dist/index.mjs
-var WEB_PUSH_MAX_BODY_BYTES2 = 4096;
-var WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2 = 16 + 4 + 1 + 65 + 1 + 16;
-var MAX_PUSH_PAYLOAD_BYTES2 = WEB_PUSH_MAX_BODY_BYTES2 - WEB_PUSH_ENCRYPTION_OVERHEAD_BYTES2;
-var PROBE_BYTE_ENCODER = new TextEncoder();
-var LONGEST_MESSAGE_KIND = Object.values(MESSAGE_KIND2).reduce((longest, kind) => kind.length > longest.length ? kind : longest, "");
-var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
-function segmentTextWithProtectedBlocks(text2, options) {
-  if (!text2) return [];
-  const splitAndSanitize = (plainText) => {
-    const chunks = options.splitText(plainText).filter((c) => c !== "");
-    return chunks.map((chunk) => ({
-      raw: chunk,
-      sanitized: options.sanitizeText ? options.sanitizeText(chunk) : chunk,
-      protect: false
-    }));
-  };
-  if (!options.protectedPatterns || options.protectedPatterns.length === 0) {
-    return splitAndSanitize(text2);
-  }
-  const matches = [];
-  for (const p of options.protectedPatterns) {
-    const flags = p.pattern.flags.includes("g") ? p.pattern.flags : p.pattern.flags + "g";
-    const regex = new RegExp(p.pattern.source, flags);
-    let match;
-    while ((match = regex.exec(text2)) !== null) {
-      if (match[0].length === 0) {
-        regex.lastIndex++;
-        continue;
-      }
-      matches.push({
-        index: match.index,
-        length: match[0].length,
-        raw: match[0],
-        matchObj: match,
-        patternDef: p
-      });
-    }
-  }
-  matches.sort((a, b) => {
-    if (a.index !== b.index) return a.index - b.index;
-    return b.length - a.length;
-  });
-  const validMatches = [];
-  let lastEnd = 0;
-  for (const m of matches) {
-    if (m.index >= lastEnd) {
-      validMatches.push(m);
-      lastEnd = m.index + m.length;
-    }
-  }
-  const segments = [];
-  let cursor = 0;
-  const resolveField = (field, raw, match) => typeof field === "function" ? field(raw, match) : field;
-  for (const m of validMatches) {
-    if (m.index > cursor) {
-      const plainText = text2.substring(cursor, m.index);
-      segments.push(...splitAndSanitize(plainText));
-    }
-    const previewStr = resolveField(m.patternDef.preview, m.raw, m.matchObj);
-    const metaData = resolveField(m.patternDef.meta, m.raw, m.matchObj);
-    let sanitized = previewStr;
-    if (sanitized == null) {
-      sanitized = options.sanitizeText ? options.sanitizeText(m.raw) : m.raw;
-    }
-    const pushSeg = {
-      raw: m.raw,
-      sanitized,
-      protect: true
-    };
-    if (metaData !== void 0) {
-      pushSeg.meta = metaData;
-    }
-    segments.push(pushSeg);
-    cursor = m.index + m.length;
-  }
-  if (cursor < text2.length) {
-    const plainText = text2.substring(cursor);
-    segments.push(...splitAndSanitize(plainText));
-  }
-  return segments;
-}
-var SSE_ENCODER = new TextEncoder();
-var SSE_KEEPALIVE_BYTES = SSE_ENCODER.encode(": keepalive\n\n");
-var SSE_DONE_BYTES = SSE_ENCODER.encode("event: done\ndata: {}\n\n");
-
-// utils/sanitize.ts
-var stripLiteralBackslashN = (t) => t.replace(/\\n/g, "\n");
-var stripLeakedSourceTags = (t) => t.replace(
-  /\s*\[\s*(?:聊\s*(?:天|chat)|chat|通\s*(?:话|call)|call|约\s*(?:会|date)|date)\s*\]\s*/giu,
-  "\n"
-);
-var stripTimestamps = (t) => t.replace(/\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*/g, "").replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*/gm, "").replace(/（[上下]午\d{1,2}[：:]\d{2}）/g, "").replace(/\(\d{1,2}:\d{2}\s*[AP]M\)/gi, "");
-var stripChineseDate = (t) => t.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, "");
-var stripRoleNamePrefix = (t) => t.replace(/^[\w一-龥]+:\s*/, "");
-var stripBusinessTagsForBubble = (t) => t.replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[\s*[记記][录錄]\s*[:：][\s\S]*?\]\]/g, "").replace(/\[schedule_message[^\]]*\]/g, "");
-var stripBusinessTagsForNotification = (t) => stripBusinessTagsForBubble(t).replace(/\[\[(?:READ_NOTE|XHS_[A-Z_]+|LIFE|NEWS_CARD)[:\s][\s\S]*?\]\]/g, "").replace(/\[\[XHS_[A-Z_]+\]\]/g, "");
-var stripAllDoubleBracketTags = (t) => t.replace(/\[\[[\s\S]*?\]\]/g, "");
-var stripQuotes2 = (t) => t.replace(/\[\[(?:QU[OA]TE|引用)[：:][\s\S]*?\]\]/g, "").replace(/\[(?:QU[OA]TE|引用)[：:][^\]]*\]/g, "").replace(/\[回复\s*[""“][^""”]*?[""”](?:\.{0,3})\]\s*[：:]?\s*/g, "").replace(/\[[^\[\]\n「」]{0,24}引用了[^\[\]\n「」]{0,24}「[^」\n]*?」[^\[\]\n]{0,24}\]\s*/g, "");
-var stripSystemLogLeak = (t) => t.replace(/[\[【]\s*(?:系统|系統|System)\s*(?:提示)?\s*[:：][^\[\]【】]*[\]】]\s*/gi, "").replace(/\[\s*(?:系统|系統)\s*\]\s*/g, "");
-var stripMarkdownHeaders = (t) => t.replace(/^#{1,6}\s+/gm, "");
-var stripMarkdownBold = (t) => t.replace(/\*{2,}/g, "");
-var stripMarkdownDividers = (t) => t.replace(/^\s*---\s*$/gm, "").replace(/^\s*[-*+]\s*$/gm, "");
-var stripBackticks = (t) => t.replace(/`(\[\[[\s\S]*?\]\])`/g, "$1").replace(/``+/g, "").replace(/(^|\s)`(\s|$)/gm, "$1$2");
-var stripLegacyTrans = (t) => t.replace(/%%TRANS%%[\s\S]*/gi, "");
-var collapseWhitespace = (t) => t.replace(/\n{3,}/g, "\n\n").trim();
-var stripThinkBlocks = (t) => t.replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, "").replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, "");
-var stripInnerState = (t) => t.replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, "");
-var replaceMarkdownLinks = (t) => t.replace(/\[([^\]]+)\]\([^)]+\)/g, "[\u94FE\u63A5\uFF1A$1]");
-var replaceSendEmoji = (t) => t.replace(/\[\[SEND_EMOJI[:：]\s*(.+?)\]\]/g, "[\u8868\u60C5\uFF1A$1]");
-var replaceEmojiReverseTag = (t) => t.replace(/\[(?:你|User|用户|System|[\w一-龥]+)\s*发送了表情包[:：]\s*(.*?)\]/g, "[\u8868\u60C5\uFF1A$1]");
-var replaceHtmlBlocks = (t) => t.replace(/\[html\][\s\S]*?\[\/html\]/gi, "[HTML \u5361\u7247]");
-var replaceTranslationForBanner = (t) => t.replace(/<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, "$1").replace(/<译文>[\s\S]*?<\/译文>/g, "").replace(/<\/?(?:翻译|原文)>/g, "");
-var replaceVoiceForBanner = (t) => t.replace(
-  /(?:<字幕>([\s\S]*?)<\/字幕>\s*)?<[语語]音[^>]*>([\s\S]*?)<\/\s*[语語]音\s*>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/g,
-  (_m, pre, inner, post) => (post || pre || inner || "").trim()
-).replace(/<字幕>([\s\S]*?)<\/字幕>/g, "$1").replace(/<\/?字幕>/g, "");
-function repairPairedTag(text2, tokenRe, closeFormOf, closeBeforeTrailingSubtitle) {
-  const kept = [];
-  let cursor = 0;
-  let openForm = null;
-  let tok;
-  while ((tok = tokenRe.exec(text2)) !== null) {
-    const isClose = tok[0].startsWith("</");
-    if (!isClose && /\/\s*>$/.test(tok[0])) {
-      kept.push(text2.slice(cursor, tok.index));
-      cursor = tok.index + tok[0].length;
-      continue;
-    }
-    if (isClose) {
-      if (openForm === null) {
-        kept.push(text2.slice(cursor, tok.index));
-        cursor = tok.index + tok[0].length;
-      } else {
-        openForm = null;
-      }
-    } else if (openForm !== null) {
-      kept.push(text2.slice(cursor, tok.index));
-      cursor = tok.index + tok[0].length;
-    } else {
-      openForm = closeFormOf(tok[0]);
-    }
-  }
-  kept.push(text2.slice(cursor));
-  let result = kept.join("");
-  if (openForm !== null) {
-    const closeTag = `</${openForm}>`;
-    if (closeBeforeTrailingSubtitle) {
-      const trail = result.match(/(\s*<字幕>[\s\S]*?<\/字幕>\s*)$/);
-      if (trail) {
-        const at = result.length - trail[0].length;
-        return result.slice(0, at).replace(/\s+$/, "") + closeTag + trail[0].replace(/\s+$/, "");
-      }
-    }
-    result = result.replace(/\s+$/, "") + closeTag;
-  }
-  return result;
-}
-function normalizeVoiceTags(t) {
-  if (!/[语語]音|字幕/.test(t)) return t;
-  let result = t;
-  result = result.replace(/＜\s*[/／]\s*([语語]音|字幕)\s*＞/g, "</$1>");
-  result = result.replace(/＜\s*((?:[语語]音|字幕)[^<>＜＞]*?)\s*＞/g, "<$1>");
-  result = result.replace(/<\s*[/／]\s*([语語]音|字幕)\s*>/g, "</$1>");
-  result = result.replace(/<([语語]音|字幕)\s*([^<>]*?)\s*>/g, (_m, tag2, attrs) => {
-    if (!attrs) return `<${tag2}>`;
-    const fixed = attrs.replace(/[“”＂]/g, '"').replace(/[‘’]/g, "'").replace(/＝/g, "=").trim();
-    return `<${tag2} ${fixed}>`;
-  });
-  result = repairPairedTag(result, /<\/?[语語]音[^>]*>/g, (tok) => /語/.test(tok) ? "\u8A9E\u97F3" : "\u8BED\u97F3", true);
-  result = repairPairedTag(result, /<\/?字幕[^>]*>/g, () => "\u5B57\u5E55", false);
-  return result;
-}
-var simpTransTag = (tag2) => tag2.replace(/譯/g, "\u8BD1");
-function normalizeTranslationTags(t) {
-  if (!/[<＜]\s*[/／]?\s*(?:翻[译譯]|原文|[译譯]文)/.test(t)) return t;
-  let result = t;
-  result = result.replace(/[<＜]\s*[/／]\s*(翻[译譯]|原文|[译譯]文)\s*[>＞]/g, (_m, tag2) => `</${simpTransTag(tag2)}>`);
-  result = result.replace(/[<＜]\s*(翻[译譯]|原文|[译譯]文)\s*[>＞]/g, (_m, tag2) => `<${simpTransTag(tag2)}>`);
-  result = result.replace(
-    /[<＜]\s*([/／]?)\s*(翻[译譯]|原文|[译譯]文)\s*(?=$|\n|[<＜])/g,
-    (_m, slash, tag2) => `<${slash ? "/" : ""}${simpTransTag(tag2)}>`
-  );
-  result = repairPairedTag(result, /<\/?原文[^>]*>/g, () => "\u539F\u6587", false);
-  result = repairPairedTag(result, /<\/?译文[^>]*>/g, () => "\u8BD1\u6587", false);
-  result = repairPairedTag(result, /<\/?翻译[^>]*>/g, () => "\u7FFB\u8BD1", false);
-  const HOLD = String.fromCharCode(3);
-  const blocks = [];
-  const hold = (m) => {
-    blocks.push(m);
-    return `${HOLD}${blocks.length - 1}${HOLD}`;
-  };
-  result = result.replace(/<翻译>\s*<原文>[\s\S]*?<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, hold);
-  result = result.replace(
-    /(?:<翻译>\s*)?<原文>([\s\S]*?)<\/原文>\s*<译文>([\s\S]*?)<\/译文>\s*(?:<\/翻译>)?/g,
-    (_m, a, b) => hold(`<\u7FFB\u8BD1><\u539F\u6587>${a.trim()}</\u539F\u6587><\u8BD1\u6587>${b.trim()}</\u8BD1\u6587></\u7FFB\u8BD1>`)
-  );
-  result = result.replace(
-    /<翻译>\s*(?!<原文>)((?:(?!<\/?翻译>)[\s\S])*?)<\/翻译>\s*<译文>([\s\S]*?)<\/译文>/g,
-    (_m, a, b) => hold(`<\u7FFB\u8BD1><\u539F\u6587>${a.trim()}</\u539F\u6587><\u8BD1\u6587>${b.trim()}</\u8BD1\u6587></\u7FFB\u8BD1>`)
-  );
-  result = result.replace(/<译文>[\s\S]*?<\/译文>/g, "");
-  result = result.replace(/[<＜]\s*[/／]?\s*(?:翻[译譯]|原文|[译譯]文)\s*[>＞]?/g, "");
-  result = result.replace(new RegExp(`${HOLD}(\\d+)${HOLD}`, "g"), (_m, n) => blocks[Number(n)] || "");
-  return result;
-}
-var extractTranslationOriginal = (t) => {
-  let result = t.replace(
-    /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g,
-    "$1"
-  );
-  result = result.replace(/<译文>[\s\S]*?<\/译文>/g, "");
-  result = result.replace(/<\/?(?:翻译|原文)>/g, "");
-  return result;
-};
-function sanitizeForNotification(text2) {
-  let result = text2;
-  result = stripLiteralBackslashN(result);
-  result = stripThinkBlocks(result);
-  result = replaceHtmlBlocks(result);
-  result = replaceEmojiReverseTag(result);
-  result = replaceSendEmoji(result);
-  result = normalizeTranslationTags(result);
-  result = extractTranslationOriginal(result);
-  result = stripTimestamps(result);
-  result = stripChineseDate(result);
-  result = stripRoleNamePrefix(result);
-  result = stripSystemLogLeak(result);
-  result = stripLeakedSourceTags(result);
-  result = stripInnerState(result);
-  result = stripBusinessTagsForNotification(result);
-  result = stripQuotes2(result);
-  result = replaceMarkdownLinks(result);
-  result = stripMarkdownHeaders(result);
-  result = stripMarkdownBold(result);
-  result = stripMarkdownDividers(result);
-  result = stripBackticks(result);
-  result = stripLegacyTrans(result);
-  result = collapseWhitespace(result);
-  return result;
-}
-function sanitizeIntoSegments(text2) {
-  let cleaned = stripLiteralBackslashN(text2);
-  cleaned = stripThinkBlocks(cleaned);
-  cleaned = deduplicateVoiceText(normalizeVoiceTags(cleaned));
-  cleaned = normalizeTranslationTags(cleaned);
-  const ATOM_MARKER = String.fromCharCode(2);
-  const atomBlocks = [];
-  const atomSegments = segmentTextWithProtectedBlocks(cleaned, {
-    splitText: (plainText) => [plainText],
-    protectedPatterns: [
-      {
-        pattern: /\[html\][\s\S]*?\[\/html\]/i,
-        preview: "[HTML \u5361\u7247]"
-      },
-      {
-        pattern: /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/,
-        preview: (_raw, match) => (match[1] || "").trim() || "[\u7FFB\u8BD1]"
-      },
-      {
-        // 语音块 + 紧邻的 <字幕> 块是一个原子单元 (字幕是这条语音的中文对照, 拆开
-        // 就配不上了)。字幕前置/后置都容忍; banner 预览优先用字幕 (用户读得懂中文)。
-        // 闭合容许空格 + 简繁互换 (normalizeVoiceTags 已修, 这里不再依赖 \1 回引)。
-        pattern: /(?:<字幕>([\s\S]*?)<\/字幕>\s*)?<[语語]音[^>]*>([\s\S]*?)<\/\s*[语語]音\s*>(?:\s*<字幕>([\s\S]*?)<\/字幕>)?/,
-        preview: (_raw, match) => (match[3] || match[1] || match[2] || "").trim() || "[\u8BED\u97F3]"
-      }
-    ]
-  });
-  cleaned = atomSegments.map((seg) => {
-    if (!seg.protect) return seg.raw;
-    const idx = atomBlocks.length;
-    atomBlocks.push({
-      raw: seg.raw,
-      sanitized: typeof seg.sanitized === "string" ? seg.sanitized : sanitizeTextForBanner(seg.raw)
-    });
-    return `
-${ATOM_MARKER}B${idx}${ATOM_MARKER}
-`;
-  }).join("");
-  cleaned = extractTranslationOriginal(cleaned);
-  cleaned = stripInnerState(cleaned);
-  cleaned = stripBusinessTagsForNotification(cleaned);
-  cleaned = stripTimestamps(cleaned);
-  cleaned = stripChineseDate(cleaned);
-  cleaned = stripRoleNamePrefix(cleaned);
-  cleaned = stripLeakedSourceTags(cleaned);
-  cleaned = stripLegacyTrans(cleaned);
-  cleaned = stripMarkdownDividers(cleaned);
-  const rawChunks = chunkText(cleaned);
-  const SOLO_RE = new RegExp(`^${ATOM_MARKER}B(\\d+)${ATOM_MARKER}$`);
-  const GLOBAL_RE = new RegExp(`${ATOM_MARKER}B(\\d+)${ATOM_MARKER}`, "g");
-  const segments = [];
-  let pendingQuoteRaw = "";
-  for (const rawChunk of rawChunks) {
-    const soloMatch = rawChunk.trim().match(SOLO_RE);
-    if (soloMatch) {
-      const blk = atomBlocks[Number(soloMatch[1])];
-      if (blk) segments.push({ raw: blk.raw, sanitized: blk.sanitized });
-      continue;
-    }
-    const parts = splitOnSendEmoji(rawChunk);
-    for (const part of parts) {
-      if (part.kind === "emoji") {
-        segments.push({
-          raw: `[[SEND_EMOJI: ${part.name}]]`,
-          sanitized: `[\u8868\u60C5\uFF1A${part.name}]`
-        });
-        continue;
-      }
-      let rawText = part.text.replace(
-        GLOBAL_RE,
-        (_m, n) => atomBlocks[Number(n)]?.raw || ""
-      );
-      rawText = rawText.trim();
-      if (!rawText) continue;
-      const sanitized = sanitizeTextForBanner(rawText).trim();
-      if (!sanitized) {
-        if (!stripQuotes2(rawText).trim()) pendingQuoteRaw += `${rawText}
-`;
-        continue;
-      }
-      if (!stripAllDoubleBracketTags(sanitized).trim()) continue;
-      segments.push({
-        raw: pendingQuoteRaw ? `${pendingQuoteRaw}${rawText}` : rawText,
-        sanitized
-      });
-      pendingQuoteRaw = "";
-    }
-  }
-  return segments;
-}
-function sanitizeTextForBanner(text2) {
-  let result = text2;
-  result = replaceHtmlBlocks(result);
-  result = replaceTranslationForBanner(result);
-  result = replaceVoiceForBanner(result);
-  result = stripQuotes2(result);
-  result = stripSystemLogLeak(result);
-  result = replaceEmojiReverseTag(result);
-  result = replaceMarkdownLinks(result);
-  result = stripMarkdownHeaders(result);
-  result = stripMarkdownBold(result);
-  result = stripBackticks(result);
-  result = collapseWhitespace(result);
-  return result;
-}
-function chunkText(text2) {
-  return text2.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
-}
-function splitOnSendEmoji(chunk) {
-  const re = /\[\[SEND_EMOJI[:：]\s*(.*?)\]\]/g;
-  const parts = [];
-  let lastIndex = 0;
-  let m;
-  while ((m = re.exec(chunk)) !== null) {
-    if (m.index > lastIndex) {
-      parts.push({ kind: "text", text: chunk.slice(lastIndex, m.index) });
-    }
-    parts.push({ kind: "emoji", name: m[1].trim() });
-    lastIndex = m.index + m[0].length;
-  }
-  if (lastIndex < chunk.length) {
-    parts.push({ kind: "text", text: chunk.slice(lastIndex) });
-  }
-  if (parts.length === 0 && chunk) parts.push({ kind: "text", text: chunk });
-  return parts;
-}
-
-// utils/transferFormat.ts
-function parseTransferAmount(raw) {
-  if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
-  if (typeof raw !== "string") return null;
-  let s = raw.replace(/[０-９．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 65248));
-  s = s.replace(/[¥￥$＄]/g, "").replace(/(?:元|块钱|块|圆|RMB|CNY|credits?)/gi, "").replace(/[,，\s]/g, "");
-  if (!/^\d+(?:\.\d+)?$/.test(s)) return null;
-  const n = Number(s);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
-}
-function formatTransferAmount(n) {
-  return Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100);
-}
-var RECORD_TRANSFER_RE = /\[\[\s*[记記][录錄]\s*[:：]\s*TRANSFER[^\]]*\]\]/gi;
-var ACTION_SEND_KV_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER\s*((?:\|[^\]]*)?)\s*\]\]/gi;
-var ACTION_SEND_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER\s*[:：]\s*([^\]]*?)\s*\]\]/gi;
-var FORGED_TO_VALUES = /* @__PURE__ */ new Set(["char", "self", "me", "\u89D2\u8272", "\u81EA\u5DF1", "\u6211", "\u81EA\u5206", "\u672C\u4EBA"]);
-function parseKvArgs(argStr) {
-  const out = {};
-  for (const part of argStr.split(/[|｜]/)) {
-    const seg = part.trim();
-    if (!seg) continue;
-    const eq = seg.search(/[=＝]/);
-    if (eq < 0) {
-      if (!("amount" in out) && parseTransferAmount(seg) !== null) out.amount = seg;
-      continue;
-    }
-    const k = seg.slice(0, eq).trim().toLowerCase();
-    const v = seg.slice(eq + 1).trim();
-    if (k) out[k] = v;
-  }
-  return out;
-}
-function kvToSendEvent(argStr) {
-  const kv = parseKvArgs(argStr);
-  const to = (kv.to ?? kv["\u7ED9"] ?? "").toLowerCase();
-  if (to && FORGED_TO_VALUES.has(to)) return null;
-  const amount = parseTransferAmount(kv.amount ?? kv["\u91D1\u989D"]);
-  return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
-}
-var ACTION_ACCEPT_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER_ACCEPT\s*\]\]/gi;
-var ACTION_RETURN_RE = /\[\[\s*ACTION\s*[:：]\s*TRANSFER_RETURN\s*\]\]/gi;
-var SYSTEM_LOG_RE = /[\[【]\s*(?:系统|系統|System)\s*(?:提示)?\s*[:：]\s*([^\[\]【】]*?)\s*[\]】]/gi;
-var BARE_TRANSFER_RE = /\[\s*转[账帐]\s*[:：]?\s*([^\[\]]{0,24}?)\s*\]/gi;
-var AMOUNT_FRAGMENT = String.raw`[¥￥$＄]?\s*([0-9０-９][0-9０-９.,，]*)\s*(?:元|块钱|块|圆)?`;
-var LOG_SEND_RE = new RegExp(String.raw`^(?:你|我)\s*(?:向|给).*?转(?:[账帐]了?|了)\s*${AMOUNT_FRAGMENT}`);
-var LOG_ACCEPT_RE = /^你(?:接收|接受|收下|领取)了.*?转[账帐]/;
-var LOG_RETURN_RE = /^你退回了.*?转[账帐]/;
-var LOG_FORGED_RE = /(?:向|给)你转[账帐]|(?:接收|接受|收下|领取|退回)了你的转[账帐]/;
-var LOG_IS_TRANSFER_RE = /转[账帐]|转了?\s*[¥￥$＄]?\s*[0-9０-９]/;
-function classifySystemLog(inner) {
-  const s = inner.trim();
-  if (!LOG_IS_TRANSFER_RE.test(s)) return void 0;
-  if (LOG_ACCEPT_RE.test(s)) return { kind: "accept" };
-  if (LOG_RETURN_RE.test(s)) return { kind: "return" };
-  const m = s.match(LOG_SEND_RE);
-  if (m) {
-    const amount = parseTransferAmount(m[1]);
-    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
-  }
-  if (LOG_FORGED_RE.test(s)) return null;
-  return null;
-}
-function collect(text2, re, toEvent, hits) {
-  re.lastIndex = 0;
-  let m;
-  while ((m = re.exec(text2)) !== null) {
-    const start = m.index;
-    const end = start + m[0].length;
-    if (hits.some((h) => start < h.end && end > h.start)) continue;
-    const event = toEvent(m);
-    if (event === void 0) continue;
-    hits.push({ start, end, event });
-  }
-}
-function extractTransferCommands(content) {
-  const src = String(content ?? "");
-  if (!src) return { text: "", events: [], consumed: 0 };
-  const hits = [];
-  collect(src, RECORD_TRANSFER_RE, () => null, hits);
-  collect(src, ACTION_SEND_KV_RE, (m) => kvToSendEvent(m[1] ?? ""), hits);
-  collect(src, ACTION_SEND_RE, (m) => {
-    const amount = parseTransferAmount(m[1]);
-    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
-  }, hits);
-  collect(src, ACTION_ACCEPT_RE, () => ({ kind: "accept" }), hits);
-  collect(src, ACTION_RETURN_RE, () => ({ kind: "return" }), hits);
-  collect(src, SYSTEM_LOG_RE, (m) => classifySystemLog(m[1] ?? ""), hits);
-  collect(src, BARE_TRANSFER_RE, (m) => {
-    const amount = parseTransferAmount(m[1]);
-    return amount === null ? null : { kind: "send", amount: formatTransferAmount(amount) };
-  }, hits);
-  hits.sort((a, b) => a.start - b.start);
-  let text2 = "";
-  let cursor = 0;
-  for (const h of hits) {
-    text2 += src.slice(cursor, h.start);
-    cursor = h.end;
-  }
-  text2 += src.slice(cursor);
-  return {
-    text: text2.trim(),
-    events: hits.map((h) => h.event).filter((e) => e !== null),
-    consumed: hits.length
-  };
-}
-
-// utils/scheduleChangeParse.ts
-var KEYWORD_RE = /^\s*(?:ACTION\s*[:：]\s*CHANGE_SCHEDULE|change[\s_-]*(?:schedule|schedue)|modify[\s_-]*schedule|修改(?:未来)?日程|更改(?:未来)?日程|改日程)(?=\s|[:：|=→>\-（(]|\d|$)/iu;
-var parseDirectiveBody = (input) => {
-  const body = input.replace(/^[\s【\[]+|[\s】\]]+$/gu, "").trim();
-  const keyword = body.match(KEYWORD_RE);
-  if (!keyword) return { recognized: false };
-  const rest = body.slice(keyword[0].length).replace(/^\s*[:：|=→>\-]+\s*/u, "");
-  const time = rest.match(/[（(]?\s*(\d{1,2})\s*(?:[:：点时])\s*(\d{1,2})?\s*(?:分)?\s*[）)]?/u);
-  if (!time || time.index == null) return { recognized: true, directive: null };
-  const hour = Number(time[1]);
-  const minute = time[2] == null || time[2] === "" ? 0 : Number(time[2]);
-  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-    return { recognized: true, directive: null };
-  }
-  const activity = rest.slice(time.index + time[0].length).replace(/^\s*(?:[:：|=→>\-]+)\s*/u, "").replace(/[】\]]+\s*$/gu, "").trim();
-  if (!activity) return { recognized: true, directive: null };
-  return {
-    recognized: true,
-    directive: {
-      startTime: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
-      // 日程卡本来就是短标题；截断异常长输出，避免一条标签撑坏 UI / prompt。
-      activity: activity.slice(0, 120)
-    }
-  };
-};
-var extractScheduleChangeDirectives = (text2) => {
-  const directives = [];
-  let malformedCount = 0;
-  const consumeBody = (body, original) => {
-    const parsed = parseDirectiveBody(body);
-    if (!parsed.recognized) return original;
-    if (parsed.directive) directives.push(parsed.directive);
-    else malformedCount += 1;
-    return "";
-  };
-  let cleanedText = (text2 || "").replace(
-    /(?:【{1,2}|\[{1,2})([^【】\[\]\r\n]{1,360})(?:】{1,2}|\]{1,2})/gu,
-    (whole, body) => consumeBody(body ?? "", whole)
-  );
-  cleanedText = cleanedText.replace(
-    /^[ \t]*(?:【【?|\[\[?)?[ \t]*(?:ACTION[ \t]*[:：][ \t]*CHANGE_SCHEDULE|change[ \t_-]*(?:schedule|schedue)|modify[ \t_-]*schedule|修改(?:未来)?日程|更改(?:未来)?日程|改日程)[ \t]*[:：|]?[^\r\n]{0,360}/gimu,
-    (whole) => consumeBody(whole, whole)
-  );
-  const recognizedSomething = directives.length > 0 || malformedCount > 0;
-  if (!recognizedSomething) {
-    return { cleanedText: text2 || "", directives, malformedCount };
-  }
-  return {
-    cleanedText: cleanedText.replace(/[ \t]+\r?\n/gu, "\n").replace(/\n{3,}/gu, "\n\n").trim(),
-    directives,
-    malformedCount
-  };
-};
-
-// worker/amsg/src/classifier.ts
-var DATA_TAGS = [
-  // [[RECALL: 2024-05]] / [[RECALL: 2024年5]]
-  {
-    re: /\[\[RECALL:\s*(\d{4})[-/年](\d{1,2})\]\]/g,
-    toolName: "recall",
-    toArgs: (m) => ({ year: m[1], month: m[2].padStart(2, "0") })
-  },
-  // [[SEARCH: query]]
-  {
-    re: /\[\[SEARCH:\s*(.+?)\]\]/g,
-    toolName: "web_search",
-    toArgs: (m) => ({ query: m[1].trim() })
-  },
-  // [[READ_DIARY: 2024-05-19]] / [[READ_DIARY: 今天]]
-  {
-    re: /\[\[READ_DIARY:\s*(.+?)\]\]/g,
-    toolName: "notion_read_diary",
-    toArgs: (m) => ({ date: m[1].trim() })
-  },
-  // [[FS_READ_DIARY: 2024-05-19]]
-  {
-    re: /\[\[FS_READ_DIARY:\s*(.+?)\]\]/g,
-    toolName: "feishu_read_diary",
-    toArgs: (m) => ({ date: m[1].trim() })
-  },
-  // [[READ_NOTE: keyword]]
-  {
-    re: /\[\[READ_NOTE:\s*(.+?)\]\]/g,
-    toolName: "read_note",
-    toArgs: (m) => ({ keyword: m[1].trim() })
-  },
-  // [[XHS_SEARCH: keyword]]
-  {
-    re: /\[\[XHS_SEARCH:\s*(.+?)\]\]/g,
-    toolName: "xhs_search",
-    toArgs: (m) => ({ keyword: m[1].trim() })
-  },
-  // [[XHS_BROWSE]] / [[XHS_BROWSE: category]]
-  {
-    re: /\[\[XHS_BROWSE(?::\s*(.+?))?\]\]/g,
-    toolName: "xhs_browse",
-    toArgs: (m) => m[1] ? { category: m[1].trim() } : {}
-  },
-  // [[XHS_DETAIL: noteId]]
-  {
-    re: /\[\[XHS_DETAIL:\s*(.+?)\]\]/g,
-    toolName: "xhs_detail",
-    toArgs: (m) => ({ noteId: m[1].trim() })
-  },
-  // [[XHS_MY_PROFILE]]
-  {
-    re: /\[\[XHS_MY_PROFILE\]\]/g,
-    toolName: "xhs_my_profile",
-    toArgs: () => ({})
-  }
-];
-var DATA_TOOL_NAMES = Object.freeze([...new Set(DATA_TAGS.map((spec) => spec.toolName))]);
-var SIDE_EFFECT_TAGS = [
-  // [[ACTION:POKE]]
-  {
-    re: /\[\[ACTION:POKE\]\]/g,
-    toDirective: () => ({ type: "poke" })
-  },
-  // 转账 (TRANSFER / TRANSFER_ACCEPT / TRANSFER_RETURN) 不在这张表里 —— 见 classifyLLMOutput
-  // 里的 extractTransferCommands, 那份解析跟客户端共用一份源码, 且要认模仿历史日志的口语形态。
-  // [[ACTION:ADD_EVENT|title|date]]
-  {
-    re: /\[\[ACTION:ADD_EVENT\s*\|\s*(.*?)\s*\|\s*(.*?)\]\]/g,
-    toDirective: (m) => ({ type: "add_event", title: m[1], date: m[2] })
-  },
-  // [schedule_message | time | fixed | text]  (note: 单方括号, 跟原 chatParser 一致)
-  {
-    re: /\[schedule_message\s*\|\s*(.+?)\s*\|\s*fixed\s*\|\s*(.+?)\]/g,
-    toDirective: (m) => ({ type: "schedule_message", time: m[1], text: m[2] })
-  },
-  // [[MUSIC_ACTION:verb]] 或 [[MUSIC_ACTION:verb|arg1|arg2]]
-  {
-    re: /\[\[MUSIC_ACTION:(join|add|add_new|join_and_add|join_and_add_new)(?:\|([^\]]*))?\]\]/g,
-    toDirective: (m) => ({
-      type: "music_action",
-      verb: m[1],
-      args: m[2] ? m[2].split("|").map((s) => s.trim()) : []
-    })
-  },
-  // [[XHS_LIKE: noteId]]
-  {
-    re: /\[\[XHS_LIKE:\s*(.+?)\]\]/g,
-    toDirective: (m) => ({ type: "xhs_like", noteId: m[1].trim() })
-  },
-  // [[XHS_FAV: noteId]]
-  {
-    re: /\[\[XHS_FAV:\s*(.+?)\]\]/g,
-    toDirective: (m) => ({ type: "xhs_fav", noteId: m[1].trim() })
-  },
-  // [[XHS_COMMENT: noteId | text]]
-  {
-    re: /\[\[XHS_COMMENT:\s*([^|]+?)\s*\|\s*([^\]]+?)\]\]/g,
-    toDirective: (m) => ({ type: "xhs_comment", noteId: m[1].trim(), text: m[2].trim() })
-  },
-  // [[XHS_REPLY: noteId | commentId | text]]
-  {
-    re: /\[\[XHS_REPLY:\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^\]]+?)\]\]/g,
-    toDirective: (m) => ({
-      type: "xhs_reply",
-      noteId: m[1].trim(),
-      commentId: m[2].trim(),
-      text: m[3].trim()
-    })
-  },
-  // [[XHS_POST: title | content | tags]]   (用 s flag 兼容多行 content)
-  {
-    re: /\[\[XHS_POST:\s*([^|]+?)\s*\|\s*([\s\S]+?)\s*\|\s*([^\]]+?)\]\]/g,
-    toDirective: (m) => ({
-      type: "xhs_post",
-      title: m[1].trim(),
-      content: m[2].trim(),
-      tags: m[3].trim()
-    })
-  },
-  // [[XHS_SHARE: 3]]
-  {
-    re: /\[\[XHS_SHARE:\s*(\d+)\]\]/g,
-    toDirective: (m) => ({ type: "xhs_share", idx: Number(m[1]) })
-  },
-  // [[LIFE:MED|布洛芬]] 生活记录代记 — 跟 chatParser.ts 的 `\[\[LIFE:[^\]]*\]\]` 同口径,
-  // 冒号后整段原样带走, 不在这里拆 verb/args (那份解析在 lifeRecords.parseLifeDirective)。
-  {
-    re: /\[\[LIFE:([^\]]*)\]\]/g,
-    toDirective: (m) => ({ type: "life_record", body: m[1] })
-  },
-  // [[NEWS_CARD: 来源|标题]] 分享热点卡片 — 跟 chatParser.ts:NEWS_CARD_RE 同口径。
-  {
-    re: /\[\[NEWS_CARD:\s*([^\]]*?)\s*\]\]/g,
-    toDirective: (m) => ({ type: "news_card", body: m[1] })
-  },
-  // 写日记 — 长形态: [[DIARY_START: title|mood]]\n content \n[[DIARY_END]]
-  // 短形态: [[DIARY: title|content]] 或 [[DIARY: content]] (无 title)
-  // 行为跟 applyAssistantPostProcessing.ts:465-495 字节对齐:
-  //   - 长形态 header 含 `|` → title|mood 切, 不含 `|` → 整段 = title
-  //   - 短形态 raw 含 `|` → title|content 切, 不含 `|` → 整段 = content (title 留空, 客户端兜底)
-  // 多行 content 用 [\s\S]*? 跨行, 别用 `s` flag (worker 端 esbuild target 默认 ok 但避免冗余)
-  {
-    re: /\[\[DIARY_START:\s*(.+?)\]\]\n?([\s\S]*?)\[\[DIARY_END\]\]/g,
-    toDirective: (m) => parseDiaryLong(m, "notion_write_diary")
-  },
-  {
-    re: /\[\[DIARY:\s*([\s\S]+?)\]\]/g,
-    toDirective: (m) => parseDiaryShort(m, "notion_write_diary")
-  },
-  // 飞书写日记 — 同形态, FS_ 前缀
-  {
-    re: /\[\[FS_DIARY_START:\s*(.+?)\]\]\n?([\s\S]*?)\[\[FS_DIARY_END\]\]/g,
-    toDirective: (m) => parseDiaryLong(m, "feishu_write_diary")
-  },
-  {
-    re: /\[\[FS_DIARY:\s*([\s\S]+?)\]\]/g,
-    toDirective: (m) => parseDiaryShort(m, "feishu_write_diary")
-  }
-];
-function parseDiaryLong(m, type) {
-  const header = m[1].trim();
-  const content = (m[2] || "").trim();
-  let title = "";
-  let mood = "";
-  if (header.includes("|")) {
-    const parts = header.split("|");
-    title = parts[0].trim();
-    mood = parts.slice(1).join("|").trim();
-  } else {
-    title = header;
-  }
-  return { type, title, content, mood: mood || void 0 };
-}
-function parseDiaryShort(m, type) {
-  const raw = m[1].trim();
-  let title = "";
-  let content = "";
-  if (raw.includes("|")) {
-    const parts = raw.split("|");
-    title = parts[0].trim();
-    content = parts.slice(1).join("|").trim();
-  } else {
-    content = raw;
-  }
-  return { type, title, content };
-}
-function classifyLLMOutput(text2) {
-  const toolCalls = [];
-  for (const spec of DATA_TAGS) {
-    const matches = Array.from(text2.matchAll(spec.re));
-    for (const m of matches) {
-      const args = spec.toArgs(m);
-      if (!args) continue;
-      toolCalls.push({
-        id: `call_${spec.toolName}_${toolCalls.length}_${Date.now().toString(36)}`,
-        type: "function",
-        function: { name: spec.toolName, arguments: JSON.stringify(args) }
-      });
-    }
-  }
-  if (toolCalls.length > 0) {
-    let prefix = text2;
-    for (const spec of DATA_TAGS) prefix = prefix.replace(spec.re, "");
-    prefix = prefix.trim();
-    const sanitizedPrefix = sanitizeForNotification(prefix);
-    return { kind: "tool-request", prefix, sanitizedPrefix, toolCalls };
-  }
-  const directives = [];
-  const { text: textAfterTransfers, events: transferEvents } = extractTransferCommands(text2);
-  for (const ev of transferEvents) {
-    if (ev.kind === "send") {
-      const amount = parseTransferAmount(ev.amount);
-      if (amount !== null) directives.push({ type: "transfer", amount });
-    } else if (ev.kind === "accept") {
-      directives.push({ type: "transfer_accept" });
-    } else {
-      directives.push({ type: "transfer_return" });
-    }
-  }
-  const scheduleParsed = extractScheduleChangeDirectives(textAfterTransfers);
-  const textAfterSchedule = scheduleParsed.cleanedText;
-  for (const d of scheduleParsed.directives) {
-    directives.push({ type: "change_schedule", time: d.startTime, activity: d.activity });
-  }
-  for (const spec of SIDE_EFFECT_TAGS) {
-    const matches = Array.from(textAfterSchedule.matchAll(spec.re));
-    for (const m of matches) {
-      const d = spec.toDirective(m);
-      if (d) directives.push(d);
-    }
-  }
-  const dedupedDirectives = [];
-  const seenDirectives = /* @__PURE__ */ new Set();
-  for (const d of directives) {
-    const key = JSON.stringify(d);
-    if (seenDirectives.has(key)) {
-      console.warn("[classifier] \u540C\u4E00\u6761\u6D88\u606F\u91CC\u91CD\u590D\u7684\u526F\u4F5C\u7528, \u53EA\u4FDD\u7559\u7B2C\u4E00\u4E2A:", key);
-      continue;
-    }
-    seenDirectives.add(key);
-    dedupedDirectives.push(d);
-  }
-  let cleanedText = textAfterSchedule;
-  for (const spec of DATA_TAGS) cleanedText = cleanedText.replace(spec.re, "");
-  for (const spec of SIDE_EFFECT_TAGS) cleanedText = cleanedText.replace(spec.re, "");
-  cleanedText = cleanedText.trim();
-  const sanitizedBody = sanitizeForNotification(cleanedText);
-  return { kind: "finish", cleanedText, sanitizedBody, directives: dedupedDirectives };
-}
-
-// utils/vrWorld/sarEnvelopeCore.ts
-var planFromSARModuleSnapshot = (snapshot) => {
-  if (!snapshot || !snapshot.character && !snapshot.user) return null;
-  const character2 = snapshot.character;
-  const user = snapshot.user;
-  const hasActiveEffect = character2?.phase === "active" || user?.phase === "active";
-  const hasAfterglow = character2?.phase === "afterglow" || user?.phase === "afterglow";
-  return { character: character2, user, hasActiveEffect, hasAfterglow, requiresEnvelope: hasActiveEffect };
-};
-var isPlainSARChatActionOnlyChunk = (text2) => {
-  const clean = text2.trim();
-  if (!clean) return false;
-  return /^(?:(?:（[^（）]*）|\([^()]*\)|\*[^*\n]+\*)\s*)+[。！？!?…～~—-]*$/s.test(clean);
-};
-var isSARChatActionOnlyChunk = (text2) => {
-  const bilingualParts = text2.split(/%%BILINGUAL%%/i).map((part) => part.trim()).filter(Boolean);
-  return bilingualParts.length > 0 && bilingualParts.every(isPlainSARChatActionOnlyChunk);
-};
-var isSARChatHtmlPlaceholder = (text2) => /^\[HTML\s*卡片\]$/i.test(text2.trim());
-var consumeSARChatSurfaceChunk = (canonicalChunk, surfaceChunks, startIndex) => {
-  let index = Math.max(0, startIndex);
-  if (isSARChatHtmlPlaceholder(canonicalChunk)) {
-    if (surfaceChunks[index] && isSARChatHtmlPlaceholder(surfaceChunks[index])) index += 1;
-    return { nextIndex: index };
-  }
-  if (isSARChatActionOnlyChunk(canonicalChunk)) {
-    if (surfaceChunks[index] && isSARChatActionOnlyChunk(surfaceChunks[index])) index += 1;
-    return { nextIndex: index };
-  }
-  while (surfaceChunks[index] && (isSARChatActionOnlyChunk(surfaceChunks[index]) || isSARChatHtmlPlaceholder(surfaceChunks[index]))) index += 1;
-  const surface = surfaceChunks[index];
-  return { surface, nextIndex: surface === void 0 ? index : index + 1 };
-};
-var tag = (raw, name) => {
-  const match = raw.match(new RegExp(`<${name}>\\s*([\\s\\S]*?)\\s*</${name}>`, "i"));
-  const value = match?.[1]?.trim();
-  return value || void 0;
-};
-var parseSARModuleReply = (raw, plan) => {
-  if (!plan.requiresEnvelope) return { canonical: raw, enveloped: false };
-  const body = tag(raw, "SAR_MODULE_OUTPUT") || raw;
-  const canonical = tag(body, "CHAR_TRUE");
-  if (!canonical) return { canonical: raw.trim(), enveloped: false };
-  return {
-    canonical,
-    assistantSurface: plan.character?.phase === "active" ? tag(body, "CHAR_SURFACE") : void 0,
-    userSurface: plan.user?.phase === "active" ? tag(body, "USER_SURFACE") : void 0,
-    enveloped: true
-  };
-};
-var createSARModuleSurfaceMeta = (state, surface) => {
-  const clean = surface.trim();
-  if (!clean || state.phase !== "active") return void 0;
-  return {
-    version: 1,
-    runId: state.runId,
-    moduleId: state.moduleId,
-    moduleTitle: state.moduleTitle,
-    target: state.target,
-    phase: "active",
-    surface: clean,
-    canonicalField: "content",
-    surfaceField: "metadata.sarModuleSurface.surface"
-  };
-};
-
-// worker/amsg/src/sarEnvelope.ts
-var AMSG_SAR_META_KEY = "amsgSar";
-var amsgSarUserSurfaceKey = (clientTaskId) => `sar_user_surface:${clientTaskId}`;
-var amsgSarSnapshotKey = (clientTaskId) => `sar_snapshot:${clientTaskId}`;
-var amsgSarSurfaceKey = (clientTaskId, segmentIndex) => `sar_surface:${clientTaskId}:${segmentIndex}`;
-var SAR_SURFACE_BANNER_MAX = 100;
-var clipSarSurfaceBanner = (banner) => {
-  const chars = Array.from(banner);
-  return chars.length <= SAR_SURFACE_BANNER_MAX ? banner : `${chars.slice(0, SAR_SURFACE_BANNER_MAX - 1).join("")}\u2026`;
-};
-var isPlainObject2 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-var isSurfaceSource = (value) => isPlainObject2(value) && typeof value.phase === "string";
-var readSarSnapshot = (metadata) => {
-  const raw = metadata?.[AMSG_SAR_META_KEY];
-  if (!isPlainObject2(raw) || raw.v !== 1) return null;
-  if (raw.character !== void 0 && !isSurfaceSource(raw.character)) return null;
-  if (raw.user !== void 0 && !isSurfaceSource(raw.user)) return null;
-  return raw;
-};
-var stripSarSnapshot = (metadata) => {
-  const { [AMSG_SAR_META_KEY]: _snapshot, ...rest } = metadata ?? {};
-  return rest;
-};
-var SURFACE_BLOCK_RE = /<(CHAR_SURFACE|USER_SURFACE)>[\s\S]*?(?:<\/\1>|(?=<\/?(?:SAR_MODULE_OUTPUT|CHAR_TRUE|CHAR_SURFACE|USER_SURFACE)>)|$)/gi;
-var PLACEHOLDER = String.fromCharCode(5);
-var PLACEHOLDER_RE = new RegExp(`${PLACEHOLDER}(\\d+)${PLACEHOLDER}`, "g");
-var maskSarSurfaceBlocks = (text2) => {
-  const blocks = [];
-  const masked = text2.replace(SURFACE_BLOCK_RE, (block) => {
-    blocks.push(block);
-    return `${PLACEHOLDER}${blocks.length - 1}${PLACEHOLDER}`;
-  });
-  return {
-    masked,
-    restore: (value) => blocks.length === 0 ? value : value.replace(PLACEHOLDER_RE, (_m, n) => blocks[Number(n)] ?? "")
-  };
-};
-var ENVELOPE_TAG_RE = /<\/?(?:SAR_MODULE_OUTPUT|CHAR_TRUE|CHAR_SURFACE|USER_SURFACE)>/gi;
-var stripEnvelopeTags = (text2) => text2.replace(ENVELOPE_TAG_RE, "").trim();
-var closeOpenTag = (text2, name, stoppers) => {
-  const open = new RegExp(`<${name}>`, "i").exec(text2);
-  if (!open || new RegExp(`</${name}>`, "i").test(text2)) return text2;
-  const after = open.index + open[0].length;
-  const stop = new RegExp(stoppers.join("|"), "i").exec(text2.slice(after));
-  const at = stop ? after + stop.index : text2.length;
-  return `${text2.slice(0, at)}</${name}>${text2.slice(at)}`;
-};
-var repairEnvelope = (text2) => {
-  let repaired = closeOpenTag(text2, "CHAR_TRUE", ["<CHAR_SURFACE>", "<USER_SURFACE>", "</SAR_MODULE_OUTPUT>"]);
-  repaired = closeOpenTag(repaired, "CHAR_SURFACE", ["<USER_SURFACE>", "<CHAR_TRUE>", "</SAR_MODULE_OUTPUT>"]);
-  repaired = closeOpenTag(repaired, "USER_SURFACE", ["<CHAR_SURFACE>", "<CHAR_TRUE>", "</SAR_MODULE_OUTPUT>"]);
-  return repaired;
-};
-var parseSarEnvelopeRounds = (rounds, plan) => {
-  const texts = rounds.filter((round) => round.trim().length > 0);
-  if (!plan.requiresEnvelope) return { canonical: texts.join("\n"), enveloped: false, pieces: [] };
-  const pieces = [];
-  let enveloped = false;
-  let userSurface;
-  for (const text2 of texts) {
-    const parsed = parseSARModuleReply(repairEnvelope(text2), plan);
-    if (parsed.enveloped) {
-      enveloped = true;
-      if (parsed.userSurface) userSurface = parsed.userSurface;
-    }
-    const canonical = stripEnvelopeTags(parsed.canonical);
-    if (!canonical) continue;
-    const surface = parsed.enveloped && parsed.assistantSurface ? stripEnvelopeTags(parsed.assistantSurface) : "";
-    pieces.push({ canonical, ...surface ? { surface } : {} });
-  }
-  return {
-    canonical: pieces.map((p) => p.canonical).join("\n"),
-    enveloped,
-    pieces,
-    ...userSurface ? { userSurface } : {}
-  };
-};
-var isEmojiSegment = (seg) => /^\[\[SEND_EMOJI[:：]/i.test(seg.raw.trim());
-var isHtmlSegment = (seg) => /^\[html\][\s\S]*\[\/html\]$/i.test(seg.raw.trim());
-var TRANSLATION_BLOCK_RE = /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>([\s\S]*?)<\/译文>\s*<\/翻译>/;
-var alignKey = (seg) => {
-  const translation = seg.raw.match(TRANSLATION_BLOCK_RE);
-  if (translation) {
-    const original = translation[1].trim();
-    const translated = translation[2].trim();
-    return original && translated ? `${original}
-%%BILINGUAL%%
-${translated}` : original || translated;
-  }
-  return seg.sanitized;
-};
-var segmentSurface = (surfaceText) => {
-  const prepared = surfaceText.replace(/\[html\][\s\S]*?\[\/html\]/gi, "\n").replace(/\[\[[\s\S]*?\]\]/g, "");
-  return sanitizeIntoSegments(prepared).filter((seg) => !isEmojiSegment(seg) && !isHtmlSegment(seg));
-};
-var alignSarSurfaceSegments = (canonicalSegments, surfaceText) => {
-  const surfaceSegs = segmentSurface(surfaceText);
-  const surfaceKeys = surfaceSegs.map(alignKey);
-  let index = 0;
-  return canonicalSegments.map((seg) => {
-    if (isEmojiSegment(seg) || isHtmlSegment(seg)) return void 0;
-    const consumed = consumeSARChatSurfaceChunk(alignKey(seg), surfaceKeys, index);
-    index = consumed.nextIndex;
-    if (consumed.surface === void 0) return void 0;
-    const matched = surfaceSegs[consumed.nextIndex - 1];
-    return matched ? { surface: matched.raw, banner: matched.sanitized } : void 0;
-  });
-};
-var segmentCanonical = (text2) => {
-  const scan = classifyLLMOutput(text2);
-  return sanitizeIntoSegments(scan.kind === "finish" ? scan.cleanedText : scan.prefix);
-};
-var buildSarSurfaceSlots = (parse, segments) => {
-  const none = segments.map(() => void 0);
-  if (!parse.pieces.some((p) => p.surface)) return none;
-  if (parse.pieces.length === 1) return alignSarSurfaceSegments(segments, parse.pieces[0].surface ?? "");
-  const counts = parse.pieces.map((p) => segmentCanonical(p.canonical).length);
-  if (counts.reduce((a, b) => a + b, 0) !== segments.length) {
-    return alignSarSurfaceSegments(
-      segments,
-      parse.pieces.map((p) => p.surface).filter((s) => !!s).join("\n")
-    );
-  }
-  const slots = [];
-  let offset = 0;
-  parse.pieces.forEach((piece, i) => {
-    const slice = segments.slice(offset, offset + counts[i]);
-    offset += counts[i];
-    slots.push(...piece.surface ? alignSarSurfaceSegments(slice, piece.surface) : slice.map(() => void 0));
-  });
-  return slots;
-};
-
-// worker/amsg/src/agentic.ts
-var createFireSessionState = () => ({
-  narrations: [],
-  toolCalls: [],
-  duplicateToolCalls: 0,
-  mcpCallSeq: 0,
-  xhsShareNotes: null,
-  finalReasoning: null
-});
-var MAX_DUPLICATE_TOOL_CALLS = 2;
-var DEFAULT_TOOL_ITERATIONS = 5;
-var MCP_MAX_TOOL_ITERATIONS = 12;
-var resolveToolIterationBudget = (hasMcp) => hasMcp ? MCP_MAX_TOOL_ITERATIONS : DEFAULT_TOOL_ITERATIONS;
-var XHS_SHARE_TAG_RE = /\[\[XHS_SHARE:\s*\d+\]\]/;
-var XHS_DESC_MAX = 120;
-function buildXhsSessionPayload(directives, notes, xsecTokens) {
-  if (directives.length === 0) return null;
-  const sharedIdx = /* @__PURE__ */ new Set();
-  const refNoteIds = /* @__PURE__ */ new Set();
-  for (const d of directives) {
-    if (d.type === "xhs_share") sharedIdx.add(d.idx);
-    else if (d.type === "xhs_like" || d.type === "xhs_fav") refNoteIds.add(d.noteId);
-    else if (d.type === "xhs_comment" || d.type === "xhs_reply") refNoteIds.add(d.noteId);
-  }
-  if (sharedIdx.size === 0 && refNoteIds.size === 0) return null;
-  const pickedNotes = [];
-  for (const idx of [...sharedIdx].sort((a, b) => a - b)) {
-    const note = idx >= 1 ? notes?.[idx - 1] : void 0;
-    if (!note) continue;
-    pickedNotes.push({ idx, note: { ...note, desc: (note.desc || "").slice(0, XHS_DESC_MAX) } });
-  }
-  const pickedTokens = (xsecTokens ?? []).filter(([noteId]) => refNoteIds.has(noteId));
-  if (pickedNotes.length === 0 && pickedTokens.length === 0) return null;
-  return { notes: pickedNotes, xsecTokens: pickedTokens };
-}
-function attachSceneSong(directives, sceneSong) {
-  if (!sceneSong) return directives;
-  return directives.map((d) => d.type === "music_action" ? { ...d, song: sceneSong } : d);
-}
-var resolveNativeFireToolName = (raw, manageToolNames, mcpResolve) => {
-  const candidates = [raw];
-  const lastSegment = raw.split(/[:./]/).pop();
-  if (lastSegment && lastSegment !== raw) candidates.push(lastSegment);
-  for (const c of candidates) {
-    if (!c) continue;
-    if (c.startsWith(MCP_FIRE_NAME_PREFIX) && mcpResolve?.has(c.slice(MCP_FIRE_NAME_PREFIX.length))) {
-      return { kind: "mcp", name: c };
-    }
-    if (manageToolNames.has(c)) return { kind: "manage", name: c };
-    if (mcpResolve?.has(c)) return { kind: "mcp", name: `${MCP_FIRE_NAME_PREFIX}${c}` };
-  }
-  return null;
-};
-var classifyNativeToolCalls = (rawToolCalls, manageToolNames, mcpResolve) => {
-  const out = { manage: [], mcp: [], dropped: [] };
-  const calls = Array.isArray(rawToolCalls) ? rawToolCalls : [];
-  for (const tc of calls) {
-    const raw = tc?.function?.name;
-    const resolved = typeof raw === "string" && raw ? resolveNativeFireToolName(raw, manageToolNames, mcpResolve) : null;
-    if (!resolved) {
-      out.dropped.push(typeof raw === "string" && raw ? raw : null);
-      continue;
-    }
-    const call = resolved.name === raw ? tc : { ...tc, function: { ...tc.function, name: resolved.name } };
-    (resolved.kind === "mcp" ? out.mcp : out.manage).push(call);
-  }
-  return out;
-};
-function processLLMRound(state, llmOutputText, build, mcp, schedule, iteration, maxToolIterations = DEFAULT_TOOL_ITERATIONS) {
-  const isFinalRound = typeof iteration === "number" && iteration >= maxToolIterations - 1;
-  const sarPlan = planFromSARModuleSnapshot(build.sar ?? null);
-  const sarMask = sarPlan?.requiresEnvelope ? maskSarSurfaceBlocks(llmOutputText) : null;
-  const roundText = sarMask ? sarMask.masked : llmOutputText;
-  const restoreSurfaces = (text2) => sarMask ? sarMask.restore(text2) : text2;
-  const nativeToolCalls = mcp?.nativeToolCalls ?? [];
-  const textCalls = mcp?.resolve.size ? extractTextFakedMcpCalls(roundText, mcp.resolve, { alsoMatchPrefix: MCP_FIRE_NAME_PREFIX }) : [];
-  const nativeScheduleCalls = schedule?.nativeToolCalls ?? [];
-  const hasNativeSchedule = nativeScheduleCalls.some(
-    (tc) => tc?.function?.name === AMSG_FIRE_SCHEDULE_TOOL
-  );
-  const scheduleTextCalls = schedule ? extractFireScheduleTextCalls(roundText) : [];
-  const scheduleCalls = [
-    ...nativeScheduleCalls,
-    ...(hasNativeSchedule ? [] : scheduleTextCalls).map((c) => ({
-      id: `sched_${state.mcpCallSeq++}`,
-      type: "function",
-      function: { name: AMSG_FIRE_SCHEDULE_TOOL, arguments: JSON.stringify(c.args) }
-    }))
-  ];
-  const strippedText = scheduleTextCalls.length ? stripTextFakedMcpCalls(roundText, scheduleTextCalls) : roundText;
-  const scanText = textCalls.length ? stripTextFakedMcpCalls(strippedText, textCalls) : strippedText;
-  const mcpToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : textCalls.map((c) => ({
-    // id 只需在一轮的 assistant/tool 消息配对里唯一；本次 fire 内自增，绝不重号。
-    id: `mcp_${state.mcpCallSeq++}`,
-    type: "function",
-    // exposedName 恒为裸名（alsoMatchPrefix 的命中也回裸名），统一补前缀即可。
-    function: { name: `${MCP_FIRE_NAME_PREFIX}${c.exposedName}`, arguments: JSON.stringify(c.args) }
-  }));
-  const extraToolCalls = [...mcpToolCalls, ...scheduleCalls];
-  const result = classifyLLMOutput(scanText);
-  const isToolRound = result.kind === "tool-request" || extraToolCalls.length > 0;
-  if (isToolRound) {
-    const narration = result.kind === "tool-request" ? result.prefix : scanText;
-    if (state.duplicateToolCalls < MAX_DUPLICATE_TOOL_CALLS && !isFinalRound) {
-      if (narration.trim()) state.narrations.push(restoreSurfaces(narration));
-      if (state.xhsShareNotes === null && XHS_SHARE_TAG_RE.test(narration)) {
-        state.xhsShareNotes = [...build.xhsNotes ?? []];
-      }
-      return {
-        decision: "tool-request",
-        toolCalls: result.kind === "tool-request" ? [...result.toolCalls, ...extraToolCalls] : extraToolCalls
-      };
-    }
-  }
-  const thisRound = isToolRound ? "" : restoreSurfaces(scanText);
-  const rounds = [...state.narrations, thisRound].filter((part) => part.trim().length > 0);
-  const fullText = rounds.join("\n");
-  const sarParse = sarPlan?.requiresEnvelope ? parseSarEnvelopeRounds(rounds, sarPlan) : null;
-  const finalScan = sarParse ? classifyLLMOutput(sarParse.canonical) : fullText === scanText ? result : classifyLLMOutput(fullText);
-  const cleanedText = finalScan.kind === "finish" ? finalScan.cleanedText : finalScan.prefix;
-  const directives = attachSceneSong(
-    finalScan.kind === "finish" ? finalScan.directives : [],
-    build.sceneSong
-  );
-  const xhsSession = buildXhsSessionPayload(
-    directives,
-    state.xhsShareNotes ?? build.xhsNotes,
-    build.xhsXsecTokens
-  );
-  const finishMeta = directives.length > 0 ? { directives, ...xhsSession ? { xhsSession } : {} } : void 0;
-  const declined = fullText.includes(AMSG_SILENT_MARK);
-  const segments = declined ? [] : sanitizeIntoSegments(cleanedText);
-  if (segments.length === 0) {
-    const scheduleChanges = directives.filter((d) => d.type === "change_schedule").map((d) => ({ startTime: d.time, activity: d.activity }));
-    return {
-      decision: "skip-push",
-      reason: declined ? "declined" : finishMeta ? "side-effects-only" : "empty-generation",
-      ...!declined && directives.some((d) => d.type !== "change_schedule") && finishMeta ? { sideEffects: finishMeta } : {},
-      ...scheduleChanges.length > 0 ? { scheduleChanges } : {}
-    };
-  }
-  const sarCharacter = build.sar?.character;
-  const surfaceSlots = sarParse && sarCharacter?.phase === "active" ? buildSarSurfaceSlots(sarParse, segments) : [];
-  const sarLastMeta = {
-    ...build.sar ? { [AMSG_SAR_META_KEY]: build.sar } : {},
-    ...sarParse?.userSurface ? { amsgSarUserSurface: sarParse.userSurface } : {}
-  };
-  const lastMeta = finishMeta || Object.keys(sarLastMeta).length > 0 ? { ...finishMeta ?? {}, ...sarLastMeta } : void 0;
-  const lastIdx = segments.length - 1;
-  return {
-    decision: "finish",
-    pushPayloads: segments.map((seg, i) => {
-      const slot = surfaceSlots[i];
-      const surfaceMeta = slot && sarCharacter ? createSARModuleSurfaceMeta(sarCharacter, slot.surface) : void 0;
-      const extra = {
-        ...surfaceMeta ? { amsgSarSurface: surfaceMeta } : {},
-        ...i === lastIdx ? lastMeta ?? {} : {}
-      };
-      return buildScheduledPush(
-        seg.raw,
-        build,
-        Object.keys(extra).length > 0 ? extra : void 0,
-        // 外显横幅截短：这条 push 还要装外显 meta，别把单段正文的字节预算吃掉一半。
-        surfaceMeta && slot ? clipSarSurfaceBanner(slot.banner) : seg.sanitized
-      );
-    })
-  };
-}
-function buildScheduledPush(message, build, extraMeta, bannerBody) {
-  const title = `\u6765\u81EA ${build.contactName}`;
-  return {
-    messageKind: "content",
-    messageType: build.messageType,
-    source: "scheduled",
-    message,
-    title,
-    contactName: build.contactName,
-    avatarUrl: build.avatarUrl,
-    messageSubtype: "chat",
-    taskId: build.taskId,
-    metadata: {
-      // SAR 快照不许摊进每一条（它只随最后一条经 extraMeta 回去）；调用方已摘过，这里兜一道。
-      ...stripSarSnapshot(build.metadata),
-      amsgOccurrenceMs: build.occurrenceMs,
-      ...extraMeta ?? {}
-    },
-    ...bannerBody !== void 0 ? { notification: { title, body: bannerBody } } : {}
-  };
-}
 
 // utils/emotionEvalCore.ts
 var EMOTION_EVAL_SYSTEM_SLOT = "__EMOTION_EVAL_SYSTEM_PROMPT__";
@@ -17719,7 +18496,8 @@ var takeEmotionEvalSpec = (metadata) => {
 };
 var EMOTION_EVAL_RIDE_ALONG_MS = 1e4;
 var runAmsgEmotionEval = async (spec, api, chatMessages, charName, timeoutMs = EMOTION_EVAL_TIMEOUT_MS, signal) => {
-  const result = await requestEmotionEval(api, restoreEvalPrompt(spec.prompt, chatMessages, charName), timeoutMs, signal);
+  const emotionMessages = chatMessages.filter((message) => !(message.role === "system" && typeof message.content === "string" && message.content.startsWith(FRIEND_FEED_MAIN_PROMPT_PREFIX)));
+  const result = await requestEmotionEval(api, restoreEvalPrompt(spec.prompt, emotionMessages, charName), timeoutMs, signal);
   return result.raw ? { ...result, raw: tagHomeSecretEval(result.raw, spec.homeSecretRequestId) } : result;
 };
 
@@ -17735,15 +18513,65 @@ function buildScheduleChangeResult(args) {
   };
 }
 
+// utils/amsgThirdPartyPush.ts
+var WXPUSHER_SIMPLE_PUSH_URL = "https://wxpusher.zjiecode.com/api/send/message/simple-push";
+function parseThirdPartyPushEndpoint(endpoint) {
+  const raw = (endpoint || "").trim();
+  if (!raw) return null;
+  if (raw.startsWith("wxpusher:")) {
+    const token2 = raw.slice("wxpusher:".length).trim();
+    if (!token2) return null;
+    return {
+      provider: "wxpusher",
+      token: token2,
+      serverOrigin: "https://wxpusher.zjiecode.com"
+    };
+  }
+  const match = raw.match(/^(bark|meow):(https?:\/\/.+)\/([^/?#]+)\/?$/i);
+  if (!match) return null;
+  const provider = match[1].toLowerCase();
+  const serverOrigin = match[2].replace(/\/+$/, "");
+  let token = "";
+  try {
+    token = decodeURIComponent(match[3]).trim();
+  } catch {
+    token = match[3].trim();
+  }
+  if (!token) return null;
+  return {
+    provider,
+    token,
+    serverOrigin
+  };
+}
+function buildThirdPartyClickUrl(baseUrl, charId) {
+  const raw = (baseUrl || "").trim();
+  if (!raw || !/^https?:\/\//i.test(raw)) return void 0;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
+      return void 0;
+    }
+    const trimmedCharId = (charId || "").trim();
+    if (trimmedCharId) {
+      parsed.searchParams.set("openApp", "chat");
+      parsed.searchParams.set("activeMsgCharId", trimmedCharId);
+    }
+    return parsed.toString();
+  } catch {
+    return void 0;
+  }
+}
+
 // worker/amsg/src/nativeFcm.ts
 var accessTokenCache = null;
-var utf84 = new TextEncoder();
+var utf83 = new TextEncoder();
 var bytesToB64u = (bytes) => {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 };
-var textToB64u = (value) => bytesToB64u(utf84.encode(value));
+var textToB64u = (value) => bytesToB64u(utf83.encode(value));
 var pemToPkcs8 = (raw) => {
   const base64 = raw.replace(/\\n/g, "\n").replace(/-----BEGIN PRIVATE KEY-----/g, "").replace(/-----END PRIVATE KEY-----/g, "").replace(/\s+/g, "");
   if (!base64) throw new Error("FCM_SERVICE_ACCOUNT_PRIVATE_KEY \u4E0D\u662F\u6709\u6548\u7684 PKCS#8 PEM");
@@ -17780,7 +18608,7 @@ var fetchFcmAccessToken = async (env) => {
     false,
     ["sign"]
   );
-  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, utf84.encode(unsigned));
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, utf83.encode(unsigned));
   const assertion = `${unsigned}.${bytesToB64u(new Uint8Array(signature))}`;
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -17833,7 +18661,7 @@ var buildFcmMessage = (token, rawPayload) => {
       }
     }
   };
-  const bytes = utf84.encode(JSON.stringify(result)).byteLength;
+  const bytes = utf83.encode(JSON.stringify(result)).byteLength;
   if (bytes > 4e3) throw new Error(`FCM_PAYLOAD_TOO_LARGE: ${bytes} bytes\uFF08\u5B89\u5168\u4E0A\u9650 4000\uFF09`);
   return result;
 };
@@ -17855,10 +18683,128 @@ var sendFcmNotification = async (env, token, payload) => {
     throw new Error(`FCM_SEND_FAILED (${response.status}): ${detail.slice(0, 500)}`);
   }
 };
+var isSilentPushPayload = (payload) => {
+  const show = payload.notification?.show;
+  if (show === "never" || show === false) return true;
+  const kind = payload.messageKind;
+  if (kind === "reasoning" || kind === "tool-request") return true;
+  return false;
+};
+var buildThirdPartyPushRequest = (parsed, subscription, rawPayload) => {
+  let payload = {};
+  try {
+    payload = JSON.parse(rawPayload);
+  } catch {
+    payload = { body: rawPayload };
+  }
+  if (isSilentPushPayload(payload)) {
+    return null;
+  }
+  const title = String(
+    payload.notification?.title ?? payload.title ?? payload.contactName ?? payload.metadata?.charName ?? "\u4E3B\u52A8\u6D88\u606F"
+  ).trim() || "\u4E3B\u52A8\u6D88\u606F";
+  const actualBody = String(
+    payload.notification?.body ?? payload.message ?? payload.body ?? ""
+  ).trim();
+  const body = actualBody || "\u6709\u4E00\u6761\u65B0\u6D88\u606F";
+  const charId = String(payload.charId ?? payload.metadata?.charId ?? "").trim() || void 0;
+  const rawAvatarUrl = String(
+    payload.avatarUrl ?? payload.notification?.icon ?? payload.metadata?.avatarUrl ?? ""
+  ).trim();
+  const avatarUrl = /^https?:\/\//i.test(rawAvatarUrl) ? rawAvatarUrl : void 0;
+  const clickUrl = buildThirdPartyClickUrl(
+    typeof subscription?.clickUrl === "string" ? subscription.clickUrl : void 0,
+    charId
+  );
+  if (parsed.provider === "wxpusher") {
+    const summary = `${title}\uFF1A${body}`.slice(0, 96);
+    const content = `${title}
+
+${body}`;
+    return {
+      url: WXPUSHER_SIMPLE_PUSH_URL,
+      body: {
+        spt: parsed.token,
+        summary,
+        content,
+        contentType: 1,
+        ...clickUrl ? { url: clickUrl } : {}
+      }
+    };
+  }
+  if (parsed.provider === "bark") {
+    return {
+      url: `${parsed.serverOrigin}/push`,
+      body: {
+        device_key: parsed.token,
+        title,
+        body,
+        group: charId ? `amsg-${charId}` : "sullyos",
+        ...avatarUrl ? { icon: avatarUrl } : {},
+        ...clickUrl ? { url: clickUrl } : {}
+      }
+    };
+  }
+  return {
+    url: `${parsed.serverOrigin}/${encodeURIComponent(parsed.token)}`,
+    body: {
+      title,
+      msg: body,
+      ...clickUrl ? { url: clickUrl } : {}
+    }
+  };
+};
+var sendThirdPartyNotification = async (parsed, subscription, rawPayload) => {
+  const req = buildThirdPartyPushRequest(parsed, subscription, rawPayload);
+  if (!req) {
+    return { skipped: true, reason: "silent-payload" };
+  }
+  const response = await fetch(req.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    },
+    body: JSON.stringify(req.body)
+  });
+  const text2 = await response.text().catch(() => "");
+  let json = null;
+  try {
+    json = text2 ? JSON.parse(text2) : null;
+  } catch {
+    json = null;
+  }
+  if (parsed.provider === "wxpusher") {
+    const code = typeof json?.code === "number" ? json.code : void 0;
+    const ok2 = response.ok && (code === void 0 || code === 1e3) && json?.success !== false;
+    if (!ok2) {
+      const msg = String(json?.msg || text2 || `HTTP ${response.status}`).slice(0, 300);
+      throw new Error(`WXPUSHER_SEND_FAILED (${code ?? response.status}): ${msg}`);
+    }
+    return { ok: true, provider: "wxpusher" };
+  }
+  if (parsed.provider === "bark") {
+    const code = typeof json?.code === "number" ? json.code : void 0;
+    const ok2 = response.ok && (code === void 0 || code === 200);
+    if (!ok2) {
+      const msg = String(json?.message || text2 || `HTTP ${response.status}`).slice(0, 300);
+      throw new Error(`BARK_SEND_FAILED (${code ?? response.status}): ${msg}`);
+    }
+    return { ok: true, provider: "bark" };
+  }
+  const ok = response.ok && json?.status !== 500 && json?.status !== 400;
+  if (!ok) {
+    const msg = String(json?.message || json?.msg || text2 || `HTTP ${response.status}`).slice(0, 300);
+    throw new Error(`MEOW_SEND_FAILED (${response.status}): ${msg}`);
+  }
+  return { ok: true, provider: "meow" };
+};
 var createHybridPushTransport = (env, webPush) => ({
   async sendNotification(subscription, payload) {
-    const token = fcmTokenFromEndpoint(subscription?.endpoint);
+    const endpoint = subscription?.endpoint;
+    const token = fcmTokenFromEndpoint(endpoint);
     if (token) return sendFcmNotification(env, token, payload);
+    const thirdParty = parseThirdPartyPushEndpoint(typeof endpoint === "string" ? endpoint : null);
+    if (thirdParty) return sendThirdPartyNotification(thirdParty, subscription, payload);
     return webPush.sendNotification(subscription, payload);
   }
 });
@@ -17867,8 +18813,12 @@ var isFcmConfigured = (env) => Boolean(
 );
 
 // worker/amsg/src/index.ts
+installAnthropicFetch(false);
 var getFireStash = (scratch) => scratch?.fire;
 var REPLY_IN_FLIGHT_DEFER_MS = 45e3;
+var AWAY_DUE_TOLERANCE_MS = 6e4;
+var AWAY_MAX_DEFER_MS = 24 * 60 * 6e4;
+var DATE_LEAVE_DUE_TOLERANCE_MS = 5e3;
 var laterOf = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
 var buildToolCtx = (pack, config) => {
   const char = {
@@ -18110,6 +19060,7 @@ var sendInstantErrorPush = async (args) => {
   }
 };
 var amsgFireSettled = async (info) => {
+  if (await settleReproduction(info)) return;
   const stash = getFireStash(info.scratch);
   if (!stash) return;
   const cancelled = info.status === "cancelled";
@@ -18193,6 +19144,14 @@ var amsgFireSettled = async (info) => {
     stash.selfLogDirty = false;
     stateWrites.push({ key: AMSG_SELF_LOG_KEY, value: JSON.stringify(stash.selfLog) });
   }
+  if (stash.staleStoppedKeys && stash.staleStoppedKeys.length > 0) {
+    const staleKeys = stash.staleStoppedKeys;
+    stash.staleStoppedKeys = [];
+    for (const key of staleKeys) {
+      if (stateWrites.length >= 190) break;
+      stateWrites.push({ key, value: null });
+    }
+  }
   if (stateWrites.length > 0) {
     try {
       await info.writeState(amsgStateNamespace(stash.charId), stateWrites);
@@ -18220,6 +19179,10 @@ var amsgStaleSkip = async (task, info) => {
       kind: taskKind,
       action: info.action
     });
+    const diagnosticRun = diagnosticRunId(meta);
+    if (diagnosticRun) {
+      await writeDiagnosticStage(info.writeState, diagnosticRun, "fire-settled", { status: "skipped", reason: info.reason, staleAction: info.action });
+    }
     return;
   }
   const charId = typeof meta.charId === "string" && meta.charId ? meta.charId : null;
@@ -18374,6 +19337,9 @@ var runFireScheduleTool = async (stash, scheduleTask, args, nowMs) => {
       ...stash.scheduledTaskInput ? { taskInput: stash.scheduledTaskInput } : {},
       recurrenceType: parsed.recurrence,
       messageType: parsed.mode,
+      // 不写的话上游会继承当前任务的 subtype：即时对话里排的后续会带上 'instant-chat'，
+      // 列表投影里就被 classifyTaskRow 当成即时对话——前端看不见、取消不了它。
+      messageSubtype: "chat",
       uuid,
       // 角色自排的循环任务也按角色所在时区的墙钟推进，跟用户在面板排的同一套。
       tzId: stash.tz.tzId,
@@ -18615,6 +19581,8 @@ var amsgHooks = {
     const taskMeta = ctx.task.metadata ?? {};
     const taskPolicy = typeof taskMeta.amsgExpirePolicy === "string" ? taskMeta.amsgExpirePolicy : void 0;
     const selfScheduled = taskMeta.amsgSelfScheduled === true;
+    const away = taskMeta[AMSG_AWAY_MESSAGE_META] === true;
+    const dateLeave = taskMeta[AMSG_DATE_LEAVE_META] === true;
     const recurring = ctx.task.recurrenceType === "daily" || ctx.task.recurrenceType === "weekly";
     const emotionEvalSpec = takeEmotionEvalSpec(ctx.task.metadata);
     const taskKind = readTaskKind(taskMeta);
@@ -18646,7 +19614,8 @@ var amsgHooks = {
     const presence = parseAmsgChatPresence(
       charRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value
     );
-    if (!instant && policy === "expire" && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
+    const inPerson = presence?.scene === "date" && isFreshChatPresence(presence, charId, ctx.now.getTime());
+    if (!instant && policy === "expire" && !inPerson && isFreshChatPresence(presence, charId, ctx.now.getTime())) {
       console.log("[amsg:defer]", {
         taskId: ctx.task.id,
         reason: "reply-in-flight",
@@ -18724,6 +19693,27 @@ var amsgHooks = {
         presenceLastUserMessageAt
       });
     }
+    if (!instant && dateLeave && presence?.charId === charId) {
+      if (presence.scene !== "date") {
+        console.log("[amsg:date-leave-returned]", { taskId: ctx.task.id, charId, presenceActiveAt: presence.activeAt });
+        return { skip: true };
+      }
+      const dueAt = presence.activeAt + Number(taskMeta[AMSG_DATE_LEAVE_DELAY_META]) * 6e4;
+      const waitMs = Number.isFinite(dueAt) ? dueAt - ctx.now.getTime() : 0;
+      if (waitMs > DATE_LEAVE_DUE_TOLERANCE_MS) {
+        console.log("[amsg:defer]", { taskId: ctx.task.id, reason: "date-leave-not-due", dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } };
+      }
+    }
+    if (!instant && away) {
+      const delayMs = Number(taskMeta[AMSG_AWAY_DELAY_META]) * 6e4;
+      const dueAt = lastUserMessageAt != null && delayMs > 0 ? lastUserMessageAt + delayMs : null;
+      const waitMs = dueAt == null ? 0 : dueAt - ctx.now.getTime();
+      if (waitMs > AWAY_DUE_TOLERANCE_MS) {
+        console.log("[amsg:defer]", { taskId: ctx.task.id, reason: "away-not-due", dueAt });
+        return { defer: { afterMs: Math.min(waitMs, AWAY_MAX_DEFER_MS) } };
+      }
+    }
     if (!instant && typeof taskMeta.amsgTaskInstruction !== "string") {
       throw fail3("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
     }
@@ -18749,7 +19739,14 @@ var amsgHooks = {
       }
       return { skip: true };
     }
-    const storedSelfLog = reconcileStoppedReplies(parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? ""), charRows);
+    const rawSelfLog = parseSelfLog(charRows.find((r) => r.key === AMSG_SELF_LOG_KEY)?.value ?? "");
+    const storedSelfLog = reconcileStoppedReplies(rawSelfLog, charRows);
+    const selfLogReconciled = storedSelfLog !== rawSelfLog;
+    const staleStoppedKeys = pickStaleStoppedReplyKeys(
+      charRows,
+      ctx.now.getTime(),
+      typeof ctx.task.uuid === "string" && ctx.task.uuid ? stoppedReplyKey(ctx.task.uuid) : null
+    );
     const selfLog = reconcileSelfLogWithPack(storedSelfLog, pack, lastUserMessageAt);
     const taskBrief = findTaskBrief([...pack.pendingTasks, ...selfLog.tasks], ctx.task.uuid);
     const clientTaskId = typeof taskMeta.amsgClientTaskId === "string" ? taskMeta.amsgClientTaskId : "";
@@ -18766,8 +19763,13 @@ var amsgHooks = {
       await recordSkip(ctx, charId, "schedule-off", occurrenceMs, taskBrief);
       return { skip: true };
     }
+    if (!instant && policy === "expire" && inPerson) {
+      console.log("[amsg:in-person-skip]", { taskId: ctx.task.id, charId });
+      await recordSkip(ctx, charId, "in-person", occurrenceMs, taskBrief);
+      return { skip: true };
+    }
     const maxUnansweredSends = limits.maxUnansweredSends;
-    if (!instant && selfScheduled && countUnansweredSends(selfLog) >= maxUnansweredSends) {
+    if (!instant && (selfScheduled || away) && countUnansweredSends(selfLog) >= maxUnansweredSends) {
       console.log("[amsg:unanswered-limit-skip]", {
         taskId: ctx.task.id,
         charId,
@@ -18802,7 +19804,7 @@ var amsgHooks = {
     const dailyDay = dayKeyInZone(nowMs, pack.userTzId);
     const dailySends = parseDailySends(charRows.find((r) => r.key === AMSG_DAILY_SENDS_KEY)?.value);
     const sentToday = sendsOnDay(dailySends, dailyDay);
-    if (!instant && sentToday >= limits.dailySendCap) {
+    if (!instant && !dateLeave && sentToday >= limits.dailySendCap) {
       console.log("[amsg:daily-limit-skip]", {
         taskId: ctx.task.id,
         charId,
@@ -18821,7 +19823,7 @@ var amsgHooks = {
         const page = await ctx.listTasks({ status: "pending", limit: 100, offset, includeMetadata: true });
         for (const row of page.tasks) {
           const meta = row.metadata ?? {};
-          if ((row.charId ?? meta.charId) !== charId || row.status !== "pending" || !row.uuid || !row.nextSendAt || meta.amsgInstantChat === true || meta.amsgKind || row.messageSubtype === "instant-chat") continue;
+          if ((row.charId ?? meta.charId) !== charId || row.status !== "pending" || !row.uuid || !row.nextSendAt || classifyTaskRow(row) !== "scheduled") continue;
           const old = known.get(row.uuid);
           live.push({
             ...old,
@@ -18843,7 +19845,7 @@ var amsgHooks = {
       livePendingTasks = live;
     }
     const otherLiveTasks = livePendingTasks.filter((t) => recurring || t.taskUuid !== ctx.task.uuid && (!clientTaskId || t.clientTaskId !== clientTaskId));
-    const selfScheduleAllowed = !scheduleOff;
+    const selfScheduleAllowed = !scheduleOff && !dateLeave;
     const canSelfSchedule = typeof ctx.scheduleTask === "function" && selfScheduleAllowed;
     const tz = { tzId: pack.tzId };
     const { toolCtx, proxyWorkerUrl, xhsCookie } = buildToolCtx(toolPack, toolConfig);
@@ -18859,7 +19861,8 @@ var amsgHooks = {
       xhsCookie,
       occurrenceMs,
       selfLog,
-      selfLogDirty: false,
+      selfLogDirty: selfLogReconciled && staleStoppedKeys.length > 0,
+      staleStoppedKeys,
       mcpResolve,
       maxToolIterations,
       fireToolNames: /* @__PURE__ */ new Set(),
@@ -18893,6 +19896,8 @@ var amsgHooks = {
       // （resolveFireSceneSong 与 renderFireSceneBlock 共用判定），冻的必然是正文里那首。
       sceneSong: resolveFireSceneSong(pack.scene, ctx.now.getTime(), tz),
       instant,
+      // 见面离开提醒也查：生成期间回到见面或开了口，人已经回来了，这条就不发。
+      overlapGuard: !instant && (policy === "expire" || dateLeave) ? { lastUserMessageAt } : null,
       instantInputKey,
       // 下面即时对话那一支起跑（要等请求消息拼完才知道给评估喂什么）。
       emotionEvalPromise: null,
@@ -18908,6 +19913,7 @@ var amsgHooks = {
     const taskListBlock = baseTaskListBlock && canManageTasks ? `${baseTaskListBlock}
 \uFF08\u6E05\u5355\u91CC\u7684\u4EFB\u52A1\u5F52\u4F60\u7BA1\uFF1A\u60C5\u51B5\u53D8\u4E86\u4E0D\u8BE5\u54CD\u7684\u53EF\u4EE5\u7528 cancel_active_message \u53D6\u6D88\uFF0C\u53EA\u662F\u8981\u6362\u65F6\u95F4\u7684\u7528 renew_active_message \u6539\u671F\uFF0Ctask_id \u5C31\u662F\u6E05\u5355\u91CC\u7684\u77ED id\u3002\uFF09` : baseTaskListBlock;
     const worldArgs = {
+      charId,
       toolConfig,
       userName: pack.targetName,
       timeAwarenessEnabled: toolPack.timeAwarenessEnabled,
@@ -18947,6 +19953,9 @@ var amsgHooks = {
       ...canSelfSchedule && mcpNative ? [buildFireScheduleTool({ nowMs: ctx.now.getTime(), tz, abilities, context: instant ? "chat" : "fire" })] : [],
       ...canManageTasks && mcpNative ? [buildFireCancelTool(), buildFireRenewTool({ nowMs: ctx.now.getTime(), tz })] : []
     ];
+    const replyScopeBlock = fireTools.length > 0 || mcpBlock || scheduleBlock ? `
+${buildReplyScopeRule(instant ? "user" : "scheduled")}
+` : "";
     stash.fireToolNames = new Set(fireTools.map((t) => t?.function?.name).filter((n) => typeof n === "string" && !n.startsWith(MCP_FIRE_NAME_PREFIX)));
     stash.allowedToolNames = /* @__PURE__ */ new Set([
       ...DATA_TOOL_NAMES,
@@ -18971,9 +19980,13 @@ var amsgHooks = {
           renderSelfLogBlock(selfLog, ctx.now.getTime(), tz, maxUnansweredSends),
           taskListBlock,
           mcpBlock,
-          scheduleBlock
+          scheduleBlock,
+          replyScopeBlock
         ]
       });
+      const chatMessages = pack.chat.messages;
+      const insertAt = pack.chat.timelyInsertAt;
+      const timelyAt = Number.isInteger(insertAt) && insertAt >= 1 && insertAt <= chatMessages.length ? insertAt : chatMessages.length;
       const instantMessages = [
         // content 原样透传，一个字都不动：带图片的消息本地就是结构化分段
         // （`[{type:'text'},{type:'image_url'}]`），上游把这个数组整个丢进
@@ -18981,8 +19994,9 @@ var amsgHooks = {
         // `messages: llmMessages`，不看 content 的类型）。这里但凡 String() 一下，
         // 模型收到的就是「[object Object]」而不是那张图。
         // 每条重新包一层对象只是不把 pack 上那份交出去，content 仍是同一个引用。
-        ...pack.chat.messages.map((m) => ({ role: m.role, content: m.content })),
-        ...timelyBlock ? [{ role: "system", content: timelyBlock }] : []
+        ...chatMessages.slice(0, timelyAt).map((m) => ({ role: m.role, content: m.content })),
+        ...timelyBlock ? [{ role: "system", content: timelyBlock }] : [],
+        ...chatMessages.slice(timelyAt).map((m) => ({ role: m.role, content: m.content }))
       ];
       if (userHoliday) {
         const profileMessage = instantMessages.find((m) => m.role === "system" && typeof m.content === "string" && m.content.includes("### \u4E92\u52A8\u5BF9\u8C61 (User)\n"));
@@ -19027,8 +20041,9 @@ ${userHoliday}` });
       lastUserMessageAt,
       // 「此刻在做什么」里的钟点跟今日节日同一个开关：关掉时间感知的角色不该从日程块
       // 读到「23:00」——那正是这个开关要挡的东西。日程内容本身照给。
-      includeClock: toolPack.timeAwarenessEnabled
-    }), userHoliday) + mcpBlock + scheduleBlock;
+      includeClock: toolPack.timeAwarenessEnabled,
+      mustSpeak: away || dateLeave
+    }), userHoliday) + mcpBlock + scheduleBlock + replyScopeBlock;
     return {
       messages: [{ role: "user", content: prompt }],
       ...common
@@ -19044,7 +20059,7 @@ ${userHoliday}` });
       }
       return handler.llmOutput({ ctx, state: kindFire.state });
     }
-    const content = stripReasoningTags2(ctx.llmOutputText || "").trim();
+    const content = stripReasoningTags(ctx.llmOutputText || "").trim();
     const taskId = ctx.taskId != null ? String(ctx.taskId) : null;
     if (taskId == null) {
       console.warn("[amsg:agentic] ctx \u4E0A\u6CA1\u6709 taskId\uFF0C\u9001\u8FBE\u5F52\u5C5E\u4F1A\u5931\u6548", ctx.sessionId);
@@ -19117,6 +20132,37 @@ ${userHoliday}` });
         sessionId: ctx.sessionId,
         pushes: decision.decision === "finish" ? decision.pushPayloads.length : 0
       });
+    }
+    if (decision.decision === "finish" && stash.overlapGuard) {
+      const presenceRows = await ctx.readState(amsgStateNamespace(stash.charId), { key: AMSG_CHAT_PRESENCE_KEY });
+      const presence = parseAmsgChatPresence(presenceRows.find((r) => r.key === AMSG_CHAT_PRESENCE_KEY)?.value);
+      if (chattedDuringFire(presence, stash.charId, Date.now(), stash.overlapGuard.lastUserMessageAt)) {
+        const overlapReason = presence?.scene === "date" ? "in-person" : "chat-overlap";
+        if (stash.scheduledTasks.length || stash.cancelledTasks.length || stash.renewedTasks.length) {
+          console.warn("[amsg:chat-overlap] \u751F\u6210\u671F\u95F4\u7528\u6237\u5F00\u53E3\u4E86\uFF0C\u4F46\u8FD9\u8F6E\u6539\u8FC7\u4EFB\u52A1\uFF0C\u7167\u5E38\u53D1\u51FA", { taskId });
+        } else {
+          console.log("[amsg:chat-overlap] \u751F\u6210\u671F\u95F4\u7528\u6237\u5F00\u53E3\u4E86\uFF0C\u8FD9\u6761\u4E0D\u53D1", {
+            taskId,
+            seenLastUserMessageAt: stash.overlapGuard.lastUserMessageAt,
+            presenceLastUserMessageAt: presence?.lastUserMessageAt ?? null
+          });
+          await writeLastSkip(ctx.writeState, stash.charId, {
+            v: 1,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            skippedAt: Date.now()
+          });
+          await emitFireSkip(ctx.emitResult, {
+            charId: stash.charId,
+            taskUuid: stash.taskUuid,
+            occurrenceMs: stash.occurrenceMs,
+            reason: overlapReason,
+            task: findTaskBrief(stash.pendingTasks, stash.taskUuid)
+          });
+          return { decision: "skip-push" };
+        }
+      }
     }
     if (decision.decision === "skip-push" && decision.sideEffects) {
       if (typeof ctx.emitResult !== "function") throw new Error("AMSG2_RESULT_UNSUPPORTED: \u8BF7\u66F4\u65B0 Worker \u4EE5\u63A5\u6536\u52A8\u4F5C\u7ED3\u679C");
@@ -19373,8 +20419,13 @@ var buildWorkerConfig = (env) => {
     privateKey: env.VAPID_PRIVATE_KEY
   };
   const nativeFcmReady = isFcmConfigured(env);
-  const effectiveVapid = nativeFcmReady && (!vapid.publicKey?.trim() || !vapid.privateKey?.trim()) ? { email: vapid.email, publicKey: "native-fcm", privateKey: "native-fcm" } : vapid;
-  const webpush = createHybridPushTransport(env, createWebCryptoWebPush(effectiveVapid));
+  const hasRealVapid = Boolean(vapid.publicKey?.trim() && vapid.privateKey?.trim());
+  const effectiveVapid = hasRealVapid ? vapid : {
+    email: vapid.email,
+    publicKey: nativeFcmReady ? "native-fcm" : "third-party-push",
+    privateKey: nativeFcmReady ? "native-fcm" : "third-party-push"
+  };
+  const webpush = traceDiagnosticTransport(createHybridPushTransport(env, createWebCryptoWebPush(vapid)), env);
   configureInstantErrorPush(env.DB && env.AMSG_MASTER_KEY ? { webpush, db: env.DB, masterKey: env.AMSG_MASTER_KEY } : null);
   configureSkipDiagnostics({ rawExcerpt: isDebugFlagOn(env.AMSG_DEBUG_LLM_RAW) });
   return {
@@ -19392,7 +20443,7 @@ var buildWorkerConfig = (env) => {
     // 命名空间下超过天数没更新的条目清掉。角色状态那个命名空间（amsg:char:<id>，
     // 装 fire_pack / tool_pack）不配 TTL——那些是要长期留着的，配了就等于定时把
     // 角色的云端状态抹掉。判据是行本来就有的 updated_at 列，不加列、不动表结构。
-    clientStateTtl: { [INSTANT_INPUT_NAMESPACE]: INSTANT_INPUT_TTL_DAYS, [AMSG_JOB_NAMESPACE]: AMSG_JOB_TTL_DAYS },
+    clientStateTtl: { [INSTANT_INPUT_NAMESPACE]: INSTANT_INPUT_TTL_DAYS, [AMSG_JOB_NAMESPACE]: AMSG_JOB_TTL_DAYS, [DIAGNOSTIC_NAMESPACE]: DIAGNOSTIC_RETENTION_DAYS },
     cloudData: { resolveOwner: resolveSullyCloudOwnership },
     // 满血 fire-time hooks（onBeforeFire 现场填槽 + onLLMOutput 分类 +
     // executeToolCalls 服务端工具循环）；总超时用库默认 240s，轮数由 onBeforeFire 按
@@ -19401,7 +20452,7 @@ var buildWorkerConfig = (env) => {
     leaseHeartbeatMs: 1e3,
     // 用户主动触发的即时对话：生成失败本轮就结束，由用户决定是否重发。
     // 策略由上游在 onBeforeFire 前解析，读取上下文失败也覆盖；整批入箱后仍可补推原文。
-    maxGenerationRetries: (task) => isInstantChatTask(task.metadata) ? 0 : void 0,
+    maxGenerationRetries: (task) => isInstantChatTask(task.metadata) || readTaskKind(task.metadata) === "diagnostic" ? 0 : void 0,
     // 取消通过租约心跳通知执行中的 Worker；1 秒检测一次，TTL 仍由上游管理。
     // 收尾回执 + 过期跳过回执（config 级 hook）。
     // onFireSettled: 无论这次 fire 是发出去了、跳过了还是抛错了都会调一次，self_log
@@ -19669,6 +20720,7 @@ var src_default = {
         data: {
           ...inspectWorkerEnv(env),
           instantChat: true,
+          anthropicMessages: true,
           instantTick: !!env.INSTANT_TICK,
           // 这份代码认不认识「后台任务」（metadata.amsgKind → handler，见 fireKinds.ts）。
           // 老 bundle 没有这个字段，前端据此不去建那种任务——老 worker 会把它当聊天任务
@@ -19676,6 +20728,8 @@ var src_default = {
           // 正常，而门牌永远不更新。报的是**这份代码有没有**，不是版本号：自更新永远由
           // 旧代码执行，版本号对上了不代表新逻辑真的在跑。
           backgroundJobs: true,
+          thirdPartyPush: true,
+          diagnosticReproduction: 1,
           workerVersion: AMSG_BUNDLE_VERSION,
           // 自动更新：有没有这个能力（配没配 CF_API_TOKEN，不回值）+ 最近一次检查的结果。
           // 读的是诊断表，D1 没绑上时读不到就是 null，不影响上面那些照常回答。
@@ -19835,6 +20889,77 @@ var src_default = {
         });
       }
       return handleInstantChat({ request, env, upstream, json: jsonWithCors });
+    }
+    if (pathname.endsWith("/test-push")) {
+      if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+      if (method !== "POST") {
+        return jsonWithCors(405, {
+          success: false,
+          error: { code: "METHOD_NOT_ALLOWED", message: "/test-push \u53EA\u63A5\u53D7 POST" }
+        });
+      }
+      const token = env.AMSG_SERVER_TOKEN?.trim() ?? "";
+      const clientToken = request.headers.get("X-Client-Token") ?? "";
+      if (token && (!clientToken || !await constantTimeEqual2(clientToken, token))) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: "INVALID_CLIENT_TOKEN", message: "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931" }
+        });
+      }
+      try {
+        const reqUserId = request.headers.get("X-User-Id")?.trim() || "";
+        const db = env.DB;
+        const row = reqUserId ? await db.prepare("SELECT user_id, subscription FROM push_subscriptions WHERE user_id = ? LIMIT 1").bind(reqUserId).first() : await db.prepare("SELECT user_id, subscription FROM push_subscriptions LIMIT 1").first();
+        const stored = row?.subscription;
+        const userId = row?.user_id;
+        if (typeof stored !== "string" || !stored || typeof userId !== "string" || !userId) {
+          return jsonWithCors(404, {
+            success: false,
+            error: { code: "SUBSCRIPTION_NOT_FOUND", message: "\u4E91\u7AEF\u8FD8\u6CA1\u6709\u767B\u8BB0\u63A8\u9001\u8BA2\u9605\uFF0C\u8BF7\u5148\u4FDD\u5B58\u6216\u767B\u8BB0\u63A8\u9001\u914D\u7F6E\u3002" }
+          });
+        }
+        let subscription;
+        try {
+          const userKey = await deriveUserEncryptionKey(userId, env.AMSG_MASTER_KEY.trim());
+          subscription = JSON.parse(await decryptFromStorage(stored, userKey));
+        } catch {
+          subscription = JSON.parse(stored);
+        }
+        const payload = {
+          messageKind: "test-push",
+          messageType: "instant",
+          messageId: `test_${Date.now()}`,
+          timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+          contactName: "SullyOS \u63A8\u9001\u6D4B\u8BD5",
+          message: "\u5982\u679C\u4F60\u5728\u624B\u673A\u901A\u77E5\u680F\u770B\u5230\u8FD9\u6761\u6D88\u606F\uFF0C\u8BF4\u660E\u4E3B\u52A8\u6D88\u606F\u63A8\u9001\u901A\u9053\u5DF2\u7ECF\u63A5\u901A\uFF01",
+          notification: {
+            title: "SullyOS \u63A8\u9001\u6D4B\u8BD5",
+            body: "\u5982\u679C\u4F60\u5728\u624B\u673A\u901A\u77E5\u680F\u770B\u5230\u8FD9\u6761\u6D88\u606F\uFF0C\u8BF4\u660E\u4E3B\u52A8\u6D88\u606F\u63A8\u9001\u901A\u9053\u5DF2\u7ECF\u63A5\u901A\uFF01",
+            show: "always",
+            tag: "sullyos-test-push",
+            renotify: true
+          }
+        };
+        const cfg = buildWorkerConfig(env);
+        await cfg.webpush.sendNotification(subscription, JSON.stringify(payload));
+        return jsonWithCors(200, {
+          success: true,
+          data: { sent: true }
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return jsonWithCors(502, {
+          success: false,
+          error: { code: "TEST_PUSH_FAILED", message }
+        });
+      }
+    }
+    if (pathname.endsWith("/vapid-public-key") && (!env.VAPID_PUBLIC_KEY?.trim() || !env.VAPID_PRIVATE_KEY?.trim())) {
+      if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return jsonWithCors(503, {
+        success: false,
+        error: { code: "VAPID_NOT_CONFIGURED", message: "Worker \u672A\u914D\u7F6E VAPID \u5BC6\u94A5\u5BF9\uFF0C\u6D4F\u89C8\u5668 Web Push \u4E0D\u53EF\u7528\uFF08\u53EF\u4F7F\u7528\u7B2C\u4E09\u65B9\u63A8\u9001 App\uFF09\u3002" }
+      });
     }
     return upstream.fetch(request, env);
   },

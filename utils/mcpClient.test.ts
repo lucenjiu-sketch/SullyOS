@@ -33,6 +33,7 @@ import {
     stripTextFakedMcpCalls,
 } from './mcpToolBridge';
 import { completeGroupChatWithMcp } from './groupChat/mcp';
+import { formatApiErrorPayload } from './safeApi';
 
 const mkServer = (over: Partial<McpServerConfig>): McpServerConfig => ({
     ...createMcpServer('测试', 'https://mcp.example.com/mcp'),
@@ -259,13 +260,13 @@ describe('MCP 多步任务策略', () => {
         expect(MCP_CHAT_MAX_STALLED_ROUNDS).toBe(2);
     });
 
-    it('提示模型从检查推进到动作，并把用户本轮明确要求视为已确认', () => {
+    it('提示模型从检查推进到动作，并把用户最新消息里的明确要求视为已确认', () => {
         saveMcpServers([mkServer({ name: '游戏盒' })]);
         const block = buildMcpSystemBlock('条条');
         expect(block).toContain('随后立刻调用能推进目标的动作工具');
         expect(block).toContain('不要反复读取同一份说明或状态');
-        expect(block).toContain('本轮已经明确要求执行，即视为已经确认');
-        expect(MCP_TAIL_REMINDER).toContain('本轮已明确要求的操作视为已确认');
+        expect(block).toContain('在最新消息里已经明确要求执行，即视为已经确认');
+        expect(MCP_TAIL_REMINDER).toContain('最新消息里已明确要求的操作视为已确认');
     });
 
     it('文字兼容提示允许按结果继续下一步，但要求每次只输出一个调用', () => {
@@ -639,6 +640,46 @@ describe('collectMcpFireServers', () => {
         ]));
 
         expect(collectMcpFireServers().map((s) => s.id)).toEqual(['good']);
+    });
+});
+
+describe('错误详情透传（MCP JSON-RPC error.data 与 API 错误体）', () => {
+    it('tools/call 返回 JSON-RPC error.data 时把参数校验细节透传出来', async () => {
+        const server = mkServer({ id: 'rpc-error-server' });
+        vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => {
+            const req = JSON.parse(String(init?.body || '{}'));
+            if (req.method === 'initialize') {
+                return Promise.resolve(new Response(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                }));
+            }
+            if (req.method === 'notifications/initialized') {
+                return Promise.resolve(new Response('', { status: 202 }));
+            }
+            return Promise.resolve(new Response(JSON.stringify({
+                jsonrpc: '2.0',
+                id: req.id,
+                error: {
+                    code: -32602,
+                    message: 'Invalid params',
+                    data: { missingFields: ['query'] },
+                },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        });
+
+        const res = await callMcpTool(server, 'search', {});
+        expect(res.success).toBe(false);
+        expect(res.error).toContain('[-32602]: Invalid params');
+        expect(res.error).toContain('{"missingFields":["query"]}');
+    });
+
+    it('formatApiErrorPayload: error 为无 message 的对象时不产出 [object Object]，并保留 code/param/details 与顶层 detail', () => {
+        expect(formatApiErrorPayload({ error: { code: 'invalid_request', details: { missing: ['model'] } } }, 400))
+            .toBe('invalid_request ({"missing":["model"]})');
+        expect(formatApiErrorPayload({ error: { message: 'Invalid parameter', code: 'invalid_argument', param: 'tools' } }, 400))
+            .toBe('Invalid parameter [invalid_argument, param=tools]');
+        expect(formatApiErrorPayload({ detail: 'Model not found', code: 404 }, 404))
+            .toBe('Model not found [404]');
     });
 });
 

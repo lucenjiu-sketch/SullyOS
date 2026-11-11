@@ -67,7 +67,7 @@ describe('describeAmsgFetchFailure — 把 fetch 异常翻成人话', () => {
     expect(message).toContain('amsg.example.workers.dev');
     expect(message).toContain('连不上');
     // 三条自查线索都要在，缺一条就会有人往错的方向翻。
-    expect(message).toContain('Deno');
+    expect(message).toContain('直连教程');
     expect(message).toContain('地址填错');
     // 最要紧的一句：别让用户以为主动消息整个废了。
     expect(message).toContain('推送');
@@ -797,6 +797,10 @@ describe('buildAmsgDiagnosticRows — 定时任务的逐条细账', () => {
     expect(timeout?.text).toContain('没响应');
     expect(timeout?.text).toContain('给任务占位写库那一步');
     expect(timeout?.raw).toBe('Error: D1 query timed out (D1_TIMEOUT)');
+
+    const storageFull = failureRow({ message: 'D1_ERROR: Exceeded maximum DB size', code: 'D1_STORAGE_FULL' }).items?.[0];
+    expect(storageFull?.text).toContain('云端数据库满了');
+    expect(storageFull?.raw).toBe('Error: D1_ERROR: Exceeded maximum DB size (D1_STORAGE_FULL)');
 
     const cleanup = failureRow({ stage: 'post_send_cleanup_failed_advance' }).items?.[0];
     expect(cleanup?.text).toContain('发完之后写库那一步');

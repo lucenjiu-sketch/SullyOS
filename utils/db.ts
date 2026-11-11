@@ -1,4 +1,7 @@
+import { spaceDatabaseName, SESSION_SPACE_ID, DEFAULT_SPACE_ID, createSpaceStorage, rawSpaceStorage, listUserSpaces, assertUserSpaceAvailable } from './userSpaces';
+import { withSharedAssetLock, canCoordinateAssetDeletion } from './sharedAssetLock';
 import { readLocalCursor } from './localRead';
+import { applyFriendFeedMedia, collectFriendFeedMedia, isActivityTextAsset } from './activityBackup';
 import { compactMemoryLink } from './memoryPalace/linkPrecision';
 import { reportDatabaseFailure } from './databaseHealth';
 import { associateDatabaseOpen, beginDatabaseOpen, recordDatabaseOpen } from './databaseOpenDiagnostics';
@@ -8,6 +11,8 @@ import {exportBeautyPreferences,importBeautyPreferences} from './beautyPreferenc
 import {exportBeautyAuthorBackup,importBeautyAuthorBackup} from './beautyAuthorBackup';
 import { toMountedWorldbook } from './worldbook';
 import { persistCharacterWithHomeMessages } from './homeMessageBridge';
+import { buildPhoneEvidenceChatCard } from './phoneEvidence';
+import { mergePhoneGeneration, PHONE_GENERATION_COMMITTED, type PhoneGeneration } from './phoneGeneration';
 import {deleteSecretNotesForIds, announceSecretNotesChanged} from './secretNote';
 import { ensureStoryTimelineRepair, invalidateStoryTimelineRepair } from './storyTheaterTimeline';
 
@@ -36,7 +41,7 @@ import { exportWorldHomeLocal, importWorldHomeLocal } from './worldHome/localBac
 import { exportDesktopSkinLocal, importDesktopSkinLocal } from './desktopSkinBackup';
 import { editLibrary, VR_LIBRARY_RECORD, type LibraryEdit } from './vrWorld/library';
 
-const DB_NAME = 'AetherOS_Data';
+const DB_NAME = spaceDatabaseName('AetherOS_Data');
 // v67：两条并行线各自用掉了 v65/v66（A线: blob_assets + 生活记录；B线: room_plates 门牌 + digest_reports 消化日志），
 // 合并后统一推到 67——建表全部走幂等的 if(!contains)，任一侧的 v66 老库升级时都会补齐缺的那组表。
 // v68：character_groups 角色分组（神经链接"文件夹"，见 types.ts CharacterGroup）。
@@ -136,8 +141,6 @@ const SULLY_PRESET_EMOJIS = [
 // (含 Service Worker 的 dedupe / inbox 库) 可能跟着开不了或被强关, 推送消息因此确认超时。
 // 改成复用同一条连接, 并在连接被外部失效 (另一 tab 升级版本 / 浏览器强制关闭) 时
 // 清掉缓存, 下次 openDB 自动重开 —— 一处改, 全部 ~165 个调用点受益。
-let dbPromise: Promise<IDBDatabase> | null = null;
-
 /** 和新消息同事务失效镜像，防止后台把刚清掉的旧水位重新恢复。 */
 function clearStaleMemoryMirror(transaction: IDBTransaction, charId: string, newId: number): void {
     const assets = transaction.objectStore(STORE_ASSETS);
@@ -150,7 +153,9 @@ function clearStaleMemoryMirror(transaction: IDBTransaction, charId: string, new
     };
 }
 
-export const openDB = (): Promise<IDBDatabase> => {
+function makeSpaceOpener(DB_NAME: string) {
+ let dbPromise: Promise<IDBDatabase> | null = null;
+ const open = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise;
 
   const promise = new Promise<IDBDatabase>((resolve, reject) => {
@@ -533,11 +538,13 @@ export const openDB = (): Promise<IDBDatabase> => {
           let hwmCleared = 0;
           try {
               const toRemove: string[] = [];
-              for (let i = 0; i < localStorage.length; i++) {
-                  const key = localStorage.key(i);
+              const spaceId = DB_NAME === 'AetherOS_Data' ? DEFAULT_SPACE_ID : DB_NAME.slice('AetherOS_Data__'.length);
+              const storage = rawSpaceStorage ? createSpaceStorage(rawSpaceStorage, spaceId) : localStorage;
+              for (let i = 0; i < storage.length; i++) {
+                  const key = storage.key(i);
                   if (key && key.startsWith('mp_lastMsgId_')) toRemove.push(key);
               }
-              for (const key of toRemove) { localStorage.removeItem(key); hwmCleared++; }
+              for (const key of toRemove) { storage.removeItem(key); hwmCleared++; }
           } catch { /* ignore */ }
           console.log(`🗑️ [DB v48] 一次性清空完成：${cleared} 个 store，${hwmCleared} 个高水位（oldVersion=${oldVersion}）`);
       }
@@ -559,6 +566,16 @@ export const openDB = (): Promise<IDBDatabase> => {
   void promise.catch(reportDatabaseFailure);
   return promise;
 };
+
+ return { open, close: async () => { if (dbPromise) { try { (await dbPromise).close(); } finally { dbPromise = null; } } } };
+}
+const spaceOpeners = new Map<string, ReturnType<typeof makeSpaceOpener>>();
+export function openSpaceDB(id: string): Promise<IDBDatabase> {
+ let opener = spaceOpeners.get(id);
+ if (!opener) { opener = makeSpaceOpener(spaceDatabaseName('AetherOS_Data', id)); spaceOpeners.set(id, opener); }
+ return opener.open();
+}
+export const openDB = () => { assertUserSpaceAvailable(SESSION_SPACE_ID); return openSpaceDB(SESSION_SPACE_ID); };
 
 /**
  * 家园关系条读时迁移：早期格式是无序对 {aId,bId}（双方共用一个数值），
@@ -582,17 +599,15 @@ const normalizeWorldRelationships = (world: WorldProfile): WorldProfile => {
 };
 
 export const DB = {
-  deleteDB: async (): Promise<void> => {
+  deleteDB: async (spaceId = SESSION_SPACE_ID): Promise<void> => {
       // 删库前先关掉单例连接, 否则这条还开着的连接会 block 掉 deleteDatabase。
-      if (dbPromise) {
-          try { (await dbPromise).close(); } catch { /* ignore */ }
-          dbPromise = null;
-      }
+      await spaceOpeners.get(spaceId)?.close();
+      spaceOpeners.delete(spaceId);
       return new Promise((resolve, reject) => {
-          const req = indexedDB.deleteDatabase(DB_NAME);
+          const req = indexedDB.deleteDatabase(spaceDatabaseName('AetherOS_Data', spaceId));
           req.onsuccess = () => resolve();
           req.onerror = () => reject(req.error);
-          req.onblocked = () => console.warn('Delete blocked');
+          req.onblocked = () => reject(new Error('请关闭其他 SullyOS 标签页后重试重置'));
       });
   },
 
@@ -943,6 +958,49 @@ export const DB = {
           }
       };
       cursorReq.onerror = () => reject(cursorReq.error);
+    });
+  },
+
+  savePhoneGeneration: async (charId: string, generation: PhoneGeneration, appName: string): Promise<void> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(['characters', STORE_MESSAGES, STORE_ASSETS], 'readwrite');
+      const characters = tx.objectStore('characters'), messages = tx.objectStore(STORE_MESSAGES);
+      const read = characters.get(charId);
+      let failure: unknown, committed: PhoneGeneration, firstId = Infinity;
+      read.onsuccess = () => {
+        try {
+          const character = read.result as CharacterProfile | undefined;
+          if (!character) throw new Error('角色已不存在，本次生成未保存');
+          const existingIds = new Set(character.phoneState?.records?.map(record => record.id));
+          committed = { ...generation, records: generation.records.filter(record => !existingIds.has(record.id)).map(record => ({ ...record })) };
+          const persist = () => characters.put({ ...character, phoneState: mergePhoneGeneration(character.phoneState, committed) });
+          if (character.phoneState?.sendToChat === false || !committed.records.length) { persist(); return; }
+          let remaining = committed.records.length;
+          for (const record of committed.records) {
+            const card = buildPhoneEvidenceChatCard(record, appName);
+            const add = messages.add({ charId, role: 'assistant', type: 'phone_card', content: card.content, metadata: card.metadata, timestamp: record.timestamp });
+            add.onsuccess = () => {
+              try {
+                record.systemMessageId = add.result as number;
+                firstId = Math.min(firstId, record.systemMessageId);
+                clearStaleMemoryMirror(tx, charId, record.systemMessageId);
+                if (--remaining === 0) persist();
+              } catch (error) { failure = error; tx.abort(); }
+            };
+          }
+        } catch (error) { failure = error; tx.abort(); }
+      };
+      tx.oncomplete = () => {
+        try {
+          const key = `mp_lastMsgId_${charId}`;
+          if (Number(localStorage.getItem(key)) >= firstId) localStorage.removeItem(key);
+        } catch { /* Durable data is already committed. */ }
+        if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(PHONE_GENERATION_COMMITTED, { detail: { charId, generation: committed } }));
+        resolve();
+      };
+      tx.onerror = () => reject(failure || tx.error);
+      tx.onabort = () => reject(failure || tx.error || new Error('手机记录未保存，请重试'));
     });
   },
 
@@ -1534,45 +1592,23 @@ export const DB = {
   // ─── Blob 资源（图片二进制，见 utils/blobRef.ts）───────────────
   // IndexedDB 原生支持存 Blob（结构化克隆），比 base64 省 ~33% 空间、不占 JS 堆，
   // 读出后用 URL.createObjectURL 渲染即可。旧库（<v65）可能还没有此 store，读操作做空兜底。
-  getBlobAsset: async (id: string): Promise<Blob | null> => {
-      const db = await openDB();
-      if (!db.objectStoreNames.contains(STORE_BLOB_ASSETS)) return null;
-      return new Promise((resolve, reject) => {
-          const transaction = db.transaction(STORE_BLOB_ASSETS, 'readonly');
-          const store = transaction.objectStore(STORE_BLOB_ASSETS);
-          const request = store.get(id);
-          request.onsuccess = () => resolve((request.result?.blob as Blob) ?? null);
-          request.onerror = () => reject(request.error);
-      });
-  },
-
-  putBlobAsset: async (id: string, blob: Blob): Promise<void> => {
-      const db = await openDB();
-      return new Promise((resolve, reject) => {
-          const transaction = db.transaction(STORE_BLOB_ASSETS, 'readwrite');
-          transaction.objectStore(STORE_BLOB_ASSETS).put({ id, blob });
-          transaction.oncomplete = () => resolve();
-          transaction.onerror = () => reject(transaction.error);
-          transaction.onabort = () => reject(transaction.error || new Error('putBlobAsset aborted'));
-      });
-  },
+  getBlobAsset: async (id: string): Promise<Blob | null> => (await import('./sharedBlobPool')).readSharedBlob(id),
+  putBlobAsset: async (id: string, blob: Blob): Promise<void> => (await import('./sharedBlobPool')).storeSharedBlob(id, blob),
 
   deleteBlobAsset: async (id: string): Promise<void> => {
-      const db = await openDB();
-      if (!db.objectStoreNames.contains(STORE_BLOB_ASSETS)) return;
-      return new Promise((resolve, reject) => {
-          const transaction = db.transaction(STORE_BLOB_ASSETS, 'readwrite');
-          transaction.objectStore(STORE_BLOB_ASSETS).delete(id);
-          transaction.oncomplete = () => resolve();
-          transaction.onerror = () => reject(transaction.error);
-          transaction.onabort = () => reject(transaction.error || new Error('deleteBlobAsset aborted'));
-      });
+    await withSharedAssetLock('exclusive', async () => {
+      // Pool records are implementation details, never public deletion handles.
+      if (id.startsWith('pool_') || !canCoordinateAssetDeletion() && listUserSpaces().length > 1) return;
+      const { isSharedAssetReferenced } = await import('./spaceAssets');
+      if (await isSharedAssetReferenced(id)) return;
+      await (await import('./sharedBlobPool')).removeSharedBlob(id);
+    });
   },
 
   // 只列 blobRef 命名空间的 id（img_ 存量 / b_ SDK 新生成）。blob_assets 是混用表，
   // GC 的世界观必须限制在自己的前缀内；今后往这张表加新 id 族时不得使用这两个前缀。
   listBlobAssetIds: async (): Promise<string[]> => {
-      const db = await openDB();
+      const db = await openSpaceDB(DEFAULT_SPACE_ID);
       if (!db.objectStoreNames.contains(STORE_BLOB_ASSETS)) return [];
       return new Promise((resolve, reject) => {
           const transaction = db.transaction(STORE_BLOB_ASSETS, 'readonly');
@@ -3791,6 +3827,16 @@ export const DB = {
           });
       };
 
+      const mediaOnly = data.collaborationBackupMode === 'media_only';
+      // Older media archives included entire text records from assets. Recover
+      // their pictures only; never roll a user's current history back with them.
+      if (mediaOnly && !data.friendFeedMedia) {
+          const legacy = data.friendFeed ?? data.assets?.find(a => a.id === 'friend_feed_v1')?.data;
+          if (legacy) {
+              const { parseFriendFeed } = await import('./friendFeed');
+              data.friendFeedMedia = collectFriendFeedMedia(parseFriendFeed(typeof legacy === 'string' ? legacy : JSON.stringify(legacy)));
+          }
+      }
       const plannedSections = [
           data.characters !== undefined || data.mediaAssets !== undefined,
           data.characterGroups !== undefined,
@@ -3799,6 +3845,9 @@ export const DB = {
           data.savedEmojis !== undefined,
           data.emojiCategories !== undefined,
           data.assets !== undefined,
+          data.friendFeed !== undefined && !mediaOnly,
+          data.activityTextAssets !== undefined && !mediaOnly,
+          data.friendFeedMedia !== undefined,
           data.savedJournalStickers !== undefined,
           data.galleryImages !== undefined,
           data.diaries !== undefined,
@@ -4042,9 +4091,40 @@ export const DB = {
           data.emojiCategories = undefined as any;
       }, data.emojiCategories?.length || 0);
       await runSection('系统资源', data.assets !== undefined, async () => {
-          await clearAndAdd(STORE_ASSETS, data.assets || [], '系统资源', true);
+          if (mediaOnly) {
+              await mergeStore(STORE_ASSETS, (data.assets || []).filter(a => !isActivityTextAsset(a.id)), '系统资源', true);
+          } else await clearAndAdd(STORE_ASSETS, data.assets || [], '系统资源', true);
           data.assets = undefined as any;
       }, data.assets?.length || 0);
+      await runSection('活动文字记录', data.activityTextAssets !== undefined && !mediaOnly, async () => {
+          const records = data.activityTextAssets!;
+          if (!Array.isArray(records) || records.some(a => !a || typeof a.id !== 'string'
+              || !isActivityTextAsset(a.id) || a.id === 'friend_feed_v1' || typeof a.data !== 'string')) {
+              throw new Error('活动文字备份格式不正确');
+          }
+          // A present section replaces its own subset, including an empty one.
+          // Other assets (pictures, themes, and the separately restored feed) survive.
+          await withStore(STORE_ASSETS, store => {
+              const keys = store.getAllKeys();
+              keys.onsuccess = () => {
+                  for (const key of keys.result) if (typeof key === 'string' && key !== 'friend_feed_v1' && isActivityTextAsset(key)) store.delete(key);
+                  for (const item of records) store.put(item);
+              };
+          });
+          data.activityTextAssets = undefined;
+      });
+      await runSection('好友圈', data.friendFeed !== undefined && !mediaOnly, async () => {
+          const {FRIEND_FEED_KEY, parseFriendFeed} = await import('./friendFeed');
+          const state = parseFriendFeed(JSON.stringify(data.friendFeed));
+          await DB.saveAsset(FRIEND_FEED_KEY, JSON.stringify(state));
+      });
+      await runSection('哔哔图片', data.friendFeedMedia !== undefined, async () => {
+          const { FRIEND_FEED_KEY, parseFriendFeed } = await import('./friendFeed');
+          const current = parseFriendFeed(await DB.getAsset(FRIEND_FEED_KEY));
+          const state = applyFriendFeedMedia(current, data.friendFeedMedia!);
+          await DB.saveAsset(FRIEND_FEED_KEY, JSON.stringify(state));
+          data.friendFeedMedia = undefined;
+      });
       await runSection('聊天收藏', data.contentFavoritesIndex != null, async () => {
           await DB.saveAssetRaw('content_favorites_index_v1', data.contentFavoritesIndex);
       });

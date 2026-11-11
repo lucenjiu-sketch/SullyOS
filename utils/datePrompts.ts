@@ -30,6 +30,7 @@ import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
 import { isElevenLabsV4Model } from './elevenLabsModels';
 import { selectCharacterContextMessages } from './chatContextRange';
 import { buildCharacterResponsePrinciples } from './characterResponsePrinciples';
+import { resolveCharacterUser } from './userPersona';
 
 /** Adapted from story preset character-polyphony / evidence-gate / user-agency.
  * In-person companionship permits a small beat; it does not require plot escalation.
@@ -661,7 +662,8 @@ export const DatePrompts = {
         openingMode?: 'approach' | 'invite';
     }): Promise<{ messages: ApiMessage[] }> => {
 
-        const { char, userProfile, allMsgs, emojis } = input;
+        const { char, allMsgs, emojis } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
         const charTz = resolveCharTimeZone(char);
         const dateTimeOn = isDateTimeAwarenessOn(char);
         const timeStr = dateTimeOn ? getRealTimeStr(charTz) : '';
@@ -720,7 +722,7 @@ ${invite ? '描写角色自己的到来、动作与必要的开场台词，停�
 
 ### 逻辑检查
 1. **上下文连贯性**: ${continuityRule}
-2. **状态一致性**: ${gapHint.includes('天') ? '如果间隔了很多天，可能在发呆、忙碌或者有点落寞。' : '根据最近的聊天内容和情绪来决定当前状态。如果刚聊完，角色的状态应该与聊天内容相呼应。'}
+2. **状态一致性**: ${!dateTimeOn ? '根据最近记录中的剧情进展、场景与情绪来决定当前状态，使角色表现与上一幕自然呼应。' : gapHint.includes('天') ? '如果间隔了很多天，可能在发呆、忙碌或者有点落寞。' : '根据最近的聊天内容和情绪来决定当前状态。如果刚聊完，角色的状态应该与聊天内容相呼应。'}
 3. **描写风格**: ${preset.peekHint}。${isObserveOn(char) ? '先按下方「观测协议」输出观测块，再开始描写内容（描写本身不要加任何前缀）。' : '不要输出任何前缀，直接输出描写内容。'}
 ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlock(char)}` : ''}`;
 
@@ -746,9 +748,12 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
         userText: string;
         variant: 'send' | 'reroll';
         useVisionDescriptions?: boolean;
+        /** 见面期间作废的主动消息（amsg2TaskContext.buildInPersonNoticesText），可提可不提。 */
+        inPersonNotes?: string | null;
     }): Promise<{ messages: ApiMessage[] }> => {
 
-        const { char, userProfile, allMsgs, emojis, userText, variant } = input;
+        const { char, allMsgs, emojis, userText, variant } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
 
         const historyMsgs = buildDateHistory(
             allMsgs,
@@ -760,11 +765,12 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
 
         const conversation = [...historyMsgs, { role: 'user', content: userText }];
 
+        const dateTimeOn = isDateTimeAwarenessOn(char);
         // 向量召回挂到 char.memoryPalaceInjection，buildCoreContext 会读取
-        await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name);
+        await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name, { omitDates: !dateTimeOn });
         const context = (await ContextBuilder.buildCharacterContext({
             char, user: userProfile, history: conversation,
-            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char), conversational: true, includeUserLocation: true },
+            timeOptions: { skipTimeAwareness: !dateTimeOn, conversational: true, includeUserLocation: true },
         }));
         const systemPrompt = context.coreContext
             + buildVNModeBlock(char, userProfile?.name || '')
@@ -785,6 +791,7 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
                 ...messagesWithWorldbooks.map(message => message === pendingMessage
                     ? { ...message, content: `${userText}\n\n${note}` }
                     : message),
+                ...(input.inPersonNotes ? [{ role: 'system', content: input.inPersonNotes }] : []),
                 { role: 'system', content: buildDateInteractionPrinciples(char.name, userProfile?.name || '对方') },
             ],
         };

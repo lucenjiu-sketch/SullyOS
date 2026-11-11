@@ -3,8 +3,11 @@ import react from '@vitejs/plugin-react';
 import { execSync } from 'node:child_process';
 import { bakeVoiceMiddleware } from './server/bake-voice-middleware';
 import { staticCachePlugin } from './scripts/static-cache-build';
+import { homeResourcePacksPlugin } from './scripts/home-resource-packs.mjs';
 import { startupRecoveryPlugin } from './scripts/startup-recovery-plugin';
+import { pageBuildMetadataPlugin } from './scripts/build-metadata';
 import { APP_VERSION_TAG } from './utils/appVersion';
+import { tikhubMiddleware } from './server/tikhub-middleware';
 
 // MiniMax 国服 / 海外是两套域名，前端每个请求都带 X-MiniMax-Region 头说明走哪边。
 // Vite 的开发代理底层是 http-proxy，不认 router 选项，所以在 configure 里包一层 proxy.web，
@@ -84,22 +87,22 @@ export default defineConfig({
     ],
   },
   plugins: [
+    homeResourcePacksPlugin(),
     startupRecoveryPlugin(appBuildId),
+    pageBuildMetadataPlugin({ buildId: appBuildId, branch: gitInfo.branch, commit: gitInfo.commit, time: buildTime }),
     react(),
     staticCachePlugin({ buildId: appBuildId, appVersion: APP_VERSION_TAG }),
     {
       name: 'bake-voice-middleware',
       configureServer(server) {
         server.middlewares.use('/api/minimax/bake-voice', bakeVoiceMiddleware);
+        server.middlewares.use('/api/friend-feed/tikhub', tikhubMiddleware);
       },
     },
   ],
   define: {
-    __BUILD_BRANCH__: JSON.stringify(gitInfo.branch),
-    __BUILD_COMMIT__: JSON.stringify(gitInfo.commit),
-    __BUILD_TIME__: JSON.stringify(buildTime),
+    // Keep feature gating compile-time; only descriptive release metadata moves to HTML.
     __BUILD_BADGE_VISIBLE__: JSON.stringify(showBuildBadge),
-    __APP_BUILD_ID__: JSON.stringify(appBuildId),
   },
   // GitHub Pages 发布时使用相对路径，避免仓库子路径导致资源 404
   base: process.env.GITHUB_PAGES ? './' : '/',
@@ -114,6 +117,13 @@ export default defineConfig({
         changeOrigin: true,
         secure: true,
         rewrite: () => '/v1/t2a_v2',
+        configure: routeMinimaxByRegion,
+      },
+      '/api/minimax/stt': {
+        target: 'https://api.minimaxi.com',
+        changeOrigin: true,
+        secure: true,
+        rewrite: () => '/v1/speech_to_text',
         configure: routeMinimaxByRegion,
       },
       '/api/minimax/get-voice': {
@@ -137,6 +147,13 @@ export default defineConfig({
         secure: true,
         rewrite: () => '/v1/tts',
       },
+      // 鱼声 Fish Audio STT：转发到 https://api.fish.audio/v1/asr
+      '/api/fishaudio/stt': {
+        target: 'https://api.fish.audio',
+        changeOrigin: true,
+        secure: true,
+        rewrite: () => '/v1/asr',
+      },
       // ElevenLabs TTS：开发环境把同源查询参数改写到官方 voice_id 路径。
       '/api/elevenlabs/tts': {
         target: 'https://api.elevenlabs.io',
@@ -150,6 +167,13 @@ export default defineConfig({
           const timing = parsed.searchParams.get('timestamps') === '1' ? '/with-timestamps' : '';
           return `/v1/${endpoint}/stream${timing}?output_format=${encodeURIComponent(outputFormat)}`;
         },
+      },
+      // ElevenLabs STT (Scribe)：转发到 https://api.elevenlabs.io/v1/speech-to-text
+      '/api/elevenlabs/stt': {
+        target: 'https://api.elevenlabs.io',
+        changeOrigin: true,
+        secure: true,
+        rewrite: () => '/v1/speech-to-text',
       },
     }
   },

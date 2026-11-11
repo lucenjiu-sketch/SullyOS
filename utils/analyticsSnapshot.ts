@@ -41,7 +41,7 @@ import { loadMcpServers, getMcpUseNativeTools } from './mcpClient';
 import { getLuckinToken, isLuckinEnabled } from './luckinMcpClient';
 import { getMcdToken, isMcdEnabled } from './mcdMcpClient';
 import { getPendingTasks, isAmsg2EnabledForChar } from './amsg2Tasks';
-import { ActiveMsgStore } from './activeMsgStore';
+import { ActiveMsgStore, isInstantChatSwitchedOn } from './activeMsgStore';
 import { getVRApi } from './vrWorld/vrApi';
 import { isBuiltinSullyLive2D } from './builtinSullyLive2D';
 import { loadUserLocationConfig } from './userLocationPrivacy';
@@ -224,7 +224,7 @@ export function collectCharSettings(
         见面轻阅读: anyOn(x => x.dateLightReading),
         观测协议: anyOn(x => x.dateObserve?.enabled),
         彼方自主登入: anyOn(x => x.vrState?.enabled),
-        提示音绑白框: anyOn(x => x.chatSoundBound),
+        离开后消息: anyOn(x => x.awayMessage?.enabled),
         // ── 开关：默认开的，问有没有人特意关掉 ──
         时间感知: anyOn(x => x.timeAwarenessEnabled, true),
         见面时间感知: anyOn(x => x.dateTimeAwarenessEnabled, true),
@@ -540,10 +540,6 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
         彼方独立线路: src.vrIndependentApi ? '配了' : '没配',
 
         // ── 主动消息 2.0 ──
-        // 没报「主动消息 Push 加速」：那一层已经全局下线（proactivePushConfig.ts 的
-        // FORCE_DISABLED，设置面板也藏了），loadPushConfig() 恒返回 enabled=false。
-        // 报出来只会是一片「关」，看着像没人用，其实是被下掉了——这种数据比没有更坏。
-        //
         // 四态（见 amsg2Stage）：三关里卡在哪一关，要修的引导完全不是一回事。
         '主动消息2.0': amsg2Stage(
             Boolean(src.amsg2Global.workerUrl?.trim()),
@@ -555,7 +551,7 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
         '开了2.0的角色数': bucketFewCount(amsg2ActiveChars.length),
         // 聊天主路径搬没搬上云端。只有开/关：配置到哪一步由上面那格四态回答，
         // 这一格问的是「配好了的人里有多少真把聊天切过去了」。
-        即时对话: onOff(src.amsg2Global.instantChatEnabled),
+        即时对话: onOff(isInstantChatSwitchedOn(src.amsg2Global)),
         // 全局开着、却在某几个角色上单独关掉的有多少。角色级开关是「跟随全局」缺省，
         // 只有显式关才落 false——这一格数的就是这种显式关，回答「按角色区分有没有人用」。
         // 一个都没有的话这个开关可以从角色面板收掉。

@@ -47,7 +47,19 @@ interface Props {
     characters:CharacterProfile[]; userProfile:UserProfile; realtimeConfig?:RealtimeConfig;
     addToast?:(message:string,type?:any)=>void; onClose:()=>void;
     onOpenGarden?:()=>void;
-    onCharacterTrip:(char:CharacterProfile,mode:'fishing'|'market')=>Promise<{ok:boolean;reason?:string}>;
+    onCharacterTrip:(char:CharacterProfile,mode:'fishing'|'market')=>Promise<{ok:boolean;reason?:string;activity?:string;detail?:string}>;
+}
+function tripError(result:{reason?:string;detail?:string}) {
+    switch (result.reason) {
+        case 'busy': return '角色正在进行另一项活动。';
+        case 'no-api': return '请先配置角色或彼方 API。';
+        case 'empty': return '模型没有返回可用的正文。';
+        case 'truncated': return '模型回复被截断，请检查 API 输出上限。';
+        case 'fishing-format': return '回复缺少有效的鱼获去向或反应。';
+        case 'market-format': return '回复没有给出完整的布告板动作。';
+        case 'fishing-settlement': return result.detail || '鱼获结算未完成。';
+        default: return '这次活动未完成，请查看彼方调用记录。';
+    }
 }
 export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiConfig,characters,userProfile,realtimeConfig,addToast,onClose,onOpenGarden,onCharacterTrip}) => {
     const actors=useMemo(()=>listMarketActors(userProfile,characters),[userProfile.name,characters]);
@@ -130,10 +142,9 @@ export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiCo
             if (visitor) {
                 setRefreshNotice(visitor.name + '正在看看布告板…');
                 const result = await onCharacterTrip(visitor, 'market');
-                if (!result.ok) throw new Error(result.reason === 'no-api' ? '尚未配置角色或彼方 API，暂时无法邀请这位角色。'
-                    : result.reason === 'busy' ? '这位角色正在进行另一项活动，稍后再刷新看看。' : '这次来访没有完成，可以稍后再试。');
+                if (!result.ok) throw new Error(tripError(result));
                 refresh();
-                setRefreshNotice(visitor.name + '来过了，看看有没有留下新便笺或回复。');
+                setRefreshNotice(result.activity || (visitor.name + '来过了。'));
             } else {
                 setRefreshNotice('路人正在看看最近的便笺…');
                 const controller=new AbortController();npcAbort.current=controller;
@@ -165,8 +176,16 @@ export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiCo
     const runTrip=async(mode:'fishing'|'market')=>{
         const char=characters.find(c=>c.id===tripChar);if(!char||trip||busy||refreshInFlight.current)return;
         refreshInFlight.current=true;
-        setTrip(char.id);setError('');
-        try{const result=await onCharacterTrip(char,mode);if(!result.ok)throw new Error(pendingFishingTrip(readFishingMarketState(),char.id)?'这一竿的鱼获已暂存。点“继续处理这一竿”重试，不会重新抽取。':result.reason==='no-api'?'尚未配置角色或彼方 API':result.reason==='busy'?'角色正在进行另一项活动':result.reason==='empty'?'角色的回复没有给出可执行结果，这轮没有替角色编造行动':'这次活动未完成，请查看彼方调用记录');refresh();}
+        setTrip(char.id);setError('');setRefreshNotice('');
+        try {
+            const result = await onCharacterTrip(char,mode);
+            if (!result.ok) {
+                const pending = mode === 'fishing' && pendingFishingTrip(readFishingMarketState(),char.id);
+                throw new Error(tripError(result) + (pending ? ' 鱼获已暂存，可以继续处理这一竿。' : ''));
+            }
+            refresh();
+            if (mode === 'market') setRefreshNotice(result.activity || (char.name + '来过了。'));
+        }
         catch(e){report(e);}finally{refreshInFlight.current=false;setTrip(null);if(mode==='fishing')requestAnimationFrame(()=>tripResultRef.current?.scrollIntoView({block:'nearest',behavior:'smooth'}));}
     };
     useEffect(()=>{
@@ -199,6 +218,7 @@ export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiCo
         <p className="fish-note mb-3">{mode==='fishing'?`由 ta 决定保留、放生或交给${sarNpcContentEnabled()?'艾文':'回收站'}，使用一次模型调用。`:'让 ta 自己决定看看、交易，或留一句话。每次邀请使用一次模型调用。'}</p>
         <select className="fish-input" aria-label={mode==='fishing'?'选择去水域的角色':'选择逛布告板的角色'} value={tripChar} onChange={e=>setTripChar(e.target.value)}><option value="">选择已接入彼方的角色</option>{characters.filter(c=>c.vrState?.enabled).map(c=><option value={c.id} key={c.id}>{c.name}</option>)}</select>
         <button disabled={!tripChar||!!trip||busy} className="fish-action mt-2 w-full" onClick={()=>void runTrip(mode)}>{trip?'活动进行中…':mode==='fishing'?(pendingTrip?'继续处理这一竿':'让 ta 去钓鱼'):'让 ta 逛布告板'}</button>
+        {mode==='market'&&refreshNotice&&<p role="status" className="board-refresh-notice">{refreshNotice}</p>}
         {mode==='fishing'&&latestTrip&&<div ref={tripResultRef} className="mt-3 rounded-xl bg-white/5 p-3" aria-live="polite">
             <div className="text-[13px]">{speciesById(latestTrip.catch.speciesId)?.name} · {latestTrip.catch.sizeCm} cm · {'✦'.repeat(latestTrip.catch.quality)}</div>
             <p className="fish-note mt-1">{latestTrip.status==='pending'?'鱼获已暂存，等 ta 决定去向。':latestTrip.result?.disposition==='release'?'已放生，个人图鉴记录保留。':latestTrip.sale?`已交给${sarNpcContentEnabled()?'艾文':'回收站'}，获得 ${latestTrip.sale.amount} 鳞币，个人图鉴记录保留。`:'已放进 ta 自己的收藏柜。'}</p>
@@ -247,7 +267,7 @@ export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiCo
                     <div className="mt-4 flex items-center justify-between"><h2 className="text-[14px]">{actor.name} 的收藏</h2><span className="fish-note">{owned.length} 件 · 研究 {state.research[actor.id]||0}</span></div>
                     {actor.id!=='user'&&<p className="fish-note mt-1">你可以回看 ta 的收藏；鱼获和交易由 ta 在自己的活动中决定。</p>}
                     {actor.id==='user'&&<p className="fish-note mt-1">点一条鱼，可以按今天的行情交给{sarNpcContentEnabled()?'艾文':'回收站'}。</p>}
-                    <div className="mt-3 grid grid-cols-2 gap-2">{owned.slice().reverse().slice(inventoryPage*12,inventoryPage*12+12).map(c=><button className="rounded-xl bg-[#c8e0ea08] p-3 text-left" key={c.id} onClick={()=>{setSelectedCatch(c);setError('');}}><div className="flex justify-center"><FishArt speciesId={c.speciesId} size={118}/></div><div className="mt-1 text-[12px]">{speciesById(c.speciesId)?.name}</div><div className="fish-note">{'✦'.repeat(c.quality)} · {c.sizeCm} cm{c.displayed?' · 陈列中':''}{c.incubatingUntil?' · 孵化中':''}</div></button>)}</div>
+                    <div className="mt-3 grid grid-cols-2 gap-2">{owned.slice().reverse().slice(inventoryPage*12,inventoryPage*12+12).map(c=><button className="rounded-xl bg-[#c8e0ea08] p-3 text-left" key={c.id} onClick={()=>{setSelectedCatch(c);setError('');}}><div className="flex justify-center"><FishArt speciesId={c.speciesId} halloweenHat={c.halloweenHat} size={118}/></div><div className="mt-1 text-[12px]">{speciesById(c.speciesId)?.name}</div><div className="fish-note">{'✦'.repeat(c.quality)} · {c.sizeCm} cm{c.displayed?' · 陈列中':''}{c.incubatingUntil?' · 孵化中':''}</div></button>)}</div>
                     {!owned.length&&<p className="fish-note py-7 text-center">{selling?'现在还没有鱼可以卖，先去钓一会儿吧。':'水箱还空着。收藏从第一竿开始。'}</p>}
                     {owned.length>12&&<div className="mt-3 flex justify-between"><button className="fish-action" disabled={inventoryPage===0} onClick={()=>setInventoryPage(p=>p-1)}>上一页</button><span className="fish-note">{inventoryPage+1} / {Math.ceil(owned.length/12)}</span><button className="fish-action" disabled={(inventoryPage+1)*12>=owned.length} onClick={()=>setInventoryPage(p=>p+1)}>下一页</button></div>}
                     <div className="fish-divider mt-5 flex items-center justify-between pt-4"><h2 className="text-[14px]">{actor.name} 的水域图鉴</h2><span className="fish-note">{discoveries.length} / {FISH_CATALOG.length}</span></div>
@@ -291,7 +311,7 @@ export const FishingMarketOverlay:React.FC<Props> = ({initialEntry='water',apiCo
         {selectedCatch&&(()=>{const c=state.inventory.find(item=>item.id===selectedCatch.id);if(!c)return null;const f=speciesById(c.speciesId)!;const mine=c.ownerId==='user';const free=availableCatches(state,'user').some(item=>item.id===c.id);
             const collectionAct=(action:'sell'|'release'|'display'|'study'|'incubate')=>void act(s=>handleCollection(s,user,c.id,action),()=>setSelectedCatch(null));
             return <Sheet title={f.name} onClose={()=>setSelectedCatch(null)}>
-                <div className="flex justify-center py-2"><FishArt speciesId={c.speciesId} size={240} animated/></div>
+                <div className="flex justify-center py-2"><FishArt speciesId={c.speciesId} halloweenHat={c.halloweenHat} size={240} animated/></div>
                 <div className="text-center text-[13px]">{rarityLabel[f.rarity]} · {c.sizeCm} cm · {'✦'.repeat(c.quality)}</div><p className="fish-note mt-2 text-center">{f.blurb}</p>
                 <p className="fish-note mt-3">{marketActorName(actors,c.ownerId,c.ownerName)} 的收藏 · {c.weatherLabel} · {c.weatherSource==='real'?'真实天气':'模拟天气'}</p>
                 {error&&<p role="alert" className="mt-2 text-[12px] text-amber-100">{error}</p>}

@@ -19,6 +19,7 @@ import {
 } from '../../../utils/storyTheater';
 import StoryMaskBox from './StoryMaskBox';
 import StoryPresetMaker from './StoryPresetMaker';
+import { archiveStoryManually } from '../../../utils/storyTheaterArchive';
 import StoryTheaterEditor from './StoryTheaterEditor';
 import StoryTheaterSession from './StoryTheaterSession';
 import StoryVectorMemoryPanel from './StoryVectorMemoryPanel';
@@ -34,7 +35,7 @@ interface Props {
 type View = 'list' | 'editor' | 'session' | 'preset' | 'masks' | 'vectors' | 'archives';
 
 const StoryTheaterContent: React.FC<Props> = ({ onSwitchCompanion, onClose }) => {
-    const { characters, userProfile, addToast, remoteVectorConfig } = useOS();
+    const { characters, userProfile, addToast, remoteVectorConfig, apiConfig } = useOS();
     const [view, setView] = useState<View>('list');
     const [entries, setEntries] = useState<StoryTheaterEntry[]>([]);
     const [customPresets, setCustomPresets] = useState<StoryTheaterPreset[]>([]);
@@ -153,7 +154,7 @@ const StoryTheaterContent: React.FC<Props> = ({ onSwitchCompanion, onClose }) =>
             const characterIds = selection.type === 'character'
                 ? current.characterIds.filter(id => id !== selection.id)
                 : current.characterIds;
-            const remainingActors = characters.filter(char => characterIds.includes(char.id));
+            const remainingActors = characters.filter(char => characterIds.includes(char.id) || (selection.type === 'character' && selection.id === char.id));
             const validBookIds = new Set(dedupeTheaterWorldbooks(remainingActors).map(book => book.id));
             const characterContextLimits = { ...current.characterContextLimits };
             if (selection.type === 'character') {
@@ -163,7 +164,11 @@ const StoryTheaterContent: React.FC<Props> = ({ onSwitchCompanion, onClose }) =>
                 ...current,
                 mask: selection,
                 characterIds,
-                selectedWorldbookIds: current.selectedWorldbookIds.filter(id => validBookIds.has(id)),
+                selectedWorldbookIds: Array.from(new Set([
+                    ...current.selectedWorldbookIds.filter(id => validBookIds.has(id)),
+                    ...(selection.type === 'character' && (current.mask?.type !== 'character' || current.mask.id !== selection.id)
+                        ? (characters.find(char => char.id === selection.id)?.mountedWorldbooks || []).map(book => book.id) : []),
+                ])),
                 characterContextLimits,
                 updatedAt: Date.now(),
             };
@@ -205,6 +210,13 @@ const StoryTheaterContent: React.FC<Props> = ({ onSwitchCompanion, onClose }) =>
         presets={presets}
         onCancel={() => setView(entries.some(item => item.id === activeEntry.id) ? 'session' : 'list')}
         onSave={saveEntry}
+        onManualArchive={async draft => {
+            const next = await archiveStoryManually(normalizeStoryTheater(draft), apiConfig);
+            setEntries(current => current.map(item => item.id === next.id ? next : item));
+            setActiveEntry(next);
+            addToast('本段剧情已总结为事件盒，原文仍保留', 'success');
+            return next;
+        }}
         onImportPreset={importPreset}
         onEditPreset={(preset, draft) => { setActiveEntry(draft); setEditingPreset(preset); setView('preset'); }}
         onOpenMaskBox={draft => { if (maskLocked || draft.writesToCharacterMemory) return; setActiveEntry(draft); setView('masks'); }}

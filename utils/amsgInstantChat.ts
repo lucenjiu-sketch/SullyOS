@@ -1,4 +1,5 @@
 import { stageStoppedReplyReceipt } from './amsgStoppedReplyClient';
+import { listUserSpaces } from './userSpaces';
 import { amsgStateNamespace } from './amsgFirePack';
 import { stoppedReplyKey } from './amsgStoppedReply';
 import { getReplyDisplayIds, isReplyStopped, markReplyStopped, replyAbortError } from './chatReplyCancellation';
@@ -25,14 +26,14 @@ import { getReplyDisplayIds, isReplyStopped, markReplyStopped, replyAbortError }
 
 import { ActiveMsg2InboxMessage, CharacterProfile, GroupProfile, RealtimeConfig, UserProfile } from '../types';
 import { ActiveMsgClient, type AmsgOutboxEntry, type InstantChatProbeOutcome } from './activeMsgClient';
-import { ActiveMsgStore } from './activeMsgStore';
+import { ActiveMsgStore, isInstantChatSwitchedOn } from './activeMsgStore';
 import { trackEvent } from './analytics';
 import { cloudApiCallLogId, recordCloudApiCall, settleCloudApiCall } from './apiCallLog';
 import { announceEmotionDone } from './chatGenEvents';
 import { dispatchAmsgResult } from './amsgResults';
 import { DB } from './db';
 import type { AmsgEmotionEvalSpec } from '../worker/amsg/src/emotionEval';
-import { AMSG_BUNDLE_VERSION } from './amsgBundleVersion';
+import { AMSG_BUNDLE_VERSION, compareBundleVersions } from './amsgBundleVersion';
 import type { AmsgSarModuleSnapshot } from './vrWorld/sarEnvelopeCore';
 
 const HEADER = '[AmsgInstantChat]';
@@ -248,8 +249,8 @@ export interface InstantChatReadiness {
   ready: boolean;
   reason?: InstantChatReadinessReason;
   /**
-   * 那台 Worker 贴的是不是本 App 认的这一版 bundle（存量 workerBundleVersion 与
-   * AMSG_BUNDLE_VERSION 相等）。只在 ready 时给：true / false 是探到过的结论，
+   * 那台 Worker 贴的 bundle 是否不旧于本 App 认的这一版（存量 workerBundleVersion 等于或
+   * 新于 AMSG_BUNDLE_VERSION；App 还是缓存的旧构建时 Worker 会更新，那也认得新协议）。只在 ready 时给：true / false 是探到过的结论，
    * undefined = 不知道。不传 ensureBundleVersion 时它就是「还没探过」；传了的话
    * 存量为空会当场现探一次，那时 undefined 意味着「现探也没问到」。
    *
@@ -259,14 +260,15 @@ export interface InstantChatReadiness {
   workerBundleCurrent?: boolean;
 }
 
-/** 存量里那台 Worker 的 bundle 版本是不是当前这一版；没探过（undefined）返回 undefined。 */
+/** 存量里那台 Worker 的 bundle 版本是否不旧于当前这一版；没探过（undefined）返回 undefined。 */
 const resolveWorkerBundleCurrent = (
   config: { workerBundleVersion?: string | null },
-): boolean | undefined => (
-  config.workerBundleVersion === undefined
-    ? undefined
-    : config.workerBundleVersion === AMSG_BUNDLE_VERSION
-);
+): boolean | undefined => {
+  const deployed = config.workerBundleVersion;
+  if (deployed === undefined) return undefined;
+  if (deployed === null) return false;
+  return deployed === AMSG_BUNDLE_VERSION || (compareBundleVersions(deployed, AMSG_BUNDLE_VERSION) ?? -1) > 0;
+};
 
 /** ready 的那一档带上 bundle 结论；不知道就不带这个键。 */
 const readyWithBundle = (workerBundleCurrent: boolean | undefined): InstantChatReadiness => (
@@ -355,7 +357,7 @@ const probeBundleCurrentNow = async (): Promise<boolean | undefined> => {
     try {
       // 问到答案时 probeWorkerVersion 会顺手把版本存进 workerBundleVersion。
       const { state } = await ActiveMsgClient.probeWorkerVersion({ timeoutMs: INSTANT_CHAT_REPROBE_TIMEOUT_MS });
-      return state === 'current' ? true : state === 'outdated' ? false : undefined;
+      return state === 'current' || state === 'ahead' ? true : state === 'outdated' ? false : undefined;
     } catch {
       return undefined;
     }
@@ -426,7 +428,7 @@ export const resolveInstantChatReadiness = async (
     console.warn(`${HEADER} 全局配置读不出来，这一轮判断不了即时对话开没开（按走不通处理，但这不是「没开」）`, error);
     return { ready: false, reason: 'config-unreadable' };
   }
-  if (!config.instantChatEnabled) return { ready: false, reason: 'disabled' };
+  if (!isInstantChatSwitchedOn(config)) return { ready: false, reason: 'disabled' };
   // 地址排在能力前面：没填地址时那份能力位多半是上一台 Worker 留下的存量，
   // 报「Worker 太旧」会把人指去点一个根本没连上的东西。
   if (!config.workerUrl?.trim()) return { ready: false, reason: 'no-worker-url' };
@@ -515,6 +517,8 @@ export const sendInstantChatTurn = async (params: {
   signal?: AbortSignal;
   char: CharacterProfile;
   chatMessages: Array<{ role: string; content: unknown }>;
+  /** 本地「实时状态」段在 chatMessages 里的下标；-1 / 不传时 worker 把时效块追加到末尾。 */
+  timelyInsertAt?: number;
   /** 本地生成这一轮会用的凭据（effectiveApi），云端必须用同一份。 */
   api: { baseUrl: string; apiKey: string; model: string };
   /** 本地这一轮会发的采样温度；开思考时本地不发温度，这里也就不传。 */
@@ -572,6 +576,7 @@ export const sendInstantChatTurn = async (params: {
       signal: params.signal,
       char: params.char,
       chatMessages: params.chatMessages,
+      ...(params.timelyInsertAt !== undefined ? { timelyInsertAt: params.timelyInsertAt } : {}),
       api: params.api,
       ...(typeof params.temperature === 'number' ? { temperature: params.temperature } : {}),
       ...(params.maxTokens ? { maxTokens: params.maxTokens } : {}),
@@ -751,6 +756,7 @@ const backfillOutboxEntries = async (
   entries: AmsgOutboxEntry[],
 ): Promise<Omit<OutboxDrainResult, 'entries'>> => {
   const now = Date.now();
+  const localCharIds = listUserSpaces().length > 1 ? new Set((await DB.getAllCharacters()).map(c => c.id)) : null;
   const ackNow: string[] = [];
   const writtenIds: string[] = [];
   let written = 0;
@@ -768,6 +774,9 @@ const backfillOutboxEntries = async (
   }
   const persistedIdsByChar = new Map<string, Set<string>>();
   for (const [charId, ids] of candidatesByChar) {
+    // Other users' messages still enter the shared durable inbox. Their own page
+    // will deduplicate and run the unchanged chat pipeline when that space opens.
+    if (localCharIds && !localCharIds.has(charId)) continue;
     persistedIdsByChar.set(charId, await DB.findPersistedActiveMessageIds(charId, ids));
   }
   // 收件箱里已经躺着的那些，各自是什么时候到这台设备的。
@@ -885,6 +894,7 @@ export const failInstantChatPending = async (
   // 这一轮随 chat 段上云的作废回执跟着作废：没销账 = 还是「未告知」，下一轮会重新
   // 注入。销掉的话角色永远不知道那条任务被作废过，聊天里许下的承诺就这么没了。
   discardInstantChatExpiredNotices(charId, uuid);
+  void import('./friendFeedEmotion').then(m=>m.settleFriendFeedCloudTask(charId,uuid,false)).catch(()=>{});
   // 「情绪更新中」那盏灯也在这里熄。
   //
   // 平时它的熄灭信号搭在最后一条回复的推送上（metadata.amsgEmotionDone，见
@@ -923,6 +933,7 @@ export const stopInstantChat = async (charId: string): Promise<void> => {
   markReplyStopped(pending.uuid);
   clearInstantChatPending(charId);
   discardInstantChatExpiredNotices(charId, pending.uuid);
+  void import('./friendFeedEmotion').then(m=>m.settleFriendFeedCloudTask(charId,pending.uuid,false)).catch(()=>{});
   announceEmotionDone(charId);
   settleCloudApiCall({ id: cloudApiCallLogId(pending.uuid), ok: false });
   // Issue cancellation immediately; history reconciliation must not delay the remote abort.
