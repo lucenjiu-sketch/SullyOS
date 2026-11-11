@@ -2,13 +2,13 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical } from '@phosphor-icons/react';
 import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
 import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
-import { splitParagraphs, verticalChapterRange } from './layout';
+import { READING_PARAGRAPH_GAP_EM, splitParagraphs, verticalChapterRange } from './layout';
 import type { ReadingBook } from './types';
 
 /**
  * 沉浸式阅读视图。
  *
- * 没有常驻顶栏，屏幕上只有正文和左上角一行很淡的章节名。
+ * 上下各有一条固定的留白带（上面放很淡的章节名，下面留空），正文只占中间那块。
  *
  * 左右滑模式：每页**刚好一屏**，用隐藏容器真实测量出这一屏装得下多少字
  * （见 measure.ts）。整页不可滚动——需要上下滚才能看完一页，说明分页错了。
@@ -17,6 +17,19 @@ import type { ReadingBook } from './types';
  * 唤出菜单的手势按模式分开，避免和翻页手势抢：
  * - 左右滑模式：左右滑翻页，**往下滑**唤菜单
  * - 竖滑模式：上下滚动阅读，**往右滑**唤菜单
+ *
+ * ## 为什么正文区必须是独立的一层（别把留白改回 padding）
+ *
+ * 测量的依据是正文区的 `clientHeight`，而 `clientHeight` **包含 padding**。
+ * 曾经上下留白是用 padding 写在同一个元素上的，于是量出来的高度比真正能
+ * 排字的区域多了上下两条留白，每页多塞进约两行——露在屏幕外，底下那行只剩一半。
+ * 现在留白是 flex 的兄弟节点，正文区自己没有纵向 padding，量到的就是真实可排区域。
+ *
+ * ## 测量容器必须和正文排得一模一样
+ *
+ * 正文是按段落渲染的（每段之间有间距），所以测量时也要按段落建 DOM，
+ * 不能图省事塞一整串纯文本——那样量出的高度偏小，同样会多塞。
+ * 两边共用 `textStyle` 和 `READING_PARAGRAPH_GAP_EM`，改一处记得对齐另一处。
  */
 
 export type ReadingFlipMode = 'horizontal' | 'vertical';
@@ -39,6 +52,34 @@ interface ReadingViewProps {
 const SWIPE_THRESHOLD = 45;
 /** 翻页动画时长，与下面 inline transition 一致。 */
 const FLIP_ANIMATION_MS = 170;
+
+/** 上下两条固定留白带的高度（px，不含安全区）。正文永远落在它们中间。 */
+const TOP_BAND_HEIGHT = 30;
+const BOTTOM_BAND_HEIGHT = 26;
+/** 正文左右留白。测量容器必须用同一个值，否则每行字数不一样。 */
+const SIDE_PADDING = 22;
+
+/**
+ * 把 [start, end) 这段正文按段落写进试排容器。
+ *
+ * 和真实正文的渲染必须一一对应：同样按 `splitParagraphs` 切段、
+ * 同样的段间距、同样顶格不缩进。只要两边排得不一样，量出的容量就是错的。
+ */
+const renderParagraphsInto = (
+  host: HTMLElement,
+  content: string,
+  start: number,
+  end: number,
+): void => {
+  const nodes = splitParagraphs(content, start, end).map((paragraph, index) => {
+    const node = document.createElement('p');
+    node.textContent = paragraph.text;
+    node.style.margin = '0';
+    if (index > 0) node.style.marginTop = `${READING_PARAGRAPH_GAP_EM}em`;
+    return node;
+  });
+  host.replaceChildren(...nodes);
+};
 
 const ReadingView: React.FC<ReadingViewProps> = ({
   book,
@@ -88,6 +129,9 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   /**
    * 测量分页。必须在布局阶段做（useLayoutEffect），
    * 否则会先闪一帧按旧页边界排的内容。
+   *
+   * 试排的 DOM 结构必须和真实正文一致（按段落 + 段间距），
+   * 否则量出来的容量偏大，多出来的行会露在屏幕外。
    */
   useLayoutEffect(() => {
     if (flipMode !== 'horizontal') return;
@@ -95,22 +139,27 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     const viewport = pageRef.current;
     if (!host || !viewport) return;
 
+    // 正文区自己没有纵向 padding，所以 clientHeight 就是真实可排高度。
     const limit = viewport.clientHeight;
     if (limit <= 0) return;
 
     const fits = (start: number, length: number): boolean => {
-      host.textContent = content.slice(start, start + length);
+      renderParagraphsInto(host, content, start, start + length);
       return host.scrollHeight <= limit;
     };
     const starts = paginateBlock(block.start, block.end, fits);
-    host.textContent = '';
+    host.replaceChildren();
     setPageStarts(starts);
   }, [block.start, block.end, content, flipMode, fontSize]);
 
   const pageIndex = pageIndexForOffset(pageStarts, offset);
   const pageStart = pageStarts[pageIndex] ?? block.start;
   const pageEnd = pageStarts[pageIndex + 1] ?? block.end;
-  const pageText = useMemo(() => content.slice(pageStart, pageEnd), [content, pageEnd, pageStart]);
+  /** 当前页的段落。和测量时用的是同一个切分函数，排版才对得上。 */
+  const pageParagraphs = useMemo(
+    () => splitParagraphs(content, pageStart, pageEnd),
+    [content, pageEnd, pageStart],
+  );
 
   const commitOffset = useCallback((next: number) => {
     setOffset(next);
@@ -234,47 +283,56 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     onChangeFontSize(READING_FONT_SIZES[Math.min(READING_FONT_SIZES.length - 1, Math.max(0, base + step))]);
   }, [fontSize, onChangeFontSize]);
 
-  /** 正文与测量容器必须共用这一份样式，否则量出来的页放不进真实页面。 */
+  /**
+   * 正文与测量容器必须共用这一份样式，否则量出来的页放不进真实页面。
+   *
+   * 没有 `textIndent`：原来那条首行缩进只对一页的**第一行**生效，
+   * 于是上一页没读完的半句话到了新页开头也被缩两格，看着像新段落。
+   * 缩进这件事交给段落本身（现在是顶格，不缩）。
+   *
+   * 也没有 `whiteSpace: pre-wrap`：段落是分开的 `<p>`，换行由段落结构表达，
+   * 原文的空行不再照排——那会一次空掉一整行。
+   */
   const textStyle: React.CSSProperties = {
     fontSize,
-    lineHeight: 1.95,
+    lineHeight: 1.9,
     fontFamily: '"Noto Serif SC", Georgia, serif',
     color: '#3a3027',
-    whiteSpace: 'pre-wrap',
-    textIndent: '2em',
     wordBreak: 'break-word',
   };
 
   const atBookStart = chapterIndex === 0 && pageIndex === 0 && block.start === 0;
   const atBookEnd = pageEnd >= content.length;
-
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#f6ecd9]">
-      {/* 唯一常驻信息：左上角一行很小很淡的章节名。 */}
+      {/*
+        三层竖向结构：顶带 / 正文 / 底带。
+        正文那一层是 flex-1 且自身没有纵向 padding，所以它的 clientHeight
+        就是真正能排字的高度——测量依赖这一点，别把留白改回 padding。
+      */}
       <div
-        className="pointer-events-none absolute left-0 right-0 top-0 z-10 px-6 text-[11px] text-stone-400/90"
-        style={{ paddingTop: 'calc(var(--safe-top) + 8px)' }}
+        className="flex h-full w-full flex-col"
+        style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)' }}
       >
-        <span className="line-clamp-1">
-          第{chapterIndex + 1}章{chapter?.title && chapter.title !== '全文' ? ` ${chapter.title}` : ''}
-        </span>
-      </div>
-
-      {flipMode === 'horizontal' ? (
+        {/* 顶带：固定高度，放很淡的章节名。正文不会再压到它上面。 */}
         <div
-          className="h-full w-full"
-          onTouchStart={handleTouchStart}
-          onTouchEnd={handleTouchEnd}
+          className="pointer-events-none flex shrink-0 items-end text-[11px] text-stone-400/90"
+          style={{ height: TOP_BAND_HEIGHT, paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
         >
-          {/* 整页不可滚动：要滚才能读完一页就说明分页错了。 */}
+          <span className="line-clamp-1">
+            第{chapterIndex + 1}章{chapter?.title && chapter.title !== '全文' ? ` ${chapter.title}` : ''}
+          </span>
+        </div>
+
+        {flipMode === 'horizontal' ? (
           <div
             ref={pageRef}
-            className="h-full w-full overflow-hidden px-6"
-            style={{
-              paddingTop: 'calc(var(--safe-top) + 34px)',
-              paddingBottom: 'calc(var(--safe-bottom) + 20px)',
-            }}
+            className="min-h-0 flex-1 overflow-hidden"
+            style={{ paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
+            onTouchStart={handleTouchStart}
+            onTouchEnd={handleTouchEnd}
           >
+            {/* 整页不可滚动：要滚才能读完一页就说明分页错了。 */}
             <div
               style={{
                 ...textStyle,
@@ -283,49 +341,69 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                 transition: `transform ${FLIP_ANIMATION_MS}ms ease-out, opacity ${FLIP_ANIMATION_MS}ms ease-out`,
               }}
             >
-              {pageText}
+              {pageParagraphs.map((paragraph, index) => (
+                <p
+                  key={paragraph.offset}
+                  data-offset={paragraph.offset}
+                  style={{ margin: 0, marginTop: index > 0 ? `${READING_PARAGRAPH_GAP_EM}em` : 0 }}
+                >
+                  {paragraph.text}
+                </p>
+              ))}
             </div>
           </div>
-
-          {/* 测量容器：宽度与正文一致、位置在屏外，不参与点击与朗读。 */}
+        ) : (
           <div
-            ref={measureRef}
-            aria-hidden
-            className="pointer-events-none absolute left-6 right-6 top-0 -z-10 opacity-0"
-            style={{ ...textStyle, visibility: 'hidden' }}
-          />
-        </div>
-      ) : (
-        <div
-          ref={verticalRef}
-          onScroll={handleVerticalScroll}
-          onTouchStart={handleTouchStart}
-          onTouchEnd={handleTouchEnd}
-          className="h-full w-full overflow-y-auto no-scrollbar px-6"
-          style={{
-            paddingTop: 'calc(var(--safe-top) + 34px)',
-            paddingBottom: 'calc(var(--safe-bottom) + 40px)',
-          }}
-        >
-          {verticalParagraphs.map(paragraph => (
-            <p
-              key={paragraph.offset}
-              data-offset={paragraph.offset}
-              className="mb-4"
-              style={{ ...textStyle, whiteSpace: 'normal' }}
-            >
-              {paragraph.text}
-            </p>
-          ))}
-        </div>
-      )}
+            ref={verticalRef}
+            onScroll={handleVerticalScroll}
+            onTouchStart={handleTouchStart}
+            onTouchEnd={handleTouchEnd}
+            className="min-h-0 flex-1 overflow-y-auto no-scrollbar"
+            style={{ paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
+          >
+            {verticalParagraphs.map((paragraph, index) => (
+              <p
+                key={paragraph.offset}
+                data-offset={paragraph.offset}
+                style={{
+                  ...textStyle,
+                  margin: 0,
+                  marginTop: index > 0 ? `${READING_PARAGRAPH_GAP_EM}em` : 0,
+                }}
+              >
+                {paragraph.text}
+              </p>
+            ))}
+          </div>
+        )}
+
+        {/* 底带：固定高度，故意留空（久说右下角不用放东西）。 */}
+        <div className="pointer-events-none shrink-0" style={{ height: BOTTOM_BAND_HEIGHT }} />
+      </div>
+
+      {/*
+        测量容器：左右留白与正文一致，绝对定位在屏外、不占布局。
+        宽度要和正文那一层相同，否则每行能排的字数不一样，量了也白量。
+      */}
+      <div
+        ref={measureRef}
+        aria-hidden
+        className="pointer-events-none absolute top-0 -z-10 opacity-0"
+        style={{
+          ...textStyle,
+          left: SIDE_PADDING,
+          right: SIDE_PADDING,
+          visibility: 'hidden',
+        }}
+      />
 
       {/* 第一次进来时提示手势，之后不再显示（只在最开头那一页出现）。 */}
       {atBookStart && !menuOpen && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+7px)] text-center text-[10px] text-stone-400/80">
           {flipMode === 'horizontal' ? '左右滑翻页 · 向下滑唤出菜单' : '上下滑阅读 · 向右滑唤出菜单'}
         </div>
       )}
+
 
       {/* ——— 菜单 ——— */}
       {menuOpen && (

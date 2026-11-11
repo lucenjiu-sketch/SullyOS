@@ -16,6 +16,12 @@ export interface ReadingParagraph {
 /**
  * 把 [start, end) 这段正文切成段落。
  * 空行被吃掉（它们只是排版间隔），所以偏移不连续是正常的。
+ *
+ * 每行会 trim 掉首尾空白，**包括 TXT 里常见的全角空格缩进（U+3000）**。
+ * 缩进交给排版决定，不留在正文里：原文自带两格 + 样式再缩两格会变成四格，
+ * 而且样式缩进只对一页的第一行生效，上一页没读完的半句到新页开头也会被缩，
+ * 看起来像凭空多出一个段落。offset 跟着跳过这些空白，所以
+ * `content.slice(offset, offset + text.length)` 仍然等于 text（有守卫用例锁着）。
  */
 export const splitParagraphs = (
   content: string,
@@ -63,6 +69,15 @@ export const coverPalette = (seed: string): { from: string; to: string; ink: str
 export const coverTitleLines = (title: string, maxChars = 18): string => (
   title.length > maxChars ? `${title.slice(0, maxChars)}…` : title
 );
+
+/**
+ * 段落之间的间距（em，相对当前字号）。
+ *
+ * 原文的空行**不照排**：一个空行等于一整行高度，有的 TXT 段间有两三个空行，
+ * 照排出来一屏只剩几行字。统一成这个小间距（参考微信读书的观感），
+ * 字号变大时间距跟着变大，所以用 em 不用 px。
+ */
+export const READING_PARAGRAPH_GAP_EM = 0.55;
 
 /**
  * 上下滑模式一次渲染几章。

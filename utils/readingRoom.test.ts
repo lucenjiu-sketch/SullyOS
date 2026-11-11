@@ -18,6 +18,7 @@ import {
 import {
   coverPalette,
   coverTitleLines,
+  READING_PARAGRAPH_GAP_EM,
   splitParagraphs,
   verticalChapterRange,
 } from '../features/readingRoom/layout';
@@ -199,6 +200,29 @@ describe('共读室 · 排版与书封', () => {
     paragraphs.forEach(item => {
       expect(content.slice(item.offset, item.offset + item.text.length)).toBe(item.text);
     });
+  });
+
+  it('TXT 自带的全角空格缩进被去掉，缩进交给排版决定', () => {
+    // U+3000（全角空格）是中文 TXT 最常见的缩进方式。留着它会和样式缩进叠加，
+    // 而且上一页没读完的半句到新页开头也会凭空多出两格。
+    const content = '\u3000\u3000他推开门。\n\u3000\u3000外面在下雨。';
+    const paragraphs = splitParagraphs(content, 0, content.length);
+    expect(paragraphs.map(item => item.text)).toEqual(['他推开门。', '外面在下雨。']);
+    paragraphs.forEach(item => {
+      expect(item.text.startsWith('\u3000')).toBe(false);
+      expect(content.slice(item.offset, item.offset + item.text.length)).toBe(item.text);
+    });
+  });
+
+  it('原文的连续空行不产生空段落（段间距由排版给，不照排空行）', () => {
+    const content = '甲甲甲\n\n\n\n乙乙乙';
+    const paragraphs = splitParagraphs(content, 0, content.length);
+    expect(paragraphs.map(item => item.text)).toEqual(['甲甲甲', '乙乙乙']);
+  });
+
+  it('段间距是相对字号的 em，字号变大时跟着变大', () => {
+    expect(READING_PARAGRAPH_GAP_EM).toBeGreaterThan(0);
+    expect(READING_PARAGRAPH_GAP_EM).toBeLessThan(1);
   });
 
   it('只切指定区间，不把别的章节带进来', () => {
