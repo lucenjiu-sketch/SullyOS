@@ -11,6 +11,7 @@ import {
   nextWindowName,
   normalizeWindowName,
   reconcileSelection,
+  recomputeWindowPreview,
   renameWindow,
   setWindowArchived,
   sortMessagesByTime,
@@ -282,6 +283,54 @@ describe('共读室 · 窗口上的消息痕迹', () => {
     const second = applyMessageToWindow(first, message('第二条', 200));
     expect(second.lastMessagePreview).toBe('第二条');
     expect(second.lastMessageAt).toBe(200);
+  });
+});
+
+describe('共读室 · 删掉一条之后的预览', () => {
+  const message = (id: string, content: string, at: number) => ({
+    ...createDiscussionMessage({ windowId: 'w1', role: 'user' as const, content, now: at }),
+    id,
+  });
+
+  it('删掉最后一条，预览退回上一条', () => {
+    const rows = [message('a', '第一条', 100), message('b', '第二条', 200)];
+    const base = applyMessageToWindow(window('w1', 'c1', '讨论 1'), rows[1]);
+    const updated = recomputeWindowPreview(base, [rows[0]]);
+    expect(updated.lastMessagePreview).toBe('第一条');
+    expect(updated.lastMessageAt).toBe(100);
+  });
+
+  it('删掉中间那条，预览还是最后一条', () => {
+    const rows = [message('a', '第一条', 100), message('b', '中间', 150), message('c', '最后', 200)];
+    const base = applyMessageToWindow(window('w1', 'c1', '讨论 1'), rows[2]);
+    const updated = recomputeWindowPreview(base, [rows[0], rows[2]]);
+    expect(updated.lastMessagePreview).toBe('最后');
+  });
+
+  it('删到一条不剩，预览清空（列表会显示「还没有讨论记录」）', () => {
+    const base = applyMessageToWindow(window('w1', 'c1', '讨论 1'), message('a', '唯一一条', 100));
+    const updated = recomputeWindowPreview(base, []);
+    expect(updated.lastMessagePreview).toBeUndefined();
+    expect(updated.lastMessageAt).toBeUndefined();
+  });
+
+  it('updatedAt 不往回退 —— 删一条不该让窗口掉到列表最底下', () => {
+    const base = applyMessageToWindow(window('w1', 'c1', '讨论 1'), message('a', '唯一一条', 9_000));
+    expect(recomputeWindowPreview(base, []).updatedAt).toBe(base.updatedAt);
+  });
+
+  it('剩下的只有空内容消息时，预览也清空', () => {
+    // 只带引用、没写感想的那种消息，预览本来就是空的。
+    const base = applyMessageToWindow(window('w1', 'c1', '讨论 1'), message('a', '有内容', 100));
+    const updated = recomputeWindowPreview(base, [message('b', '   ', 200)]);
+    expect(updated.lastMessagePreview).toBeUndefined();
+  });
+
+  it('不改名字、不改归档状态', () => {
+    const base = setWindowArchived(window('w1', 'c1', '聊聊第三章'), true, 500);
+    const updated = recomputeWindowPreview(base, []);
+    expect(updated.name).toBe('聊聊第三章');
+    expect(updated.archivedAt).toBe(500);
   });
 });
 

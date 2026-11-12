@@ -4,7 +4,9 @@ import {
   ArrowsInSimple,
   CaretDown,
   PaperPlaneRight,
+  PencilSimple,
   Stop,
+  Trash,
   WarningCircle,
   X,
   Quotes,
@@ -44,6 +46,11 @@ import type { ReadingDiscussionMessage, ReadingMessageReference } from './types'
 /** 半屏占多宽。久要的是「盖住右半边」，留一点让她看见底下还是正文。 */
 const HALF_WIDTH = '56%';
 
+/** 气泡上长按多久算长按。和阅读页正文那边一致，手感统一。 */
+const BUBBLE_LONG_PRESS_MS = 400;
+/** 长按期间允许的手指漂移。超过就认为她在滑聊天记录，不弹菜单。 */
+const BUBBLE_LONG_PRESS_TOLERANCE = 12;
+
 export interface ReadingDiscussionPanelProps {
   open: boolean;
   /** 角色名，显示在标题上。没选角色时面板不该被打开。 */
@@ -68,6 +75,23 @@ export interface ReadingDiscussionPanelProps {
   onSend: (text: string, reference?: ReadingMessageReference) => void;
   onStop: () => void;
   onDismissError: () => void;
+  /** 删一条消息（两边都能删；角色那条连心象一起删）。 */
+  onDeleteMessage: (messageId: string) => void;
+  /**
+   * 把自己那条收回输入框重新编辑。
+   *
+   * 库里那条会被删掉，正文和引用回到输入区——久要的就是这个：
+   * 「点编辑的话那条消息就回到输入框，同时对话框里那条消失。」
+   */
+  onEditMessage: (message: ReadingDiscussionMessage) => void;
+  /**
+   * 「收回来改」时要填进输入框的草稿。
+   *
+   * 由外面给：阅读页删掉那条消息、把引用放回待发送区，同时把正文从这里
+   * 送进来。**每次都带一个新的 `token`**，面板靠它判断「这是一次新的回填」
+   * ——不然同一句话改两次就只生效一次。
+   */
+  draftSeed?: { text: string; token: number };
   onClose: () => void;
 }
 
@@ -207,11 +231,39 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
   onSend,
   onStop,
   onDismissError,
+  onDeleteMessage,
+  onEditMessage,
+  draftSeed,
   onClose,
 }) => {
   const [full, setFull] = useState(false);
   const [draft, setDraft] = useState('');
+  /** 长按选中的那条消息。null = 没在选。 */
+  const [actionMessage, setActionMessage] = useState<ReadingDiscussionMessage | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  /** 气泡长按的计时器和起点。滑动超过容差就取消——免得滑记录时误弹菜单。 */
+  const longPressRef = useRef<{ timer: number | null; origin: { x: number; y: number } | null }>({
+    timer: null,
+    origin: null,
+  });
+
+  useEffect(() => () => {
+    if (longPressRef.current.timer !== null) window.clearTimeout(longPressRef.current.timer);
+  }, []);
+
+  /** 面板一关就把菜单收掉，下次打开不该还浮着上次那个。 */
+  useEffect(() => { if (!open) setActionMessage(null); }, [open]);
+
+  /**
+   * 「收回来改」时把原文填进输入框。
+   *
+   * 依赖 `token` 而不是 `text`：同一句话连着改两次，文本没变但 token 变了，
+   * 这样第二次也能生效。
+   */
+  useEffect(() => {
+    if (!draftSeed) return;
+    setDraft(draftSeed.text);
+  }, [draftSeed?.token]);
 
   /**
    * 滚到底。
@@ -253,6 +305,50 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
   const stopTouch = useCallback((event: React.TouchEvent) => {
     event.stopPropagation();
   }, []);
+
+  // ——— 气泡长按 ———
+  //
+  // 长按弹菜单，滑动超过容差就作罢。聊天记录区本身要能上下滑，
+  // 所以不能把长按做成「按下就弹」。
+
+  const clearLongPress = useCallback(() => {
+    if (longPressRef.current.timer !== null) {
+      window.clearTimeout(longPressRef.current.timer);
+      longPressRef.current.timer = null;
+    }
+  }, []);
+
+  const handleBubbleTouchStart = useCallback((
+    event: React.TouchEvent,
+    message: ReadingDiscussionMessage,
+  ) => {
+    event.stopPropagation();
+    clearLongPress();
+    if (event.touches.length > 1) return;
+    const touch = event.touches[0];
+    longPressRef.current.origin = { x: touch.clientX, y: touch.clientY };
+    longPressRef.current.timer = window.setTimeout(() => {
+      longPressRef.current.timer = null;
+      setActionMessage(message);
+    }, BUBBLE_LONG_PRESS_MS);
+  }, [clearLongPress]);
+
+  const handleBubbleTouchMove = useCallback((event: React.TouchEvent) => {
+    event.stopPropagation();
+    const origin = longPressRef.current.origin;
+    if (!origin || longPressRef.current.timer === null) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    const drifted = Math.abs(touch.clientX - origin.x) > BUBBLE_LONG_PRESS_TOLERANCE
+      || Math.abs(touch.clientY - origin.y) > BUBBLE_LONG_PRESS_TOLERANCE;
+    if (drifted) clearLongPress();
+  }, [clearLongPress]);
+
+  const handleBubbleTouchEnd = useCallback((event: React.TouchEvent) => {
+    event.stopPropagation();
+    clearLongPress();
+    longPressRef.current.origin = null;
+  }, [clearLongPress]);
 
   return (
     <div
@@ -307,11 +403,15 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
                 className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
                 <div
-                  className={`max-w-[88%] rounded-2xl px-3 py-2 ${
+                  onTouchStart={event => handleBubbleTouchStart(event, message)}
+                  onTouchMove={handleBubbleTouchMove}
+                  onTouchEnd={handleBubbleTouchEnd}
+                  onTouchCancel={handleBubbleTouchEnd}
+                  className={`max-w-[88%] select-none rounded-2xl px-3 py-2 transition ${
                     message.role === 'user'
                       ? 'bg-stone-700 text-stone-50'
                       : 'bg-white text-stone-700 ring-1 ring-stone-200'
-                  }`}
+                  } ${actionMessage?.id === message.id ? 'ring-2 ring-orange-400' : ''}`}
                 >
                   {message.reference && (
                     <QuoteCard reference={message.reference} tone={message.role} />
@@ -427,6 +527,58 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
           )}
         </div>
       </div>
+
+      {/*
+        长按某条消息后的操作菜单。
+        自己那条可以收回来重编辑；角色那条只能删（它说过的话没法替它改）。
+      */}
+      {actionMessage && (
+        <div className="absolute inset-0 z-50" onClick={() => setActionMessage(null)}>
+          <div className="absolute inset-0 bg-black/30" />
+          <div
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-3 pt-3 shadow-[0_-8px_30px_rgba(0,0,0,0.2)]"
+            onClick={event => event.stopPropagation()}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 12px)' }}
+          >
+            <p className="mb-1 text-[10px] text-stone-500">
+              {actionMessage.role === 'user' ? '你说的这条' : `${charName}说的这条`}
+            </p>
+            <p className="mb-3 line-clamp-2 text-[11px] leading-relaxed text-stone-600">
+              {actionMessage.content.replace(/\s+/g, ' ').trim()
+                || (actionMessage.reference ? `［引用］${actionMessage.reference.quote}` : '（空消息）')}
+            </p>
+
+            {actionMessage.role === 'user' && (
+              <button
+                onClick={() => { onEditMessage(actionMessage); setActionMessage(null); }}
+                className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-[13px] text-stone-50 transition active:scale-95"
+              >
+                <PencilSimple size={15} weight="bold" /> 收回来改
+              </button>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => { onDeleteMessage(actionMessage.id); setActionMessage(null); }}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-red-100 py-2.5 text-[13px] text-red-700 transition active:scale-95"
+              >
+                <Trash size={15} weight="bold" />
+                {actionMessage.role === 'assistant' && actionMessage.thinkingChain ? '删掉（连心象）' : '删掉这条'}
+              </button>
+              <button
+                onClick={() => setActionMessage(null)}
+                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-[13px] transition active:scale-95"
+              >
+                取消
+              </button>
+            </div>
+
+            <p className="mt-2 px-0.5 text-[9px] leading-relaxed text-stone-400">
+              删掉之后，下一轮发给{charName}的历史里也不会再有这条。
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

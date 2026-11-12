@@ -13,6 +13,8 @@ import {
   createDiscussionMessage,
   emptySelection,
   reconcileSelection,
+  recomputeWindowPreview,
+  sortMessagesByTime,
 } from '../features/readingRoom/discussion';
 import { runReadingTurn } from '../features/readingRoom/engine';
 import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
@@ -546,6 +548,32 @@ const ReadingRoomApp: React.FC = () => {
     turnAbortRef.current?.abort();
   }, []);
 
+  /**
+   * 删一条讨论消息。
+   *
+   * 删完要**重算窗口上的预览**：删掉最后一条而不重算，列表里那行还显示它，
+   * 看着像没删掉。角色那条的心象跟消息一起走（它存在同一条记录里）。
+   *
+   * 界面先去掉（手感要立刻），落库失败再放回来并提示。
+   */
+  const handleDeleteDiscussionMessage = useCallback(async (messageId: string) => {
+    const removed = discussionMessages.find(item => item.id === messageId);
+    if (!removed) return;
+    const remaining = discussionMessages.filter(item => item.id !== messageId);
+    setDiscussionMessages(remaining);
+    try {
+      await ReadingRoomStore.deleteMessage(messageId);
+      if (discussionWindow) {
+        const nextWindow = recomputeWindowPreview(discussionWindow, remaining);
+        await ReadingRoomStore.saveWindow(nextWindow);
+        setDiscussionWindow(nextWindow);
+      }
+    } catch (error: any) {
+      setDiscussionMessages(previous => sortMessagesByTime([...previous, removed]));
+      showError?.('这条没删掉', error?.message || String(error));
+    }
+  }, [discussionMessages, discussionWindow, showError]);
+
   const discussionChar = characters.find(char => char.id === selection.charId);
 
   // ——— 阅读 ———
@@ -572,6 +600,7 @@ const ReadingRoomApp: React.FC = () => {
         onSendDiscussion={(text, reference, range) => { void handleSendDiscussion(text, reference, range); }}
         onStopDiscussion={handleStopDiscussion}
         onDismissDiscussionError={() => setDiscussionError(undefined)}
+        onDeleteDiscussionMessage={id => { void handleDeleteDiscussionMessage(id); }}
         onExit={() => { setOpenBook(null); setContent(''); setHighlights([]); void refreshShelf(); }}
       />
     );

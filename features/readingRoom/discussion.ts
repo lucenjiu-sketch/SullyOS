@@ -187,6 +187,31 @@ export function sortMessagesByTime(
 }
 
 /**
+ * 删掉某条消息之后，重算窗口上的预览。
+ *
+ * 不做这件事的话：删掉最后一条，列表里那行预览还是它——看着像没删掉。
+ * 删到一条不剩时把两个字段清空（`undefined`），列表会显示「还没有讨论记录」。
+ *
+ * `updatedAt` **不往回退**：它决定窗口在列表里的排序，删一条消息不该
+ * 让这个窗口跳到最底下去。
+ */
+export function recomputeWindowPreview(
+  window: ReadingDiscussionWindow,
+  remaining: ReadingDiscussionMessage[],
+): ReadingDiscussionWindow {
+  const sorted = sortMessagesByTime(remaining);
+  const last = [...sorted].reverse().find(message => messagePreviewText(message.content));
+  if (!last) {
+    return { ...window, lastMessagePreview: undefined, lastMessageAt: undefined };
+  }
+  return {
+    ...window,
+    lastMessagePreview: messagePreviewText(last.content),
+    lastMessageAt: last.createdAt,
+  };
+}
+
+/**
  * 修一遍「当前选择」，把已经不存在的角色或窗口清掉。
  *
  * 为什么必须有这一步：角色和窗口是两个库里的东西，用户可能在角色页删掉角色、

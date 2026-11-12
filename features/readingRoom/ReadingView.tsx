@@ -92,6 +92,8 @@ interface ReadingViewProps {
   ) => void;
   onStopDiscussion: () => void;
   onDismissDiscussionError: () => void;
+  /** 删一条讨论消息。 */
+  onDeleteDiscussionMessage: (messageId: string) => void;
   onExit: () => void;
 }
 
@@ -154,6 +156,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   onSendDiscussion,
   onStopDiscussion,
   onDismissDiscussionError,
+  onDeleteDiscussionMessage,
   onExit,
 }) => {
   /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
@@ -195,6 +198,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     reference: ReadingMessageReference;
     range: { startOffset: number; endOffset: number };
   } | undefined>();
+  /** 「收回来改」时要填进面板输入框的草稿。token 保证同一句话改两次都生效。 */
+  const [draftSeed, setDraftSeed] = useState<{ text: string; token: number } | undefined>();
 
   /** 当前块的页起点列表。测量得出，字号或屏幕变化后重算。 */
   const [pageStarts, setPageStarts] = useState<number[]>([]);
@@ -458,6 +463,30 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     setActiveHighlight(null);
     setHighlightListOpen(false);
   }, [book.chapters, book.id, book.title, openDiscussion]);
+
+  /**
+   * 「收回来改」：删掉库里那条，把正文和引用放回输入区。
+   *
+   * 引用的范围（取前后文要用）**从划线表里重新找**：消息里只存了
+   * highlightId，没存偏移。划线已经被删掉的话就只把正文放回去，
+   * 引用不再附带——总比把一条指向空气的引用塞回去好。
+   */
+  const editMyMessage = useCallback((message: ReadingDiscussionMessage) => {
+    onDeleteDiscussionMessage(message.id);
+    setDraftSeed({ text: message.content, token: Date.now() });
+    const reference = message.reference;
+    if (!reference) { setPendingQuote(undefined); return; }
+    const highlight = reference.highlightId
+      ? highlights.find(item => item.id === reference.highlightId)
+      : undefined;
+    setPendingQuote(highlight
+      ? {
+        reference,
+        range: { startOffset: highlight.startOffset, endOffset: highlight.endOffset },
+      }
+      : undefined);
+    if (!highlight) showToast('那条划线已经删了，引用没放回来');
+  }, [highlights, onDeleteDiscussionMessage, showToast]);
 
   // ——— 手势 ———
   /**
@@ -1110,6 +1139,9 @@ const ReadingView: React.FC<ReadingViewProps> = ({
           onSend={(text, reference) => onSendDiscussion(text, reference, pendingQuote?.range)}
           onStop={onStopDiscussion}
           onDismissError={onDismissDiscussionError}
+          onDeleteMessage={onDeleteDiscussionMessage}
+          onEditMessage={editMyMessage}
+          draftSeed={draftSeed}
           onClose={() => setDiscussionOpen(false)}
         />
       )}
