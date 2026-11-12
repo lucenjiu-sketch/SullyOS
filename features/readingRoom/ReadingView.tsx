@@ -20,6 +20,7 @@ import {
 import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint } from './caret';
 import ReadingDiscussionPanel from './ReadingDiscussionPanel';
 import type { ReadingBook, ReadingDiscussionMessage, ReadingHighlight, ReadingMessageReference } from './types';
+import type { Emoji, EmojiCategory } from '../../types';
 
 /**
  * 沉浸式阅读视图。
@@ -94,6 +95,9 @@ interface ReadingViewProps {
   onDismissDiscussionError: () => void;
   /** 删一条讨论消息。 */
   onDeleteDiscussionMessage: (messageId: string) => void;
+  /** 表情库。角色发表情时面板要靠它找到真图。 */
+  discussionEmojis: Emoji[];
+  discussionEmojiCategories: EmojiCategory[];
   onExit: () => void;
 }
 
@@ -157,6 +161,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   onStopDiscussion,
   onDismissDiscussionError,
   onDeleteDiscussionMessage,
+  discussionEmojis,
+  discussionEmojiCategories,
   onExit,
 }) => {
   /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
@@ -1141,6 +1147,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
           onDismissError={onDismissDiscussionError}
           onDeleteMessage={onDeleteDiscussionMessage}
           onEditMessage={editMyMessage}
+          emojis={discussionEmojis}
+          emojiCategories={discussionEmojiCategories}
           draftSeed={draftSeed}
           onClose={() => setDiscussionOpen(false)}
         />

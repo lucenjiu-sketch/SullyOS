@@ -172,6 +172,22 @@ describe('共读室 · 消息预览', () => {
   it('全是空白的内容给出空串', () => {
     expect(messagePreviewText('   \n  ')).toBe('');
   });
+
+  it('表情标签换成「[表情]」，不是一行看不懂的符号', () => {
+    expect(messagePreviewText('这段真好 [[SEND_EMOJI: 开心]]')).toBe('这段真好 [表情]');
+  });
+
+  it('只发了表情没说话，预览就是「[表情]」', () => {
+    expect(messagePreviewText('[[SEND_EMOJI: 呆猫: 亲亲额头]]')).toBe('[表情]');
+  });
+
+  it('多个表情各换一个', () => {
+    expect(messagePreviewText('[[SEND_EMOJI:a]][[SEND_EMOJI:b]]')).toBe('[表情][表情]');
+  });
+
+  it('全角冒号的写法也认', () => {
+    expect(messagePreviewText('[[SEND_EMOJI：开心]]')).toBe('[表情]');
+  });
 });
 
 describe('共读室 · 讨论消息', () => {

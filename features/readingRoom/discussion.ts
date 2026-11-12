@@ -120,9 +120,17 @@ export function renameWindow(
   return { ...window, name: next, updatedAt: now };
 }
 
-/** 列表里显示的那行预览：压掉换行和多余空白，太长就截断。 */
+/**
+ * 列表里显示的那行预览：压掉换行和多余空白，太长就截断。
+ *
+ * **先把表情标签换成「[表情]」**：角色发的 `[[SEND_EMOJI: 名字]]` 原样进预览
+ * 会变成一行看不懂的符号。只发了表情没说话的那条，预览就是「[表情]」。
+ */
 export function messagePreviewText(content: string): string {
-  const flat = content.replace(/\s+/g, ' ').trim();
+  const flat = content
+    .replace(/\[\[SEND_EMOJI\s*[:：]\s*[^\]\r\n]*?\s*\]\]/gi, '[表情]')
+    .replace(/\s+/g, ' ')
+    .trim();
   return flat.length > MAX_MESSAGE_PREVIEW_CHARS
     ? `${flat.slice(0, MAX_MESSAGE_PREVIEW_CHARS)}…`
     : flat;

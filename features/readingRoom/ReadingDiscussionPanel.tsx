@@ -14,6 +14,9 @@ import {
 import { highlightSummary } from './highlight';
 import { normalizeCollaborationVisibleText, parseCollaborationMarkdown } from '../collaboration/markdown';
 import type { CollaborationInlineSpan } from '../collaboration/markdown';
+import { parseCollaborationRichOutput, resolveCollaborationEmoji } from '../collaboration/richOutput';
+import TokenImg from '../../components/os/TokenImg';
+import type { Emoji, EmojiCategory } from '../../types';
 import type { ReadingDiscussionMessage, ReadingMessageReference } from './types';
 
 /**
@@ -84,6 +87,14 @@ export interface ReadingDiscussionPanelProps {
    * 「点编辑的话那条消息就回到输入框，同时对话框里那条消失。」
    */
   onEditMessage: (message: ReadingDiscussionMessage) => void;
+  /**
+   * 表情库。角色发 `[[SEND_EMOJI: 名字]]` 时靠它找到真图。
+   *
+   * 共读室允许表情包（久定的），所以这两份要传进来；
+   * 空数组的话标签会显示成「表情包未找到」。
+   */
+  emojis: Emoji[];
+  emojiCategories: EmojiCategory[];
   /**
    * 「收回来改」时要填进输入框的草稿。
    *
@@ -193,6 +204,30 @@ const MarkdownView: React.FC<{ content: string }> = ({ content }) => (
   </div>
 );
 
+/**
+ * 角色发的表情包。
+ *
+ * 名字找不到对应的图就显示一个虚线框写明名字——**不要静默吞掉**，
+ * 否则她会以为角色发了句空话。名字可能带分类前缀（「分类: 名字」），
+ * `resolveCollaborationEmoji` 已经处理了这种写法。
+ */
+const EmojiCard: React.FC<{ name: string; emoji?: Emoji }> = ({ name, emoji }) => (
+  emoji
+    ? (
+      <TokenImg
+        value={emoji.url}
+        alt={emoji.name}
+        title={emoji.name}
+        className="mt-1.5 max-h-28 max-w-28 object-contain"
+      />
+    )
+    : (
+      <div className="mt-1.5 rounded-lg border border-dashed border-current/20 px-2 py-1.5 text-[9px] opacity-55">
+        表情包未找到：{name}
+      </div>
+    )
+);
+
 /** 思考链折叠块。默认收起——它是心象，不是说出口的话。 */
 const ThinkingBlock: React.FC<{ chain: string }> = ({ chain }) => {
   const [expanded, setExpanded] = useState(false);
@@ -233,6 +268,8 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
   onDismissError,
   onDeleteMessage,
   onEditMessage,
+  emojis,
+  emojiCategories,
   draftSeed,
   onClose,
 }) => {
@@ -397,41 +434,68 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
           </p>
         ) : (
           <div className="flex flex-col gap-3">
-            {messages.map(message => (
-              <div
-                key={message.id}
-                className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-              >
+            {messages.map(message => {
+              // 角色那条要把 [[SEND_EMOJI]] 从正文里切出来单独渲染，
+              // 否则标签会原样显示成一行字。用户自己写的话不解析。
+              const rich = message.role === 'assistant'
+                ? parseCollaborationRichOutput(message.content)
+                : null;
+              return (
                 <div
-                  onTouchStart={event => handleBubbleTouchStart(event, message)}
-                  onTouchMove={handleBubbleTouchMove}
-                  onTouchEnd={handleBubbleTouchEnd}
-                  onTouchCancel={handleBubbleTouchEnd}
-                  className={`max-w-[88%] select-none rounded-2xl px-3 py-2 transition ${
-                    message.role === 'user'
-                      ? 'bg-stone-700 text-stone-50'
-                      : 'bg-white text-stone-700 ring-1 ring-stone-200'
-                  } ${actionMessage?.id === message.id ? 'ring-2 ring-orange-400' : ''}`}
+                  key={message.id}
+                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
                 >
-                  {message.reference && (
-                    <QuoteCard reference={message.reference} tone={message.role} />
-                  )}
-                  {message.thinkingChain && <ThinkingBlock chain={message.thinkingChain} />}
-                  {message.content && (
-                    message.role === 'assistant'
-                      ? <MarkdownView content={message.content} />
-                      : <p className="whitespace-pre-wrap text-[12px] leading-relaxed">{message.content}</p>
-                  )}
+                  <div
+                    onTouchStart={event => handleBubbleTouchStart(event, message)}
+                    onTouchMove={handleBubbleTouchMove}
+                    onTouchEnd={handleBubbleTouchEnd}
+                    onTouchCancel={handleBubbleTouchEnd}
+                    className={`max-w-[88%] select-none rounded-2xl px-3 py-2 transition ${
+                      message.role === 'user'
+                        ? 'bg-stone-700 text-stone-50'
+                        : 'bg-white text-stone-700 ring-1 ring-stone-200'
+                    } ${actionMessage?.id === message.id ? 'ring-2 ring-orange-400' : ''}`}
+                  >
+                    {message.reference && (
+                      <QuoteCard reference={message.reference} tone={message.role} />
+                    )}
+                    {message.thinkingChain && <ThinkingBlock chain={message.thinkingChain} />}
+                    {message.role === 'assistant' ? (
+                      <>
+                        {rich!.text && <MarkdownView content={rich!.text} />}
+                        {rich!.emojiNames.map((name, index) => (
+                          <EmojiCard
+                            key={`${name}-${index}`}
+                            name={name}
+                            emoji={resolveCollaborationEmoji(name, emojis, emojiCategories)}
+                          />
+                        ))}
+                      </>
+                    ) : (
+                      message.content && (
+                        <p className="whitespace-pre-wrap text-[12px] leading-relaxed">{message.content}</p>
+                      )
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
-            {/* 这一轮正在来的回复。还没开口时显示三个点。 */}
+            {/*
+              这一轮正在来的回复。还没开口时显示三个点。
+              表情标签在流式途中也要切掉，不然半截的 [[SEND_EMOJI 会闪出来。
+              生成中只显示文字，表情等落定后那条消息再渲染。
+            */}
             {sending && (
               <div className="flex justify-start">
                 <div className="max-w-[88%] rounded-2xl bg-white px-3 py-2 text-stone-700 ring-1 ring-stone-200">
                   {streamingText
-                    ? <MarkdownView content={streamingText} />
+                    ? (() => {
+                      const rich = parseCollaborationRichOutput(streamingText);
+                      return rich.text
+                        ? <MarkdownView content={rich.text} />
+                        : <span className="text-[11px] text-stone-400">（表情包）</span>;
+                    })()
                     : (
                       <span className="flex items-center gap-1 py-0.5">
                         {[0, 1, 2].map(index => (

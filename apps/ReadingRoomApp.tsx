@@ -601,6 +601,8 @@ const ReadingRoomApp: React.FC = () => {
         onStopDiscussion={handleStopDiscussion}
         onDismissDiscussionError={() => setDiscussionError(undefined)}
         onDeleteDiscussionMessage={id => { void handleDeleteDiscussionMessage(id); }}
+        discussionEmojis={emojis}
+        discussionEmojiCategories={emojiCategories}
         onExit={() => { setOpenBook(null); setContent(''); setHighlights([]); void refreshShelf(); }}
       />
     );
