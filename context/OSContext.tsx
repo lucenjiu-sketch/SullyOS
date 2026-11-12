@@ -3746,9 +3746,23 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 共读室（书 / 正文 / 进度 / 划线 / 讨论窗口与消息 / 当前选择）。
           // 独立 IndexedDB（SullyOS_ReadingRoom），不在上面那份 allStores 清单里，
           // 所以单独读一次。media_only 不带：这一块全是文本。
-          const readingRoomBackup = (mode === 'text_only' || mode === 'full')
-              ? buildReadingRoomBackup(await ReadingRoomStore.exportAll().catch(() => null))
-              : undefined;
+          //
+          // 读不出来时**不静默跳过**：以前这里是 `.catch(() => null)`，结果是
+          // 导出照样成功，但那份备份里一本书一条讨论都没有，而用户以为自己
+          // 存全了。久定的口径是「别的照样导，但要明确告诉我这一块没进去」，
+          // 所以这里只拦这一块，不让整份导出失败（聊天记录比书重要）。
+          let readingRoomExportFailed = false;
+          const readingRoomSnapshot = (mode === 'text_only' || mode === 'full')
+              ? await ReadingRoomStore.exportAll().catch(error => {
+                  readingRoomExportFailed = true;
+                  console.warn(`📖 [ReadingRoom] 共读室数据没能读出来，这份备份不含共读室: ${error?.message || error}`);
+                  return null;
+              })
+              : null;
+          if (readingRoomExportFailed) {
+              addToast('共读室的数据这次没能读出来，这份备份里不含书和讨论记录。其余数据正常。', 'error');
+          }
+          const readingRoomBackup = buildReadingRoomBackup(readingRoomSnapshot);
           const backupData: Partial<FullBackupData> = {
               friendFeed: mode === 'text_only' ? stripBackupImages(await readFriendFeed()) : undefined,
               friendFeedMedia: mode === 'media_only' ? collectFriendFeedMedia(await readFriendFeed()) : undefined,
