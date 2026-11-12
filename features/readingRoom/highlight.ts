@@ -186,3 +186,39 @@ export const buildHighlightContext = (
 export const sortHighlightsByPosition = (highlights: ReadingHighlight[]): ReadingHighlight[] => (
   [...highlights].sort((a, b) => a.startOffset - b.startOffset || a.endOffset - b.endOffset)
 );
+
+/**
+ * 微调落点。
+ *
+ * 取偏移靠浏览器排版接口，实测会差一两个字。随机偏差靠重选能解决，
+ * **系统性偏差（总是偏同一个方向）只能靠微调**——重选十次都是一样的结果。
+ * 所以一次挪一个字符，用户看着高亮走到对的字上。
+ */
+export const nudgeOffset = (offset: number, delta: number, contentLength: number): number => (
+  Math.max(0, Math.min(offset + delta, Math.max(0, contentLength - 1)))
+);
+
+export interface CaretPreview {
+  /** 落点所在的那个字符。空字符串表示落在正文末尾之后。 */
+  charAt: string;
+  /** 落点前面一小段，给用户判断位置。 */
+  before: string;
+  /** 落点后面一小段。 */
+  after: string;
+}
+
+/**
+ * 落点周围的文字，用来在小条上显示「起点落在这个字上」。
+ *
+ * 和 `buildHighlightContext` 分开：这个是给用户看落点的，取的范围很短，
+ * 而且**要保留原样不压空白**——压掉空白会让显示的位置和实际落点错开。
+ */
+export const describeCaret = (
+  content: string,
+  offset: number,
+  radius = 12,
+): CaretPreview => ({
+  before: content.slice(Math.max(0, offset - radius), offset).replace(/\n/g, ' '),
+  charAt: content.slice(offset, offset + 1).replace(/\n/g, '⏎'),
+  after: content.slice(offset + 1, offset + 1 + radius).replace(/\n/g, ' '),
+});

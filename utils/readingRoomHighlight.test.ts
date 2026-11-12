@@ -2,12 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   buildHighlightContext,
   DEFAULT_HIGHLIGHT_COLOR,
+  describeCaret,
   highlightDisplayText,
   highlightSliceOnPage,
   highlightSummary,
   isHighlightTruncated,
   MAX_HIGHLIGHT_CHARS,
   normalizeHighlightRange,
+  nudgeOffset,
   READING_HIGHLIGHT_COLORS,
   sortHighlightsByPosition,
   splitByHighlights,
@@ -176,6 +178,65 @@ describe('共读室 · 划线列表顺序与配色', () => {
   });
 });
 
+describe('共读室 · 落点微调与预览', () => {
+  const content = '他推开门。外面在下雨。';
+
+  it('微调一次挪一个字符，正负都行', () => {
+    expect(nudgeOffset(5, 1, content.length)).toBe(6);
+    expect(nudgeOffset(5, -1, content.length)).toBe(4);
+  });
+
+  it('微调不会挪出正文范围', () => {
+    expect(nudgeOffset(0, -1, content.length)).toBe(0);
+    expect(nudgeOffset(content.length - 1, 1, content.length)).toBe(content.length - 1);
+    expect(nudgeOffset(0, -99, content.length)).toBe(0);
+  });
+
+  it('空正文时微调不会得到负数', () => {
+    expect(nudgeOffset(0, -1, 0)).toBe(0);
+    expect(nudgeOffset(0, 1, 0)).toBe(0);
+  });
+
+  it('预览给出落点那个字，以及前后各一小段', () => {
+    const preview = describeCaret(content, 5, 3);
+    expect(preview.charAt).toBe('外');
+    expect(preview.before).toBe('开门。');
+    expect(preview.after).toBe('面在下');
+  });
+
+  it('预览里的落点字和 content 同一个位置对得上（和正文高亮是同一处）', () => {
+    for (let offset = 0; offset < content.length; offset += 1) {
+      expect(describeCaret(content, offset).charAt).toBe(content[offset]);
+    }
+  });
+
+  it('换行显示成可见符号，不会让预览看起来断掉', () => {
+    const multi = '第一段。\n第二段。';
+    expect(describeCaret(multi, 4).charAt).toBe('⏎');
+    // 从偏移 5 往前取 5 个字符是「第一段。\n」，换行要显示成空格而不是真的断行。
+    expect(describeCaret(multi, 5, 5).before).toBe('第一段。 ');
+  });
+
+  it('落在正文末尾之后时 charAt 为空，不报错', () => {
+    expect(describeCaret(content, content.length).charAt).toBe('');
+  });
+});
+
+describe('共读室 · 终点含落点那个字', () => {
+  const content = '甲乙丙丁戊';
+
+  it('正向划线时终点那个字被划进去', () => {
+    // 用户起点按在「乙」(1)、终点按在「丁」(3)，期望划到「乙丙丁」。
+    // 终点加一由 ReadingView 做，这里锁住区间语义本身。
+    const range = normalizeHighlightRange(1, 3 + 1, content.length)!;
+    expect(content.slice(range.startOffset, range.endOffset)).toBe('乙丙丁');
+  });
+
+  it('只按同一个字两次也能划出那一个字', () => {
+    const range = normalizeHighlightRange(2, 2 + 1, content.length)!;
+    expect(content.slice(range.startOffset, range.endOffset)).toBe('丙');
+  });
+});
 describe('共读室 · 整句范围（偏移解析退化时的兜底）', () => {
   const content = '他推开门。外面在下雨。远处有人在喊。';
 

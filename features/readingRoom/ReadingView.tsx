@@ -1,18 +1,22 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash } from '@phosphor-icons/react';
+import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash, CaretLeft, CaretRight } from '@phosphor-icons/react';
 import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
 import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
 import { READING_PARAGRAPH_GAP_EM, splitParagraphs, verticalChapterRange } from './layout';
 import {
   DEFAULT_HIGHLIGHT_COLOR,
+  describeCaret,
   highlightSummary,
   IDLE_HIGHLIGHT_SELECTION,
   isHighlightTruncated,
   normalizeHighlightRange,
+  nudgeOffset,
   splitByHighlights,
   type HighlightSelectionState,
 } from './highlight';
-import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint, sentenceRangeAt } from './caret';
+// sentenceRangeAt 没在这里用：它是「偏移解析完全不准」时的退路
+// （长按直接选整句），留在 caret.ts 里备用，有测试锁着。
+import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint } from './caret';
 import type { ReadingBook, ReadingHighlight } from './types';
 
 /**
@@ -126,8 +130,13 @@ const ReadingView: React.FC<ReadingViewProps> = ({
    * 起点记的是全文偏移，和当前显示哪一页无关。
    */
   const [selection, setSelection] = useState<HighlightSelectionState>(IDLE_HIGHLIGHT_SELECTION);
-  /** 刚长按到的位置，用来弹「从这里划 / 到这里结束」那个小条。 */
-  const [pendingPoint, setPendingPoint] = useState<{ offset: number; preview: string } | null>(null);
+  /**
+   * 刚长按到的落点（全文偏移）。
+   *
+   * 只存偏移，不存预览文字——预览和高亮都由它实时算出来，
+   * 微调时才不会出现「高亮走了但文字还是旧的」。
+   */
+  const [pendingOffset, setPendingOffset] = useState<number | null>(null);
   /** 点到已有划线时弹出的操作条。 */
   const [activeHighlight, setActiveHighlight] = useState<ReadingHighlight | null>(null);
   /** 一次性的提示文字（划线存好了、范围太长被截断之类）。 */
@@ -271,7 +280,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   /** 取消这一次划线，回到正常阅读。随时可用，不留残留状态。 */
   const cancelSelection = useCallback(() => {
     setSelection(IDLE_HIGHLIGHT_SELECTION);
-    setPendingPoint(null);
+    setPendingOffset(null);
   }, []);
 
   /**
@@ -287,35 +296,50 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     const hit = highlights.find(item => point >= item.startOffset && point < item.endOffset);
     if (hit && selection.mode === 'idle') {
       setActiveHighlight(hit);
-      setPendingPoint(null);
+      setPendingOffset(null);
       return;
     }
+    setPendingOffset(point);
+  }, [highlights, selection.mode]);
 
-    // 给用户看一眼「按到的是这句」，比只显示一个光标位置好认。
-    const sentence = sentenceRangeAt(content, point);
-    setPendingPoint({
-      offset: point,
-      preview: highlightSummary(content.slice(sentence.startOffset, sentence.endOffset), 24),
-    });
-  }, [content, highlights, selection.mode]);
+  /**
+   * 微调落点，一次一个字符。
+   *
+   * 这是给「偏移总是偏同一个方向」准备的：那种情况重选多少次都一样，
+   * 只有挪一格才能对上。随机偏差则靠取消重选。
+   */
+  const nudgePending = useCallback((delta: number) => {
+    setPendingOffset(previous => (
+      previous === null ? previous : nudgeOffset(previous, delta, content.length)
+    ));
+  }, [content.length]);
+
+  /** 落点周围的原文，显示在小条上，让用户看清高亮落在哪个字。 */
+  const caretPreview = useMemo(
+    () => (pendingOffset === null ? null : describeCaret(content, pendingOffset)),
+    [content, pendingOffset],
+  );
 
   /** 把刚长按到的位置确定为起点，进入等终点状态。 */
   const confirmStart = useCallback(() => {
-    if (!pendingPoint) return;
-    setSelection({ mode: 'selecting-end', startOffset: pendingPoint.offset });
-    setPendingPoint(null);
-  }, [pendingPoint]);
+    if (pendingOffset === null) return;
+    setSelection({ mode: 'selecting-end', startOffset: pendingOffset });
+    setPendingOffset(null);
+  }, [pendingOffset]);
 
   /**
    * 把刚长按到的位置确定为终点，存下这条划线。
    *
    * 起点和终点之间的正文由全文偏移直接切出来，**不要求两点在同一页**：
    * 中间隔多少页都是一条记录。
+   *
+   * 终点是**含**的：用户按在哪个字上，那个字就该被划进去，
+   * 所以这里给终点加一，否则最后一个字总是漏掉。
    */
   const confirmEnd = useCallback(() => {
-    if (!pendingPoint || selection.startOffset === null) return;
+    if (pendingOffset === null || selection.startOffset === null) return;
     const first = selection.startOffset;
-    const second = pendingPoint.offset;
+    const second = pendingOffset >= first ? pendingOffset + 1 : pendingOffset;
     const range = normalizeHighlightRange(first, second, content.length);
     if (!range) {
       showToast('起点和终点是同一个位置，没有划出内容');
@@ -329,7 +353,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     });
     showToast(isHighlightTruncated(first, second) ? '划线太长，已截断保存' : '划线已保存');
     cancelSelection();
-  }, [cancelSelection, content, onCreateHighlight, pendingPoint, selection.startOffset, showToast]);
+  }, [cancelSelection, content, onCreateHighlight, pendingOffset, selection.startOffset, showToast]);
 
   const removeActiveHighlight = useCallback(() => {
     if (!activeHighlight) return;
@@ -482,25 +506,55 @@ const ReadingView: React.FC<ReadingViewProps> = ({
    *
    * 底色用 backgroundColor，**不改行高也不加 padding**：
    * 一旦影响排版高度，分页测量就会跟着变，而测量容器那边没有划线。
+   * 落点高亮和起点标记同理，只换颜色，不碰尺寸。
    */
   const renderParagraphBody = (paragraph: { offset: number; text: string }): React.ReactNode => {
+    const paragraphEnd = paragraph.offset + paragraph.text.length;
+    const marks: Array<{ offset: number; kind: 'caret' | 'anchor' }> = [];
+    if (pendingOffset !== null && pendingOffset >= paragraph.offset && pendingOffset < paragraphEnd) {
+      marks.push({ offset: pendingOffset, kind: 'caret' });
+    }
+    // 已确定的起点也标出来，翻回那一页时能看见自己从哪里开始划的。
+    if (
+      selection.startOffset !== null
+      && selection.startOffset >= paragraph.offset
+      && selection.startOffset < paragraphEnd
+    ) {
+      marks.push({ offset: selection.startOffset, kind: 'anchor' });
+    }
+
     const segments = splitByHighlights(
       content,
       paragraph.offset,
-      paragraph.offset + paragraph.text.length,
+      paragraphEnd,
       visibleHighlights,
     );
     if (segments.length === 0) return paragraph.text;
-    if (segments.length === 1 && !segments[0].highlight) return paragraph.text;
-    return segments.map(segment => (
-      segment.highlight
-        ? (
-          <span key={segment.offset} style={{ backgroundColor: segment.highlight.color, borderRadius: 2 }}>
-            {segment.text}
-          </span>
-        )
-        : <React.Fragment key={segment.offset}>{segment.text}</React.Fragment>
-    ));
+    if (segments.length === 1 && !segments[0].highlight && marks.length === 0) return paragraph.text;
+
+    /** 在一个片段里把落点/起点那一个字再切出来单独上色。 */
+    const renderSegment = (segment: { text: string; offset: number; highlight: ReadingHighlight | null }): React.ReactNode => {
+      const base: React.CSSProperties = segment.highlight
+        ? { backgroundColor: segment.highlight.color, borderRadius: 2 }
+        : {};
+      const mark = marks.find(item => item.offset >= segment.offset && item.offset < segment.offset + segment.text.length);
+      if (!mark) {
+        return <span key={segment.offset} style={base}>{segment.text}</span>;
+      }
+      const cut = mark.offset - segment.offset;
+      const markStyle: React.CSSProperties = mark.kind === 'caret'
+        ? { backgroundColor: '#C2410C', color: '#FFF7ED', borderRadius: 2 }
+        : { backgroundColor: 'rgba(194, 65, 12, 0.3)', borderRadius: 2 };
+      return (
+        <span key={segment.offset} style={base}>
+          {segment.text.slice(0, cut)}
+          <span style={markStyle}>{segment.text.slice(cut, cut + 1)}</span>
+          {segment.text.slice(cut + 1)}
+        </span>
+      );
+    };
+
+    return segments.map(renderSegment);
   };
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#f6ecd9]">
@@ -626,20 +680,47 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         </div>
       )}
 
-      {/* 长按落点后的小条：确认这里是起点还是终点。 */}
-      {pendingPoint && (
-        <div className="absolute inset-0 z-30" onClick={() => setPendingPoint(null)}>
+      {/* 长按落点后的小条：确认这里是起点还是终点，可以先微调。 */}
+      {pendingOffset !== null && caretPreview && (
+        <div className="absolute inset-0 z-30" onClick={() => setPendingOffset(null)}>
           <div
             className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
             onClick={event => event.stopPropagation()}
             style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)' }}
           >
-            <p className="mb-1 text-[11px] text-stone-500">
-              {selection.mode === 'selecting-end' ? '把这里作为划线终点' : '从这里开始划线'}
+            <p className="mb-1.5 text-[11px] text-stone-500">
+              {selection.mode === 'selecting-end' ? '终点落在这个字上（这个字会划进去）' : '起点落在这个字上'}
             </p>
-            <p className="mb-3 line-clamp-2 text-[13px] leading-relaxed text-stone-700">
-              {pendingPoint.preview || '（这一处没有文字）'}
+
+            {/* 落点那个字反白显示，和正文里的高亮是同一个位置。 */}
+            <p className="mb-3 break-all text-[13px] leading-relaxed text-stone-500">
+              {caretPreview.before}
+              <span className="rounded bg-orange-700 px-0.5 font-semibold text-orange-50">
+                {caretPreview.charAt || '␀'}
+              </span>
+              {caretPreview.after}
             </p>
+
+            {/* 微调：系统性偏移靠重选解决不了，只能一格一格挪。 */}
+            <div className="mb-3 flex items-center gap-2">
+              <span className="text-[11px] text-stone-500">微调</span>
+              <button
+                onClick={() => nudgePending(-1)}
+                className="rounded-lg bg-stone-200/80 px-3 py-1.5 transition active:scale-90"
+                aria-label="往前挪一个字"
+              >
+                <CaretLeft size={14} weight="bold" />
+              </button>
+              <button
+                onClick={() => nudgePending(1)}
+                className="rounded-lg bg-stone-200/80 px-3 py-1.5 transition active:scale-90"
+                aria-label="往后挪一个字"
+              >
+                <CaretRight size={14} weight="bold" />
+              </button>
+              <span className="ml-auto text-[10px] text-stone-400">选不准就取消重按</span>
+            </div>
+
             <div className="flex gap-2">
               {selection.mode === 'selecting-end' ? (
                 <button
@@ -657,7 +738,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                 </button>
               )}
               <button
-                onClick={() => { setPendingPoint(null); if (selection.mode === 'selecting-end') cancelSelection(); }}
+                onClick={() => { setPendingOffset(null); if (selection.mode === 'selecting-end') cancelSelection(); }}
                 className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
               >
                 取消
