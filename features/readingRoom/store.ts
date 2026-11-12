@@ -1,5 +1,13 @@
 import { spaceDatabaseName, SESSION_SPACE_ID, assertUserSpaceAvailable } from '../../utils/userSpaces';
-import type { ReadingBook, ReadingBookContent, ReadingHighlight, ReadingProgress } from './types';
+import {
+  READING_SELECTION_ID,
+  type ReadingBook,
+  type ReadingBookContent,
+  type ReadingDiscussionWindow,
+  type ReadingHighlight,
+  type ReadingProgress,
+  type ReadingSelection,
+} from './types';
 
 /**
  * 共读室的独立数据库，不动主库。
@@ -15,14 +23,20 @@ import type { ReadingBook, ReadingBookContent, ReadingHighlight, ReadingProgress
  * - v1：books / contents / progress
  * - v2：加 highlights（划线）。划线按 bookId 建索引，列一本书的划线不必全表扫。
  *   **升级是加表，不改旧表**，所以 v1 存的书和进度原样保留。
+ * - v3：加 windows（讨论窗口，按 charId 建索引）和 selection（当前选了谁、用哪个窗口）。
+ *   同样只加表。窗口**只挂角色不挂书**，当前选择是**应用级全局的一行记录**，
+ *   换书不动它——这是久定的，别改成按书存。
  */
 
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_BOOKS = 'books';
 const STORE_CONTENTS = 'contents';
 const STORE_PROGRESS = 'progress';
 const STORE_HIGHLIGHTS = 'highlights';
+const STORE_WINDOWS = 'windows';
+const STORE_SELECTION = 'selection';
 const INDEX_HIGHLIGHT_BOOK = 'by_book';
+const INDEX_WINDOW_CHAR = 'by_char';
 
 const connections = new Map<string, Promise<IDBDatabase>>();
 
@@ -47,6 +61,15 @@ export const openReadingRoomSpace = (spaceId = SESSION_SPACE_ID): Promise<IDBDat
       if (!db.objectStoreNames.contains(STORE_HIGHLIGHTS)) {
         const store = db.createObjectStore(STORE_HIGHLIGHTS, { keyPath: 'id' });
         store.createIndex(INDEX_HIGHLIGHT_BOOK, 'bookId', { unique: false });
+      }
+      // v3 新增。窗口按角色建索引：列一个角色的窗口不必全表扫。
+      if (!db.objectStoreNames.contains(STORE_WINDOWS)) {
+        const store = db.createObjectStore(STORE_WINDOWS, { keyPath: 'id' });
+        store.createIndex(INDEX_WINDOW_CHAR, 'charId', { unique: false });
+      }
+      // v3 新增。当前选择只有一行（主键恒为 READING_SELECTION_ID）。
+      if (!db.objectStoreNames.contains(STORE_SELECTION)) {
+        db.createObjectStore(STORE_SELECTION, { keyPath: 'id' });
       }
     };
     request.onsuccess = () => {
@@ -190,6 +213,61 @@ export const ReadingRoomStore = {
     const db = await openDatabase();
     const transaction = db.transaction(STORE_HIGHLIGHTS, 'readwrite');
     transaction.objectStore(STORE_HIGHLIGHTS).delete(highlightId);
+    await commitTransaction(transaction);
+  },
+
+  // ——— 讨论窗口（v3）———
+  //
+  // 窗口只按 charId 归属，**没有 bookId**。切书不换窗口是久定的交互，
+  // 要是哪天加了 bookId，那条交互就跟着没了。
+
+  /** 一个角色名下的全部窗口（含已归档）。分栏交给 `filterWindows`。 */
+  listWindows: async (charId: string): Promise<ReadingDiscussionWindow[]> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_WINDOWS, 'readonly');
+    const index = transaction.objectStore(STORE_WINDOWS).index(INDEX_WINDOW_CHAR);
+    const rows = await requestResult(index.getAll(IDBKeyRange.only(charId))) as ReadingDiscussionWindow[];
+    return rows.sort((a, b) => b.updatedAt - a.updatedAt);
+  },
+
+  saveWindow: async (window: ReadingDiscussionWindow): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_WINDOWS, 'readwrite');
+    transaction.objectStore(STORE_WINDOWS).put(window);
+    await commitTransaction(transaction);
+  },
+
+  /**
+   * 删一个窗口。
+   *
+   * 这一期窗口里还没有消息表，所以只删窗口本身。
+   * 等讨论消息做出来，这里要跟着删消息（照 `deleteBook` 用索引游标那个写法）。
+   */
+  deleteWindow: async (windowId: string): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_WINDOWS, 'readwrite');
+    transaction.objectStore(STORE_WINDOWS).delete(windowId);
+    await commitTransaction(transaction);
+  },
+
+  // ——— 当前选择（v3）———
+  //
+  // 单行记录，不跟书绑定。读不到就返回 null，由调用方用 `emptySelection()` 兜。
+
+  getSelection: async (): Promise<ReadingSelection | null> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_SELECTION, 'readonly');
+    const row = await requestResult(
+      transaction.objectStore(STORE_SELECTION).get(READING_SELECTION_ID),
+    ) as ReadingSelection | undefined;
+    return row || null;
+  },
+
+  saveSelection: async (selection: ReadingSelection): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_SELECTION, 'readwrite');
+    // 主键强制成固定值：多出第二行的话，「当前选择」就有两个答案了。
+    transaction.objectStore(STORE_SELECTION).put({ ...selection, id: READING_SELECTION_ID });
     await commitTransaction(transaction);
   },
 };

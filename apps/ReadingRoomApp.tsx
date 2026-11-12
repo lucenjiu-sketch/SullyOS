@@ -1,29 +1,41 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
-import { ArrowLeft, Books, Plus, Trash, WarningCircle, PencilSimple, TextAa } from '@phosphor-icons/react';
+import { ArrowLeft, Books, Plus, Trash, WarningCircle, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
 import { ReadingRoomStore } from '../features/readingRoom/store';
 import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/parse';
 import { progressPercent } from '../features/readingRoom/paginate';
 import { coverPalette, coverTitleLines } from '../features/readingRoom/layout';
 import { sortHighlightsByPosition } from '../features/readingRoom/highlight';
+import { emptySelection, reconcileSelection } from '../features/readingRoom/discussion';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
+import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
   readingRoomId,
   type ReadingBook,
   type ReadingEncoding,
   type ReadingHighlight,
+  type ReadingSelection,
 } from '../features/readingRoom/types';
 import { trackEvent } from '../utils/analytics';
 
 /**
- * 共读室 · 书架 + 沉浸式阅读器 + 划线。
+ * 共读室 · 书架 + 沉浸式阅读器 + 划线 + 设置（选共读对象和讨论窗口）。
  *
- * 与角色讨论划线、归档进记忆宫殿还没做（第二期剩余部分和第三期）。
- * 正文全程只留在本地 IndexedDB，不进任何 API 请求。
+ * 讨论窗口里的对话、划线询问角色、归档进记忆宫殿都还没做
+ * （第二期剩余部分和第三期）。正文全程只留在本地 IndexedDB，不进任何 API 请求。
+ *
+ * ## 底栏只在书架和设置这两页出现
+ *
+ * 阅读页是整屏接管的（分页测量依赖正文区的真实高度，见 `ReadingView` 顶部注释），
+ * **底栏不能挂到阅读页上**——那会让每页少排一两行字，并且测量容器和正文不再一致。
+ * 阅读页回书架的路（菜单里那个「书架」按钮）原样保留。
  */
 
 const FONT_SIZE_KEY = 'sullyos_reading_font_size';
 const FLIP_MODE_KEY = 'sullyos_reading_flip_mode';
+
+/** 共读室里的两个页面。阅读页不在这套里，它由 `openBook` 单独接管整屏。 */
+type ReadingRoomTab = 'shelf' | 'settings';
 
 const ENCODING_LABELS: Record<ReadingEncoding, string> = {
   'utf-8': 'UTF-8',
@@ -42,8 +54,9 @@ const formatCharCount = (count: number): string => (
 );
 
 const ReadingRoomApp: React.FC = () => {
-  const { closeApp, addToast, showError } = useOS();
+  const { closeApp, addToast, showError, characters } = useOS();
 
+  const [tab, setTab] = useState<ReadingRoomTab>('shelf');
   const [books, setBooks] = useState<ReadingBook[]>([]);
   const [progressByBook, setProgressByBook] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
@@ -56,6 +69,12 @@ const ReadingRoomApp: React.FC = () => {
   const [highlights, setHighlights] = useState<ReadingHighlight[]>([]);
   /** 长按书封弹出的操作面板。 */
   const [actionBook, setActionBook] = useState<ReadingBook | null>(null);
+
+  /**
+   * 当前共读对象 + 讨论窗口。**应用级全局，不跟书绑定**（久定的）。
+   * 落库在共读室的 selection 表，退出重进还记得。
+   */
+  const [selection, setSelection] = useState<ReadingSelection>(() => emptySelection());
 
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = Number(localStorage.getItem(FONT_SIZE_KEY));
@@ -85,8 +104,36 @@ const ReadingRoomApp: React.FC = () => {
       setLoading(false);
     }
   }, [showError]);
-
   useEffect(() => { void refreshShelf(); }, [refreshShelf]);
+
+  /**
+   * 进 App 时恢复上次选的角色和窗口，顺手修掉失效的那部分。
+   *
+   * 为什么要修：角色存在主库、窗口存在共读室库，两边各自都可能被删。
+   * 存下来的 id 指向空气时，界面会显示一个点不动的选中态，看着像坏了。
+   * 这里跑一遍 `reconcileSelection`，改动了才回写（它在没变化时返回同一个对象）。
+   *
+   * 这个 effect 只在角色名单就绪后跑一次性校正，所以依赖里带 `characters`。
+   */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const stored = await ReadingRoomStore.getSelection() || emptySelection();
+        const windows = stored.charId ? await ReadingRoomStore.listWindows(stored.charId) : [];
+        if (cancelled) return;
+        const fixed = reconcileSelection(stored, characters.map(char => char.id), windows);
+        setSelection(fixed);
+        if (fixed !== stored) await ReadingRoomStore.saveSelection(fixed);
+      } catch (error) {
+        // 读不出选择不该把整个共读室挡住：书架照样能用，设置页重新选一次就好。
+        console.warn('[ReadingRoom] 当前选择没读出来', error);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [characters]);
+
+
   useEffect(() => { localStorage.setItem(FONT_SIZE_KEY, String(fontSize)); }, [fontSize]);
   useEffect(() => { localStorage.setItem(FLIP_MODE_KEY, flipMode); }, [flipMode]);
   useEffect(() => () => {
@@ -263,6 +310,32 @@ const ReadingRoomApp: React.FC = () => {
     }
   }, [highlights, showError]);
 
+  /**
+   * 落库一次新的选择。
+   *
+   * 本地 state 先更新（界面立刻有反馈），写失败只提示、不回滚——
+   * 这个选择重选一次的成本很低，回滚反而会让选中态来回跳。
+   */
+  const persistSelection = useCallback((patch: Partial<ReadingSelection>) => {
+    setSelection(previous => {
+      const next: ReadingSelection = { ...previous, ...patch, updatedAt: Date.now() };
+      void ReadingRoomStore.saveSelection(next)
+        .catch(error => showError?.('这次的选择没存上', error?.message || String(error)));
+      return next;
+    });
+  }, [showError]);
+
+  /** 换角色要把窗口一起清掉：窗口挂在角色下，留着上个角色的窗口 id 就错了。 */
+  const handleSelectChar = useCallback((charId: string) => {
+    persistSelection(
+      charId === selection.charId ? { charId } : { charId, windowId: undefined },
+    );
+  }, [persistSelection, selection.charId]);
+
+  const handleSelectWindow = useCallback((windowId: string | undefined) => {
+    persistSelection({ windowId });
+  }, [persistSelection]);
+
   // ——— 阅读 ———
   if (openBook) {
     return (
@@ -305,19 +378,31 @@ const ReadingRoomApp: React.FC = () => {
           <button onClick={closeApp} className="-ml-1 rounded-full p-2 active:scale-90 transition-transform" aria-label="返回">
             <ArrowLeft size={20} weight="bold" className="text-stone-600" />
           </button>
-          <h1 className="text-[17px] font-bold">共读室</h1>
-          <span className="ml-auto text-[11px] text-stone-400">{books.length > 0 ? `${books.length} 本` : ''}</span>
+          <h1 className="text-[17px] font-bold">{tab === 'settings' ? '共读设置' : '共读室'}</h1>
+          <span className="ml-auto text-[11px] text-stone-400">
+            {tab === 'shelf' && books.length > 0 ? `${books.length} 本` : ''}
+          </span>
         </div>
       </div>
 
       <input ref={fileInputRef} type="file" accept=".txt,text/plain" className="hidden" onChange={handlePickFile} />
 
-      <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 'calc(var(--safe-bottom) + 20px)' }}>
+      {tab === 'settings' ? (
+        <ReadingRoomSettings
+          characters={characters}
+          selectedCharId={selection.charId}
+          selectedWindowId={selection.windowId}
+          onSelectChar={handleSelectChar}
+          onSelectWindow={handleSelectWindow}
+          onError={(title, detail) => showError?.(title, detail)}
+        />
+      ) : (
+      <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 20 }}>
         <div className="mb-4 flex gap-2 rounded-xl bg-stone-700 px-3 py-2.5 text-[11px] leading-relaxed text-stone-100">
           <WarningCircle size={15} weight="fill" className="mt-0.5 shrink-0 text-amber-300" />
           <span>
             书只存在这台设备上，<b>不会进备份</b>，清浏览器数据或换设备会丢。
-            划线、和角色讨论、归档进记忆宫殿还没做（第二、三期）。长按书封可以改名或删除。
+            和角色讨论划线、归档进记忆宫殿还没做（第二期剩余部分和第三期）。长按书封可以改名或删除。
           </span>
         </div>
 
@@ -383,6 +468,36 @@ const ReadingRoomApp: React.FC = () => {
             <p className="mt-2 text-xs text-stone-400">书架是空的，点上面那个加号放一本进来</p>
           </div>
         )}
+      </div>
+      )}
+
+      {/*
+        底栏：书架 / 设置。
+        **只在这两页出现，阅读页没有它**——阅读页整屏接管，多一条带子会挤掉正文行数。
+      */}
+      <div
+        className="shrink-0 border-t border-stone-200/80 bg-[#f7f4ee]"
+        style={{ paddingBottom: 'var(--safe-bottom)' }}
+      >
+        <div className="flex">
+          {([
+            ['shelf', '书架', BookOpen],
+            ['settings', '设置', SlidersHorizontal],
+          ] as const).map(([value, label, Icon]) => {
+            const active = tab === value;
+            return (
+              <button
+                key={value}
+                onClick={() => setTab(value)}
+                aria-current={active ? 'page' : undefined}
+                className={`flex flex-1 flex-col items-center gap-0.5 py-2 transition active:scale-95 ${active ? 'text-orange-700' : 'text-stone-400'}`}
+              >
+                <Icon size={21} weight={active ? 'fill' : 'regular'} />
+                <span className={`text-[10px] ${active ? 'font-semibold' : ''}`}>{label}</span>
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {/* ——— 长按书封的操作面板 ——— */}

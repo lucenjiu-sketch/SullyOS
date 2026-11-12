@@ -76,6 +76,42 @@ export interface ReadingHighlight {
   updatedAt: number;
 }
 
+/**
+ * 一个讨论窗口。
+ *
+ * **只属于角色，不属于书。** 这是久定下来的：选窗口是用户的事，切书不换窗口。
+ * 同一个窗口里可以堆着好几本书的讨论，发送时在内容里写明「正在读《某书》」，
+ * 由角色自己分辨，不靠数据结构分。
+ *
+ * 和协同工作的 `CollaborationSession` 刻意分开存（各自的数据库），
+ * 两边互不污染——久要的就是这个。
+ */
+export interface ReadingDiscussionWindow {
+  id: string;
+  /** 属于哪个角色（CharacterProfile.id）。不同角色的窗口不混在一起。 */
+  charId: string;
+  name: string;
+  /** 有值就是已归档。口径与协同工作的 `archivedAt` 一致。 */
+  archivedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * 共读室当前选了谁、用哪个窗口。
+ *
+ * **应用级别的全局选择，不跟书绑定。** 换书不动它，除非用户主动改。
+ * 单行记录，`id` 恒为 `READING_SELECTION_ID`。
+ */
+export interface ReadingSelection {
+  id: string;
+  charId?: string;
+  windowId?: string;
+  updatedAt: number;
+}
+
+/** 当前选择那一行的固定主键。 */
+export const READING_SELECTION_ID = 'current';
 
 export const readingRoomId = (prefix: string): string => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
