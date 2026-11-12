@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   ArrowCounterClockwise,
+  Brain,
   CheckCircle,
   ChatCircleDots,
   PencilSimple,
@@ -14,11 +15,13 @@ import type { CharacterProfile } from '../../types';
 import {
   createDiscussionWindow,
   filterWindows,
+  markWindowMemoryArchived,
   MAX_WINDOW_NAME_CHARS,
   renameWindow,
   setWindowArchived,
   type ReadingWindowFilter,
 } from './discussion';
+import ReadingArchiveReview from './ReadingArchiveReview';
 import { ReadingRoomStore } from './store';
 import type { ReadingDiscussionWindow } from './types';
 
@@ -51,6 +54,23 @@ interface Props {
   onSelectChar: (charId: string) => void;
   onSelectWindow: (windowId: string | undefined) => void;
   onError: (title: string, detail: string) => void;
+  /**
+   * 第三期：把一个窗口的讨论总结成一段角色第一人称的经历。
+   *
+   * 由 App 层实现（副 LLM 的配置在 `useOS()` 那一层）。
+   * 返回 `null` 表示**副 LLM 没配**，这时候预览页开成手写模式；
+   * 抛错表示这一次失败了（网络 / 渠道 / 模型没给出东西），可以重试。
+   */
+  onSummarizeWindow: (window: ReadingDiscussionWindow) => Promise<string | null>;
+  /**
+   * 第三期：把用户确认过的那段话真正写进角色的记忆。
+   *
+   * 成功返回一句给用户看的话（存到哪儿了），失败抛错。
+   * **抛错时这个函数不许留下半截状态**——窗口由这边在成功之后才标记。
+   */
+  onArchiveToMemory: (window: ReadingDiscussionWindow, summary: string) => Promise<string>;
+  /** 成功的提示。走 App 的 toast。 */
+  onNotify: (message: string) => void;
 }
 
 const windowTimeLabel = (value: number): string => {
@@ -65,6 +85,24 @@ interface RenameDraft {
   draft: string;
 }
 
+/**
+ * 「写进记忆」这件事的全部状态。null = 没在归档。
+ *
+ * **总结生成和写入是两个阶段，中间夹着用户确认。**
+ * `generating` 为真时转圈；`summary` 有值就显示出来给她改；
+ * `saving` 为真时正在跑记忆宫殿那条管线。
+ *
+ * `manual` 为真 = 副 LLM 没配，预览页开成空白手写模式。
+ */
+interface ArchiveFlow {
+  window: ReadingDiscussionWindow;
+  generating: boolean;
+  saving: boolean;
+  summary?: string;
+  error?: string;
+  manual: boolean;
+}
+
 const ReadingRoomSettings: React.FC<Props> = ({
   characters,
   selectedCharId,
@@ -72,6 +110,9 @@ const ReadingRoomSettings: React.FC<Props> = ({
   onSelectChar,
   onSelectWindow,
   onError,
+  onSummarizeWindow,
+  onArchiveToMemory,
+  onNotify,
 }) => {
   const [windows, setWindows] = useState<ReadingDiscussionWindow[]>([]);
   const [filter, setFilter] = useState<ReadingWindowFilter>('active');
@@ -79,6 +120,8 @@ const ReadingRoomSettings: React.FC<Props> = ({
   const [busy, setBusy] = useState(false);
   /** 改名弹窗。null = 没在改名。 */
   const [renaming, setRenaming] = useState<RenameDraft | null>(null);
+  /** 「写进记忆」的流程状态。null = 没在归档。 */
+  const [archiving, setArchiving] = useState<ArchiveFlow | null>(null);
 
   const selectedChar = useMemo(
     () => characters.find(char => char.id === selectedCharId),
@@ -184,6 +227,92 @@ const ReadingRoomSettings: React.FC<Props> = ({
       setBusy(false);
     }
   }, [busy, onError, renaming]);
+
+  /**
+   * 跑一次总结。开归档流程和「重新生成」都走这里。
+   *
+   * **失败只记在 `archiving.error` 上，窗口一个字都不改。**
+   * 她可以直接按「重新生成」重试——网卡一下不该变成「没配置」，
+   * 也不该让窗口显示成已写入。
+   */
+  const runSummary = useCallback(async (window: ReadingDiscussionWindow) => {
+    setArchiving({ window, generating: true, saving: false, manual: false });
+    try {
+      const summary = await onSummarizeWindow(window);
+      // null = 副 LLM 没配。开成手写模式，不是报错。
+      setArchiving({
+        window,
+        generating: false,
+        saving: false,
+        summary: summary ?? '',
+        manual: summary === null,
+      });
+    } catch (error: any) {
+      setArchiving({
+        window,
+        generating: false,
+        saving: false,
+        error: error?.message || String(error),
+        manual: false,
+      });
+    }
+  }, [onSummarizeWindow]);
+
+  /**
+   * 点「写进记忆」。
+   *
+   * 已经写过的窗口要先问一遍：记忆宫殿按内容相似度去重，**不认我们的归档 id**，
+   * 所以重复写有可能在宫殿里留下几条相近的记忆。神经链接那条不会重复。
+   */
+  const handleArchiveToMemory = useCallback(async (window: ReadingDiscussionWindow) => {
+    if (busy || archiving) return;
+    if (window.memoryArchivedAt && !globalThis.confirm?.(
+      `「${window.name}」已经写进记忆了。再写一次的话，记忆宫殿里可能会多出一条很像的记忆。继续吗？`,
+    )) return;
+    await runSummary(window);
+  }, [archiving, busy, runSummary]);
+
+  /**
+   * 她确认之后，真正写入。
+   *
+   * 顺序是定的：**先写记忆，成功了才标记窗口。** 反过来写会出现
+   * 「界面说写好了，角色脑子里什么都没有」——而她没办法自己发现。
+   *
+   * 窗口元数据保存失败时记忆已经进去了，所以那一步单独提示，
+   * 并且不清掉预览（她能看到发生在哪一步）。
+   */
+  const handleArchiveConfirm = useCallback(async (finalSummary: string) => {
+    if (!archiving || archiving.saving) return;
+    const target = archiving.window;
+    setArchiving({ ...archiving, saving: true, error: undefined });
+    let message: string;
+    try {
+      message = await onArchiveToMemory(target, finalSummary);
+    } catch (error: any) {
+      // 记忆没写进去。窗口保持原状，她改过的文字留着，可以直接再点一次。
+      setArchiving(previous => (previous && previous.window.id === target.id
+        ? { ...previous, saving: false, summary: finalSummary, error: error?.message || String(error) }
+        : previous));
+      return;
+    }
+    try {
+      const updated = markWindowMemoryArchived(target, finalSummary);
+      await ReadingRoomStore.saveWindow(updated);
+      setWindows(previous => previous.map(item => (item.id === target.id ? updated : item)));
+      setArchiving(null);
+      onNotify(message);
+    } catch (error: any) {
+      setArchiving(previous => (previous && previous.window.id === target.id
+        ? {
+          ...previous,
+          saving: false,
+          summary: finalSummary,
+          error: `记忆已经写进去了，但这个窗口的状态没存上：${error?.message || String(error)}。`
+            + '不用再写一次，重开共读室看一下这个窗口就好。',
+        }
+        : previous));
+    }
+  }, [archiving, onArchiveToMemory, onNotify]);
 
   return (
     <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 16 }}>
@@ -312,6 +441,7 @@ const ReadingRoomSettings: React.FC<Props> = ({
                               ? `最近 ${windowTimeLabel(window.lastMessageAt)}`
                               : `建于 ${windowTimeLabel(window.createdAt)}`}
                             {window.archivedAt ? ' · 已归档' : ''}
+                            {window.memoryArchivedAt ? ' · 已写进记忆' : ''}
                           </span>
                         </span>
                         {picked && (
@@ -343,6 +473,21 @@ const ReadingRoomSettings: React.FC<Props> = ({
                           <Trash size={12} weight="bold" /> 删除
                         </button>
                       </div>
+                      {/*
+                        「写进记忆」单独一行，和「归档」分开。
+                        归档只是把窗口收起来（纯界面），写进记忆是真的改角色的脑子，
+                        两件事混在一个按钮里会让撤销归档这个动作也被拖进总结流程。
+                      */}
+                      <button
+                        onClick={() => void handleArchiveToMemory(window)}
+                        disabled={busy || !!archiving || !window.lastMessageAt}
+                        className={`mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg py-2 text-[11px] transition active:scale-95 disabled:opacity-40 ${window.memoryArchivedAt ? 'bg-stone-100 text-stone-500' : 'bg-orange-50 text-orange-700 ring-1 ring-orange-200'}`}
+                      >
+                        <Brain size={13} weight="bold" />
+                        {window.memoryArchivedAt
+                          ? '已写进记忆 · 再写一次'
+                          : window.lastMessageAt ? '写进记忆' : '还没有讨论，写不了'}
+                      </button>
                     </div>
                   );
                 })}
@@ -357,8 +502,27 @@ const ReadingRoomSettings: React.FC<Props> = ({
         <span>
           窗口和当前选择都存在这台设备上，和书一样不会进备份。
           归档只是收起来，不会删掉里面的内容。
+          「写进记忆」是另一件事：那段话会存进角色的长期记忆，撤销归档不会把它删掉。
         </span>
       </p>
+
+      {/* ——— 写进记忆的预览 ——— */}
+      {archiving && (
+        <ReadingArchiveReview
+          window={archiving.window}
+          characterName={selectedChar?.name || '这个角色'}
+          generating={archiving.generating}
+          saving={archiving.saving}
+          summary={archiving.summary}
+          error={archiving.error}
+          manualHint={archiving.manual
+            ? '记忆宫殿的副 LLM 还没配好，所以没法自动总结。可以自己写一段，确认后会存进角色的神经链接。'
+            : undefined}
+          onRegenerate={() => void runSummary(archiving.window)}
+          onConfirm={finalSummary => void handleArchiveConfirm(finalSummary)}
+          onCancel={() => { if (!archiving.saving) setArchiving(null); }}
+        />
+      )}
 
       {/* ——— 改名弹窗 ——— */}
       {renaming && (

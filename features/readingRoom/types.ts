@@ -103,6 +103,21 @@ export interface ReadingDiscussionWindow {
   lastMessagePreview?: string;
   /** 最后一条消息的时间。只用于显示，排序仍然看 `updatedAt`。 */
   lastMessageAt?: number;
+  /**
+   * 这个窗口的讨论**写进角色记忆**的时间。有值 = 写过了。
+   *
+   * 和 `archivedAt` 是两件事，别合并：
+   * - `archivedAt` 只是把窗口收进「已归档」栏，纯界面状态，可以来回切；
+   * - `memoryArchivedAt` 是「记忆宫殿/神经链接里已经有这条经历了」，
+   *   **撤销归档不会清掉它**——记忆写进去就撤不回来，清掉这个字段
+   *   只会让界面谎称没写过，然后重复写出好几条相近的记忆。
+   *
+   * 口径与协同工作的 `CollaborationSession.memoryArchivedAt` 一致。
+   * 旧窗口没有这个字段，**不要把「有 archivedAt」当成写过记忆**。
+   */
+  memoryArchivedAt?: number;
+  /** 当时真正写进去的那段总结（已带日期壳）。给界面显示「写进去的是这段」。 */
+  memoryArchiveSummary?: string;
   createdAt: number;
   updatedAt: number;
 }

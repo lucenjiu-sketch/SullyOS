@@ -82,7 +82,13 @@ export function createDiscussionWindow(
   };
 }
 
-/** 归档 / 撤销归档。口径与协同工作一致：`archivedAt` 有值即已归档。 */
+/**
+ * 归档 / 撤销归档。口径与协同工作一致：`archivedAt` 有值即已归档。
+ *
+ * **只动 `archivedAt`。** 撤销归档时 `memoryArchivedAt` / `memoryArchiveSummary`
+ * 原样留着——记忆已经写进角色脑子里了，撤销「收起来」这个界面动作
+ * 不该让界面谎称没写过（谎称的后果是重复写出好几条相近的记忆）。
+ */
 export function setWindowArchived(
   window: ReadingDiscussionWindow,
   archived: boolean,
@@ -91,6 +97,29 @@ export function setWindowArchived(
   return {
     ...window,
     archivedAt: archived ? now : undefined,
+    updatedAt: now,
+  };
+}
+
+/**
+ * 记下「这个窗口的讨论已经写进角色记忆了」。
+ *
+ * 只在记忆**真的写成功之后**调用。失败时窗口一个字都不许改——
+ * 否则界面显示已写入，角色脑子里其实什么都没有，而久没法自己发现。
+ *
+ * 顺手把窗口收进「已归档」栏（没归档过的话）：写进记忆了说明这段讨论
+ * 告一段落，不用再让她多点一次。已经归档的保留原来的归档时间。
+ */
+export function markWindowMemoryArchived(
+  window: ReadingDiscussionWindow,
+  summary: string,
+  now = Date.now(),
+): ReadingDiscussionWindow {
+  return {
+    ...window,
+    archivedAt: window.archivedAt ?? now,
+    memoryArchivedAt: now,
+    memoryArchiveSummary: summary,
     updatedAt: now,
   };
 }

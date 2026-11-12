@@ -17,6 +17,12 @@ import {
   sortMessagesByTime,
 } from '../features/readingRoom/discussion';
 import { runReadingTurn } from '../features/readingRoom/engine';
+import {
+  isArchiveSummaryApiConfigured,
+  readingArchiveFragmentId,
+  summarizeReadingRoomForMemory,
+  wrapArchiveSummaryWithDate,
+} from '../features/readingRoom/archive';
 import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
@@ -35,8 +41,8 @@ import { trackEvent } from '../utils/analytics';
 /**
  * 共读室 · 书架 + 沉浸式阅读器 + 划线 + 讨论面板 + 设置。
  *
- * 讨论面板能发消息、能带划线引用，**但角色还不会回话**——接 API 是第三包。
- * 归档进记忆宫殿是第三期。
+ * 讨论面板能发消息、能带划线引用，角色会回话（第二期接的真 API）。
+ * 设置页能把一个窗口的讨论写进角色的记忆（第三期）。
  * 正文全程只留在本地 IndexedDB，不进任何 API 请求。
  *
  * ## 底栏只在书架和设置这两页出现
@@ -69,7 +75,7 @@ const formatCharCount = (count: number): string => (
 );
 
 const ReadingRoomApp: React.FC = () => {
-  const { closeApp, addToast, showError, characters, apiConfig, userProfile } = useOS();
+  const { closeApp, addToast, showError, characters, apiConfig, userProfile, memoryPalaceConfig, updateCharacter } = useOS();
 
   const [tab, setTab] = useState<ReadingRoomTab>('shelf');
   const [books, setBooks] = useState<ReadingBook[]>([]);
@@ -380,6 +386,131 @@ const ReadingRoomApp: React.FC = () => {
     showError?.(title, detail);
   }, [showError]);
 
+  /** 设置页的成功提示出口。也必须是稳定引用，理由同上。 */
+  const handleSettingsNotify = useCallback((message: string) => {
+    addToast?.(message, 'success');
+  }, [addToast]);
+
+  /**
+   * 第三期 · 把一个窗口的讨论总结成角色第一人称的一段经历。
+   *
+   * **总结走记忆宫殿的副 LLM**（`memoryPalaceConfig.lightLLM`），
+   * 不走角色的对话 API——归档的口径不该跟着角色换模型而变，久定的。
+   * 讨论本身走的是 `resolveDialogueApi`（`engine.ts`），两条路别混。
+   *
+   * 返回 `null` = 副 LLM 没配好，让设置页开成手写模式。
+   * **这和「请求失败」是两件事**：网断了要抛错（她能看到原因、能重试），
+   * 不能说成没配置。
+   *
+   * 日期壳用窗口里**真实消息**的时间（第一条 ~ 最后一条），不让模型自己编日期。
+   */
+  const handleSummarizeWindow = useCallback(async (
+    window: ReadingDiscussionWindow,
+  ): Promise<string | null> => {
+    const char = characters.find(item => item.id === window.charId);
+    if (!char) throw new Error('这个窗口的角色找不到了');
+    const messages = await ReadingRoomStore.listMessages(window.id);
+    const semantic = messages.filter(item => item.role === 'user' || item.role === 'assistant');
+    if (semantic.length === 0) throw new Error('这个窗口还没有讨论记录，没什么可以写进记忆的');
+    if (!isArchiveSummaryApiConfigured(memoryPalaceConfig.lightLLM)) return null;
+    const raw = await summarizeReadingRoomForMemory({
+      lightLLM: memoryPalaceConfig.lightLLM,
+      characterName: char.name,
+      userName: userProfile.name,
+      windowName: window.name,
+      messages: semantic,
+    });
+    return wrapArchiveSummaryWithDate(
+      raw,
+      semantic[0].createdAt,
+      semantic[semantic.length - 1].createdAt,
+    );
+  }, [characters, memoryPalaceConfig.lightLLM, userProfile.name]);
+
+  /**
+   * 第三期 · 把用户确认过的那段话真正写进角色的记忆。
+   *
+   * 照 `apps/Chat.tsx` 的 `handleCollaborationArchiveToMemory` 那套走，
+   * 两条路：
+   * - **开了记忆宫殿**：`importExternalMemoryText` 做提取 + 向量化，
+   *   再用 `mergePalaceFragmentsIntoMemories` 同步一条进神经链接；
+   * - **没开记忆宫殿**（或者没配副 LLM，手写模式）：只写神经链接。
+   *
+   * 神经链接那条用 `reading_room_archive_<窗口id>` 这个固定 id，所以
+   * 同一个窗口重复写不会在神经链接里多出一条。**记忆宫殿里的向量记忆
+   * 不认这个 id**，它按内容相似度去重——重复写可能留下几条相近的，
+   * 久知道这件事，界面上靠「已写进记忆」的状态和二次确认来防。
+   *
+   * 失败一律抛错，由设置页显示原因、保留她改过的文字、让她重试。
+   * **这里不碰窗口状态**：标记成功是设置页在这个函数返回之后做的。
+   */
+  const handleArchiveToMemory = useCallback(async (
+    window: ReadingDiscussionWindow,
+    summary: string,
+  ): Promise<string> => {
+    const char = characters.find(item => item.id === window.charId);
+    if (!char) throw new Error('这个窗口的角色找不到了');
+    const text = summary.trim();
+    if (!text) throw new Error('总结是空的，没有东西可以写进记忆');
+
+    const occurred = new Date(window.lastMessageAt || window.updatedAt);
+    const date = `${occurred.getFullYear()}-${String(occurred.getMonth() + 1).padStart(2, '0')}-${String(occurred.getDate()).padStart(2, '0')}`;
+    const fragmentId = readingArchiveFragmentId(window.id);
+    const { mergePalaceFragmentsIntoMemories } = await import('../utils/memoryPalace/pipeline');
+
+    const palaceReady = char.memoryPalaceEnabled
+      && isArchiveSummaryApiConfigured(memoryPalaceConfig.lightLLM);
+
+    if (palaceReady) {
+      const embedding = memoryPalaceConfig.embedding;
+      if (!embedding?.baseUrl || !embedding?.apiKey || !embedding?.model) {
+        throw new Error(`${char.name}开了记忆宫殿，但宫殿的向量 API 还没配好。可以去设置里配，或者先关掉这个角色的记忆宫殿只存神经链接`);
+      }
+      const { importExternalMemoryText } = await import('../utils/memoryPalace/pipeline');
+      const imported = await importExternalMemoryText(
+        text,
+        char.id,
+        char.name,
+        embedding,
+        memoryPalaceConfig.lightLLM,
+        userProfile.name,
+      );
+      // 'lock' = 这个角色正在跑别的记忆处理。说人话，不要把内部标识抛给她。
+      if (imported.error === 'lock') {
+        throw new Error(`${char.name}正在整理别的记忆，过一会儿再写一次就好`);
+      }
+      if (imported.error === 'no_memories') {
+        throw new Error('记忆宫殿没能从这段话里提取出可保存的记忆。可以把总结写得更具体一点再试');
+      }
+      if (imported.error) throw new Error(`记忆宫殿没存好：${imported.error}`);
+      if (imported.stored === 0 && imported.skipped === 0) {
+        throw new Error('记忆宫殿没有提取出可保存的经历');
+      }
+      await updateCharacter(char.id, current => ({
+        memories: (current.memories || []).some(memory => memory.id === fragmentId)
+          ? current.memories
+          : mergePalaceFragmentsIntoMemories(current.memories || [], [{
+            id: fragmentId,
+            date,
+            summary: `- ${text}`,
+            mood: 'palace',
+          }]),
+      }));
+      trackEvent('共读归档写入记忆', { 目标: '记忆宫殿+神经链接' });
+      return `已经把这次共读存进${char.name}的记忆宫殿和神经链接了`;
+    }
+
+    await updateCharacter(char.id, current => ({
+      memories: (current.memories || []).some(memory => memory.id === fragmentId)
+        ? current.memories
+        : [...(current.memories || []), { id: fragmentId, date, summary: text, mood: 'reading' }],
+    }));
+    trackEvent('共读归档写入记忆', { 目标: '神经链接' });
+    return char.memoryPalaceEnabled
+      ? `记忆宫殿的副 LLM 没配好，这段话先存进${char.name}的神经链接了`
+      : `已经把这次共读存进${char.name}的神经链接了`;
+  }, [characters, memoryPalaceConfig.embedding, memoryPalaceConfig.lightLLM, updateCharacter, userProfile.name]);
+
   /** 换角色要把窗口一起清掉：窗口挂在角色下，留着上个角色的窗口 id 就错了。 */
   const handleSelectChar = useCallback((charId: string) => {
     persistSelection(
@@ -647,6 +778,9 @@ const ReadingRoomApp: React.FC = () => {
           onSelectChar={handleSelectChar}
           onSelectWindow={handleSelectWindow}
           onError={handleSettingsError}
+          onSummarizeWindow={handleSummarizeWindow}
+          onArchiveToMemory={handleArchiveToMemory}
+          onNotify={handleSettingsNotify}
         />
       ) : (
       <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 20 }}>
