@@ -24,9 +24,10 @@ export type RecallEntryPoint =
     | 'chat_app'
     | 'home_3d'
     | 'collaboration'
+    | 'reading_room'
     | 'emotion_eval'
     | 'proactive_chat'
-    | 'vr_world'
+| 'vr_world'
     | 'world_home'
     | 'chat_payload'
     | 'direct';

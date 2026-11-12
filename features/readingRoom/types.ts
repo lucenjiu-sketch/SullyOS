@@ -93,8 +93,55 @@ export interface ReadingDiscussionWindow {
   name: string;
   /** 有值就是已归档。口径与协同工作的 `archivedAt` 一致。 */
   archivedAt?: number;
+  /**
+   * 最后一条消息的短摘要，只给列表显示用。
+   *
+   * **存摘要不存整条消息**：窗口记录会在每次列表刷新时被全部读出来，
+   * 挂上完整聊天内容等于列个窗口就把所有讨论读一遍。
+   * 完整消息在 messages 表里，按 windowId 单独取。
+   */
+  lastMessagePreview?: string;
+  /** 最后一条消息的时间。只用于显示，排序仍然看 `updatedAt`。 */
+  lastMessageAt?: number;
   createdAt: number;
   updatedAt: number;
+}
+
+/**
+ * 一条讨论消息里保留的引用信息。
+ *
+ * **只存书名、章节、划线原文**。划线前后的那些原文（`buildHighlightContext`
+ * 的 `before` / `after`）**不在这里**：它们只属于发出去的那一轮请求，
+ * 不进数据库、也不会在之后的历史里被重复发送一遍。
+ *
+ * `bookTitle` 存的是当时那个书名，不是每次去书表里查。书被删掉、
+ * 或者改了名之后，翻历史还能看出当时在读什么。
+ */
+export interface ReadingMessageReference {
+  bookId: string;
+  bookTitle: string;
+  /** 划线所在章节的标题。没识别出章节的书这里是兜底的那一章名。 */
+  chapterTitle: string;
+  /** 对应的划线 id。划线被删掉后这个 id 会指向空气，所以引用不依赖它取正文。 */
+  highlightId?: string;
+  /** 划线原文（已压掉多余空白）。历史里显示的就是这一段。 */
+  quote: string;
+}
+
+/**
+ * 讨论窗口里的一条消息。
+ *
+ * 挂在 `windowId` 下，**不挂 bookId**——一个窗口会堆好几本书的讨论，
+ * 是哪本书写在 `reference` 里。没有引用的闲聊消息就没有 `reference`。
+ */
+export interface ReadingDiscussionMessage {
+  id: string;
+  windowId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  /** 这条消息引用的划线。闲聊消息没有这个字段。 */
+  reference?: ReadingMessageReference;
+  createdAt: number;
 }
 
 /**

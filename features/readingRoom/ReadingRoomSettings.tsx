@@ -4,6 +4,7 @@ import {
   ArrowCounterClockwise,
   CheckCircle,
   ChatCircleDots,
+  PencilSimple,
   Plus,
   Trash,
   UserCircle,
@@ -13,6 +14,8 @@ import type { CharacterProfile } from '../../types';
 import {
   createDiscussionWindow,
   filterWindows,
+  MAX_WINDOW_NAME_CHARS,
+  renameWindow,
   setWindowArchived,
   type ReadingWindowFilter,
 } from './discussion';
@@ -53,6 +56,12 @@ const windowTimeLabel = (value: number): string => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 
+/** 正在改名的那个窗口。`draft` 是输入框里的字，没确定之前不碰原窗口。 */
+interface RenameDraft {
+  window: ReadingDiscussionWindow;
+  draft: string;
+}
+
 const ReadingRoomSettings: React.FC<Props> = ({
   characters,
   selectedCharId,
@@ -65,6 +74,8 @@ const ReadingRoomSettings: React.FC<Props> = ({
   const [filter, setFilter] = useState<ReadingWindowFilter>('active');
   const [loadingWindows, setLoadingWindows] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** 改名弹窗。null = 没在改名。 */
+  const [renaming, setRenaming] = useState<RenameDraft | null>(null);
 
   const selectedChar = useMemo(
     () => characters.find(char => char.id === selectedCharId),
@@ -136,7 +147,7 @@ const ReadingRoomSettings: React.FC<Props> = ({
 
   const handleDelete = useCallback(async (window: ReadingDiscussionWindow) => {
     if (busy) return;
-    if (!globalThis.confirm?.(`删掉「${window.name}」？`)) return;
+    if (!globalThis.confirm?.(`删掉「${window.name}」？里面的讨论记录会一起删掉。`)) return;
     setBusy(true);
     try {
       await ReadingRoomStore.deleteWindow(window.id);
@@ -149,6 +160,28 @@ const ReadingRoomSettings: React.FC<Props> = ({
       setBusy(false);
     }
   }, [busy, onError, onSelectWindow, selectedWindowId]);
+
+  /**
+   * 确定改名。
+   *
+   * `renameWindow` 在名字没真的变时返回同一个对象，这里靠 `===` 跳过写库——
+   * 点开弹窗什么都没改就按确定，不该把这个窗口的 `updatedAt` 刷新（它会跳到列表最前）。
+   */
+  const handleRenameConfirm = useCallback(async () => {
+    if (!renaming || busy) return;
+    const updated = renameWindow(renaming.window, renaming.draft);
+    if (updated === renaming.window) { setRenaming(null); return; }
+    setBusy(true);
+    try {
+      await ReadingRoomStore.saveWindow(updated);
+      setWindows(previous => previous.map(item => (item.id === updated.id ? updated : item)));
+      setRenaming(null);
+    } catch (error: any) {
+      onError('名字没改上', error?.message || String(error));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, onError, renaming]);
 
   return (
     <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 16 }}>
@@ -268,8 +301,14 @@ const ReadingRoomSettings: React.FC<Props> = ({
                           <span className="block truncate text-[13px] font-semibold text-stone-800">
                             {window.name}
                           </span>
-                          <span className="mt-0.5 block text-[10px] text-stone-400">
-                            建于 {windowTimeLabel(window.createdAt)}
+                          {/* 预览只显示摘要，完整消息在 messages 表里。 */}
+                          <span className={`mt-1 block line-clamp-2 text-[11px] leading-relaxed ${window.lastMessagePreview ? 'text-stone-600' : 'text-stone-400'}`}>
+                            {window.lastMessagePreview || '还没有讨论记录'}
+                          </span>
+                          <span className="mt-1 block text-[10px] text-stone-400">
+                            {window.lastMessageAt
+                              ? `最近 ${windowTimeLabel(window.lastMessageAt)}`
+                              : `建于 ${windowTimeLabel(window.createdAt)}`}
                             {window.archivedAt ? ' · 已归档' : ''}
                           </span>
                         </span>
@@ -278,6 +317,13 @@ const ReadingRoomSettings: React.FC<Props> = ({
                         )}
                       </button>
                       <div className="mt-2.5 flex items-center gap-3 border-t border-stone-100 pt-2">
+                        <button
+                          onClick={() => setRenaming({ window, draft: window.name })}
+                          disabled={busy}
+                          className="flex items-center gap-1 text-[11px] text-stone-500 transition active:scale-95 disabled:opacity-40"
+                        >
+                          <PencilSimple size={12} weight="bold" /> 改名
+                        </button>
                         <button
                           onClick={() => handleArchive(window, !window.archivedAt)}
                           disabled={busy}
@@ -311,6 +357,49 @@ const ReadingRoomSettings: React.FC<Props> = ({
           归档只是收起来，不会删掉里面的内容。
         </span>
       </p>
+
+      {/* ——— 改名弹窗 ——— */}
+      {renaming && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center px-6"
+          onClick={() => setRenaming(null)}
+        >
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            className="relative w-full max-w-xs rounded-2xl bg-[#fbf6ec] px-4 py-4 shadow-2xl"
+            onClick={event => event.stopPropagation()}
+          >
+            <p className="mb-2 text-[12px] font-semibold text-stone-700">给这个窗口改个名字</p>
+            <input
+              value={renaming.draft}
+              onChange={event => setRenaming({ ...renaming, draft: event.target.value })}
+              maxLength={MAX_WINDOW_NAME_CHARS}
+              autoFocus
+              className="w-full rounded-xl bg-white px-3 py-2.5 text-[13px] text-stone-800 outline-none ring-1 ring-stone-200 focus:ring-2 focus:ring-orange-400"
+              placeholder={renaming.window.name}
+            />
+            <p className="mt-1.5 text-[10px] text-stone-400">
+              最多 {MAX_WINDOW_NAME_CHARS} 个字。留空就保持原来的名字；
+              改名不影响里面已有的讨论记录。
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={handleRenameConfirm}
+                disabled={busy}
+                className="flex-1 rounded-xl bg-stone-700 py-2.5 text-sm text-stone-50 transition active:scale-95 disabled:opacity-40"
+              >
+                改好了
+              </button>
+              <button
+                onClick={() => setRenaming(null)}
+                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

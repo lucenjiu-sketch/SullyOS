@@ -1214,7 +1214,11 @@ export async function injectMemoryPalace(
     }
 
     let explicitEntityAnalysis: ExplicitEntityAnalysis | undefined;
-    const interactiveRecall = isChatConversationEntry(trace.entryPoint) || trace.entryPoint === 'collaboration';
+    const interactiveRecall = isChatConversationEntry(trace.entryPoint)
+        || trace.entryPoint === 'collaboration'
+        // 共读室和协同同档：角色要能认出用户提到的人名地名，去翻那些具体记忆。
+        // 少了这一步，「上次我们聊过的那个人」就召回不到。
+        || trace.entryPoint === 'reading_room';
     if (!trace.featureFlagsSnapshot.recallRouter) {
         trace.explicitEntityRecall = { status: 'disabled' };
         trace.eventBoxMetadataRecall = { status: 'disabled' };

@@ -1,13 +1,15 @@
 /**
  * 共读室 · 讨论窗口的纯逻辑。
  *
- * 分栏、默认命名、失效选择的修复全在这里，不碰 DOM 也不碰 IndexedDB，
- * 这样这些规则能被测试直接锁住（见 `utils/readingRoomDiscussion.test.ts`）。
+ * 分栏、默认命名、改名、消息预览、失效选择的修复全在这里，
+ * 不碰 DOM 也不碰 IndexedDB，这样这些规则能被测试直接锁住
+ * （见 `utils/readingRoomDiscussion.test.ts`）。
  *
- * ## 这一期只做「选择和管理」
+ * ## 这个文件不碰请求组装
  *
- * 发消息、拼上下文、召回历史都还没做。窗口现在是空壳：有 id、有名字、
- * 能选中、能归档。**别在这个文件里塞请求组装**，那是下一次推送的事。
+ * 拼 system prompt、调 API、流式回复都不在这里。**划线前后的那些原文
+ * （`buildHighlightContext` 的 before / after）一个字都不该出现在这个文件里**——
+ * 它们只属于发出去的那一轮请求，不进数据库。这里只负责「存下来的东西长什么样」。
  *
  * ## 窗口只属于角色，不属于书
  *
@@ -19,12 +21,17 @@
 import {
   READING_SELECTION_ID,
   readingRoomId,
+  type ReadingDiscussionMessage,
   type ReadingDiscussionWindow,
+  type ReadingMessageReference,
   type ReadingSelection,
 } from './types';
 
-/** 窗口名长度上限。防止以后做改名时存进一篇作文。 */
+/** 窗口名长度上限。改名时截到这里，不存一篇作文。 */
 export const MAX_WINDOW_NAME_CHARS = 40;
+
+/** 列表里那行预览留多长。超过就截断加省略号。 */
+export const MAX_MESSAGE_PREVIEW_CHARS = 50;
 
 export type ReadingWindowFilter = 'active' | 'archived';
 
@@ -92,6 +99,89 @@ export function setWindowArchived(
 export function normalizeWindowName(name: string, fallback: string): string {
   const cleaned = name.replace(/\s+/g, ' ').trim().slice(0, MAX_WINDOW_NAME_CHARS);
   return cleaned || fallback;
+}
+
+/**
+ * 改名。
+ *
+ * **名字没真的变就返回同一个对象**（`===` 成立），调用方靠它决定要不要写库——
+ * 否则点开改名弹窗、什么都没改就按确定，也会把这个窗口的 `updatedAt` 刷新，
+ * 它就莫名其妙跳到列表最前面去了。
+ *
+ * 改名**只动名字**：id 不变，所以挂在这个 id 下的消息一条都不受影响。
+ */
+export function renameWindow(
+  window: ReadingDiscussionWindow,
+  name: string,
+  now = Date.now(),
+): ReadingDiscussionWindow {
+  const next = normalizeWindowName(name, window.name);
+  if (next === window.name) return window;
+  return { ...window, name: next, updatedAt: now };
+}
+
+/** 列表里显示的那行预览：压掉换行和多余空白，太长就截断。 */
+export function messagePreviewText(content: string): string {
+  const flat = content.replace(/\s+/g, ' ').trim();
+  return flat.length > MAX_MESSAGE_PREVIEW_CHARS
+    ? `${flat.slice(0, MAX_MESSAGE_PREVIEW_CHARS)}…`
+    : flat;
+}
+
+/**
+ * 建一条讨论消息。
+ *
+ * `reference` 只接受已经精简过的引用（书名 / 章节 / 划线原文）。
+ * **调用方不要把 `buildHighlightContext` 的结果整个塞进来**：那里面的
+ * before / after 是这一轮请求用的临时上下文，存进库就会在之后每次
+ * 读历史时跟着回来，等于把前后文反复发给模型。
+ */
+export function createDiscussionMessage(input: {
+  windowId: string;
+  role: ReadingDiscussionMessage['role'];
+  content: string;
+  reference?: ReadingMessageReference;
+  now?: number;
+}): ReadingDiscussionMessage {
+  const createdAt = input.now ?? Date.now();
+  return {
+    id: readingRoomId('rm'),
+    windowId: input.windowId,
+    role: input.role,
+    content: input.content,
+    ...(input.reference ? { reference: input.reference } : {}),
+    createdAt,
+  };
+}
+
+/**
+ * 把一条新消息的痕迹记到窗口上。
+ *
+ * `updatedAt` 跟着一起更新，所以「最近聊过的排在最前面」靠现有的
+ * `filterWindows` 就成立了，不必再按 `lastMessageAt` 排一次。
+ *
+ * 没有正文的消息（流式刚开始、内容还是空的）不覆盖预览——
+ * 否则列表里会闪出一条空预览。
+ */
+export function applyMessageToWindow(
+  window: ReadingDiscussionWindow,
+  message: ReadingDiscussionMessage,
+): ReadingDiscussionWindow {
+  const preview = messagePreviewText(message.content);
+  if (!preview) return window;
+  return {
+    ...window,
+    lastMessagePreview: preview,
+    lastMessageAt: message.createdAt,
+    updatedAt: message.createdAt,
+  };
+}
+
+/** 消息按时间正序排。读历史和发给模型都用这个顺序。 */
+export function sortMessagesByTime(
+  messages: ReadingDiscussionMessage[],
+): ReadingDiscussionMessage[] {
+  return [...messages].sort((a, b) => a.createdAt - b.createdAt);
 }
 
 /**

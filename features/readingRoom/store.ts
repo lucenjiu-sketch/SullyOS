@@ -3,6 +3,7 @@ import {
   READING_SELECTION_ID,
   type ReadingBook,
   type ReadingBookContent,
+  type ReadingDiscussionMessage,
   type ReadingDiscussionWindow,
   type ReadingHighlight,
   type ReadingProgress,
@@ -26,17 +27,21 @@ import {
  * - v3：加 windows（讨论窗口，按 charId 建索引）和 selection（当前选了谁、用哪个窗口）。
  *   同样只加表。窗口**只挂角色不挂书**，当前选择是**应用级全局的一行记录**，
  *   换书不动它——这是久定的，别改成按书存。
+ * - v4：加 messages（讨论消息，按 windowId 建索引）。又是只加表，v1–v3 的数据原样留着。
+ *   消息里的引用**只有书名 / 章节 / 划线原文**，划线前后那些原文不进库（见 types.ts）。
  */
 
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_BOOKS = 'books';
 const STORE_CONTENTS = 'contents';
 const STORE_PROGRESS = 'progress';
 const STORE_HIGHLIGHTS = 'highlights';
 const STORE_WINDOWS = 'windows';
 const STORE_SELECTION = 'selection';
+const STORE_MESSAGES = 'messages';
 const INDEX_HIGHLIGHT_BOOK = 'by_book';
 const INDEX_WINDOW_CHAR = 'by_char';
+const INDEX_MESSAGE_WINDOW = 'by_window';
 
 const connections = new Map<string, Promise<IDBDatabase>>();
 
@@ -70,6 +75,12 @@ export const openReadingRoomSpace = (spaceId = SESSION_SPACE_ID): Promise<IDBDat
       // v3 新增。当前选择只有一行（主键恒为 READING_SELECTION_ID）。
       if (!db.objectStoreNames.contains(STORE_SELECTION)) {
         db.createObjectStore(STORE_SELECTION, { keyPath: 'id' });
+      }
+      // v4 新增。消息按窗口建索引：读一个窗口的历史不必全表扫。
+      // 消息只挂 windowId，不挂 bookId——是哪本书写在 message.reference 里。
+      if (!db.objectStoreNames.contains(STORE_MESSAGES)) {
+        const store = db.createObjectStore(STORE_MESSAGES, { keyPath: 'id' });
+        store.createIndex(INDEX_MESSAGE_WINDOW, 'windowId', { unique: false });
       }
     };
     request.onsuccess = () => {
@@ -151,7 +162,13 @@ export const ReadingRoomStore = {
     return row ? row.content : null;
   },
 
-  /** 删书会连带删掉正文、进度和划线；讨论窗口在下一次推送时一并处理。 */
+  /**
+   * 删书会连带删掉正文、进度和划线。
+   *
+   * **讨论消息不跟着删**：窗口不属于书，一个窗口里堆着好几本书的讨论，
+   * 按书去删会在历史中间挖出一个洞。消息里的 `reference` 存了当时的书名，
+   * 书删掉之后翻历史照样看得出在说哪本（引用卡片不依赖书还在不在）。
+   */
   deleteBook: async (bookId: string): Promise<void> => {
     const db = await openDatabase();
     const transaction = db.transaction(
@@ -238,15 +255,68 @@ export const ReadingRoomStore = {
   },
 
   /**
-   * 删一个窗口。
+   * 删一个窗口，连带删掉它名下的全部消息。
    *
-   * 这一期窗口里还没有消息表，所以只删窗口本身。
-   * 等讨论消息做出来，这里要跟着删消息（照 `deleteBook` 用索引游标那个写法）。
+   * 两件事在**同一个事务**里：只删窗口不删消息，那些消息就成了孤儿——
+   * 永远读不到，又一直占着空间。
+   *
+   * 消息的主键是 id，只能通过 `by_window` 索引逐条删（照 `deleteBook` 那个写法）。
+   * 索引范围锁死在这一个 windowId 上，**同一个角色的其它窗口不会被碰到**。
    */
   deleteWindow: async (windowId: string): Promise<void> => {
     const db = await openDatabase();
-    const transaction = db.transaction(STORE_WINDOWS, 'readwrite');
+    const transaction = db.transaction([STORE_WINDOWS, STORE_MESSAGES], 'readwrite');
     transaction.objectStore(STORE_WINDOWS).delete(windowId);
+    const index = transaction.objectStore(STORE_MESSAGES).index(INDEX_MESSAGE_WINDOW);
+    const cursorRequest = index.openCursor(IDBKeyRange.only(windowId));
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) return;
+      cursor.delete();
+      cursor.continue();
+    };
+    await commitTransaction(transaction);
+  },
+
+  // ——— 讨论消息（v4）———
+  //
+  // 消息只挂 windowId。是哪本书、哪一章、划了哪句，都在 message.reference 里，
+  // **而且只有书名 / 章节 / 划线原文**——划线前后的那些原文属于单次请求，不进这张表。
+
+  /** 一个窗口的全部消息，按时间正序。别的窗口一条都不会混进来。 */
+  listMessages: async (windowId: string): Promise<ReadingDiscussionMessage[]> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_MESSAGES, 'readonly');
+    const index = transaction.objectStore(STORE_MESSAGES).index(INDEX_MESSAGE_WINDOW);
+    const rows = await requestResult(index.getAll(IDBKeyRange.only(windowId))) as ReadingDiscussionMessage[];
+    return rows.sort((a, b) => a.createdAt - b.createdAt);
+  },
+
+  /**
+   * 存一条消息，同时把窗口上的预览和时间刷新。
+   *
+   * **两张表一个事务**：消息写进去了但窗口预览没更新，列表就会显示上一条，
+   * 看着像消息没发出去。
+   *
+   * 窗口那一份由调用方算好传进来（用 `applyMessageToWindow`），
+   * 这里不读旧窗口再改——读-改-写跨两个事务的话，中间那一下别人改过就会被覆盖。
+   */
+  saveMessage: async (
+    message: ReadingDiscussionMessage,
+    window?: ReadingDiscussionWindow,
+  ): Promise<void> => {
+    const db = await openDatabase();
+    const names = window ? [STORE_MESSAGES, STORE_WINDOWS] : [STORE_MESSAGES];
+    const transaction = db.transaction(names, 'readwrite');
+    transaction.objectStore(STORE_MESSAGES).put(message);
+    if (window) transaction.objectStore(STORE_WINDOWS).put(window);
+    await commitTransaction(transaction);
+  },
+
+  deleteMessage: async (messageId: string): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_MESSAGES, 'readwrite');
+    transaction.objectStore(STORE_MESSAGES).delete(messageId);
     await commitTransaction(transaction);
   },
 
