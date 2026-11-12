@@ -6,14 +6,22 @@ import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/par
 import { progressPercent } from '../features/readingRoom/paginate';
 import { coverPalette, coverTitleLines } from '../features/readingRoom/layout';
 import { sortHighlightsByPosition } from '../features/readingRoom/highlight';
-import { emptySelection, reconcileSelection } from '../features/readingRoom/discussion';
+import {
+  applyMessageToWindow,
+  createDiscussionMessage,
+  emptySelection,
+  reconcileSelection,
+} from '../features/readingRoom/discussion';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
   readingRoomId,
   type ReadingBook,
+  type ReadingDiscussionMessage,
+  type ReadingDiscussionWindow,
   type ReadingEncoding,
   type ReadingHighlight,
+  type ReadingMessageReference,
   type ReadingSelection,
 } from '../features/readingRoom/types';
 import { trackEvent } from '../utils/analytics';
@@ -76,6 +84,15 @@ const ReadingRoomApp: React.FC = () => {
    * 落库在共读室的 selection 表，退出重进还记得。
    */
   const [selection, setSelection] = useState<ReadingSelection>(() => emptySelection());
+
+  /**
+   * 当前选中窗口的讨论消息和窗口本身。
+   *
+   * 窗口对象要留着：存消息时得用它算出新的预览（`applyMessageToWindow`），
+   * 不然每发一条都要先回库读一次。
+   */
+  const [discussionMessages, setDiscussionMessages] = useState<ReadingDiscussionMessage[]>([]);
+  const [discussionWindow, setDiscussionWindow] = useState<ReadingDiscussionWindow | null>(null);
 
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = Number(localStorage.getItem(FONT_SIZE_KEY));
@@ -337,6 +354,64 @@ const ReadingRoomApp: React.FC = () => {
     persistSelection({ windowId });
   }, [persistSelection]);
 
+  /**
+   * 换窗口就把历史重读一遍。
+   *
+   * **只读当前 windowId 的消息**，别的窗口一条都不混进来（store 用 by_window
+   * 索引保证）。`cancelled` 那个闸是为了防止快速连切窗口时，先发出的那次
+   * 慢请求后回来、把晚选的窗口历史盖掉。
+   */
+  useEffect(() => {
+    const windowId = selection.windowId;
+    if (!windowId) { setDiscussionMessages([]); setDiscussionWindow(null); return; }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [rows, windows] = await Promise.all([
+          ReadingRoomStore.listMessages(windowId),
+          selection.charId ? ReadingRoomStore.listWindows(selection.charId) : Promise.resolve([]),
+        ]);
+        if (cancelled) return;
+        setDiscussionMessages(rows);
+        setDiscussionWindow(windows.find(item => item.id === windowId) || null);
+      } catch (error) {
+        if (!cancelled) console.warn('[ReadingRoom] 讨论历史没读出来', error);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selection.charId, selection.windowId]);
+
+  /**
+   * 发一条讨论消息。
+   *
+   * **这一包只落库，不调 API**（角色回复是下一包）。
+   *
+   * 存进去的引用只有书名 / 章节 / 划线原文——划线前后那些原文属于请求
+   * 那一轮，不进库，所以这里不去取 `buildHighlightContext`。
+   *
+   * 本地先加（界面立刻看见自己说的话），写失败再撤回并提示；
+   * 不能让她看着一条其实没存上的消息。
+   */
+  const handleSendDiscussion = useCallback(async (
+    text: string,
+    reference?: ReadingMessageReference,
+  ) => {
+    const windowId = selection.windowId;
+    if (!windowId) { addToast?.('还没选讨论窗口'); return; }
+    const message = createDiscussionMessage({ windowId, role: 'user', content: text, reference });
+    setDiscussionMessages(previous => [...previous, message]);
+    try {
+      const nextWindow = discussionWindow ? applyMessageToWindow(discussionWindow, message) : undefined;
+      await ReadingRoomStore.saveMessage(message, nextWindow);
+      if (nextWindow) setDiscussionWindow(nextWindow);
+    } catch (error: any) {
+      setDiscussionMessages(previous => previous.filter(item => item.id !== message.id));
+      showError?.('这条讨论没存上', error?.message || String(error));
+    }
+  }, [addToast, discussionWindow, selection.windowId, showError]);
+
+  const discussionChar = characters.find(char => char.id === selection.charId);
+
   // ——— 阅读 ———
   if (openBook) {
     return (
@@ -347,11 +422,15 @@ const ReadingRoomApp: React.FC = () => {
         fontSize={fontSize}
         flipMode={flipMode}
         highlights={highlights}
+        discussionCharName={discussionChar?.name}
+        discussionWindowName={discussionWindow?.name}
+        discussionMessages={discussionMessages}
         onChangeFontSize={setFontSize}
         onChangeFlipMode={setFlipMode}
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
         onCreateHighlight={range => { void handleCreateHighlight(range); }}
         onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
+        onSendDiscussion={(text, reference) => { void handleSendDiscussion(text, reference); }}
         onExit={() => { setOpenBook(null); setContent(''); setHighlights([]); void refreshShelf(); }}
       />
     );

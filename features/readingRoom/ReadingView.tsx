@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash, CaretLeft, CaretRight } from '@phosphor-icons/react';
+import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash, CaretLeft, CaretRight, ChatCircleDots } from '@phosphor-icons/react';
 import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
 import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
 import { READING_PARAGRAPH_GAP_EM, splitParagraphs, verticalChapterRange } from './layout';
 import {
   DEFAULT_HIGHLIGHT_COLOR,
   describeCaret,
+  highlightDisplayText,
   highlightSummary,
   IDLE_HIGHLIGHT_SELECTION,
   isHighlightTruncated,
@@ -17,7 +18,8 @@ import {
 // sentenceRangeAt 没在这里用：它是「偏移解析完全不准」时的退路
 // （长按直接选整句），留在 caret.ts 里备用，有测试锁着。
 import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint } from './caret';
-import type { ReadingBook, ReadingHighlight } from './types';
+import ReadingDiscussionPanel from './ReadingDiscussionPanel';
+import type { ReadingBook, ReadingDiscussionMessage, ReadingHighlight, ReadingMessageReference } from './types';
 
 /**
  * 沉浸式阅读视图。
@@ -58,11 +60,21 @@ interface ReadingViewProps {
   flipMode: ReadingFlipMode;
   /** 这本书已有的划线。全局共用，不分角色。 */
   highlights: ReadingHighlight[];
+  /**
+   * 当前选的共读对象和窗口。两个都有才说得上话。
+   * 任一为空时右侧小把手仍然在，点了给提示（久要的「不能静默失败」）。
+   */
+  discussionCharName?: string;
+  discussionWindowName?: string;
+  /** 当前窗口的讨论消息。由 App 负责读库，这里只显示。 */
+  discussionMessages: ReadingDiscussionMessage[];
   onChangeFontSize: (size: number) => void;
   onChangeFlipMode: (mode: ReadingFlipMode) => void;
   onOffsetChange: (offset: number) => void;
   onCreateHighlight: (range: { startOffset: number; endOffset: number; text: string; color: string }) => void;
   onDeleteHighlight: (highlightId: string) => void;
+  /** 发一条讨论消息。这一包只落库，不调 API。 */
+  onSendDiscussion: (text: string, reference?: ReadingMessageReference) => void;
   onExit: () => void;
 }
 
@@ -111,11 +123,15 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   fontSize,
   flipMode,
   highlights,
+  discussionCharName,
+  discussionWindowName,
+  discussionMessages,
   onChangeFontSize,
   onChangeFlipMode,
   onOffsetChange,
   onCreateHighlight,
   onDeleteHighlight,
+  onSendDiscussion,
   onExit,
 }) => {
   /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
@@ -141,6 +157,16 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const [activeHighlight, setActiveHighlight] = useState<ReadingHighlight | null>(null);
   /** 一次性的提示文字（划线存好了、范围太长被截断之类）。 */
   const [toast, setToast] = useState('');
+
+  /** 讨论面板开着没有。关掉不清引用——引用由下面那个 state 自己留着。 */
+  const [discussionOpen, setDiscussionOpen] = useState(false);
+  /**
+   * 待发送的引用。
+   *
+   * **放在阅读页而不是面板里**：面板关掉会卸载它自己的 state，
+   * 而久要求「引用不能因为打开面板、切半屏全屏而丢失」。
+   */
+  const [pendingQuote, setPendingQuote] = useState<ReadingMessageReference | undefined>();
 
   /** 当前块的页起点列表。测量得出，字号或屏幕变化后重算。 */
   const [pageStarts, setPageStarts] = useState<number[]>([]);
@@ -361,6 +387,46 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     setActiveHighlight(null);
     showToast('划线已删除');
   }, [activeHighlight, onDeleteHighlight, showToast]);
+
+  // ——— 讨论 ———
+
+  /** 角色和窗口都选好了才说得上话。 */
+  const discussionReady = Boolean(discussionCharName && discussionWindowName);
+
+  /**
+   * 打开面板。没选角色或窗口时只给提示，**不静默新建窗口**（久的要求）。
+   */
+  const openDiscussion = useCallback((): boolean => {
+    if (!discussionReady) {
+      showToast(discussionCharName ? '还没选讨论窗口，去设置页选一个' : '还没选共读对象，去设置页选一个');
+      return false;
+    }
+    setDiscussionOpen(true);
+    return true;
+  }, [discussionCharName, discussionReady, showToast]);
+
+  /**
+   * 「问角色」：把这条划线挂成待发送的引用，打开面板。
+   *
+   * **只挂引用，不发送**——久定的流程是她在输入框里补充感想之后再发。
+   *
+   * 引用里只存书名、章节、划线原文。划线前后那些原文属于请求那一轮
+   * （下一包接 API 时用 `buildHighlightContext` 现取），不进这里也不进库。
+   */
+  const askAboutHighlight = useCallback((highlight: ReadingHighlight) => {
+    const chapterTitle = book.chapters[chapterIndexAtOffset(book.chapters, highlight.startOffset)]?.title
+      || '未分章';
+    if (!openDiscussion()) return;
+    setPendingQuote({
+      bookId: book.id,
+      bookTitle: book.title,
+      chapterTitle,
+      highlightId: highlight.id,
+      quote: highlightDisplayText(highlight.text),
+    });
+    setActiveHighlight(null);
+    setHighlightListOpen(false);
+  }, [book.chapters, book.id, book.title, openDiscussion]);
 
   // ——— 手势 ———
   /**
@@ -659,6 +725,26 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       )}
 
       {/*
+        右侧讨论把手。
+        做成贴边的小竖条而不是大圆钮：它一直在屏幕上，存在感必须低。
+        划线流程进行中（等终点、落点小条）时藏起来，免得和那些操作抢位置。
+      */}
+      {!discussionOpen && !menuOpen && selection.mode === 'idle' && pendingOffset === null && (
+        <button
+          onClick={() => openDiscussion()}
+          className="absolute right-0 top-1/2 z-30 -translate-y-1/2 rounded-l-xl bg-stone-700/35 py-3 pl-1.5 pr-1 text-stone-50 backdrop-blur-sm transition active:scale-95"
+          aria-label="打开讨论"
+        >
+          <ChatCircleDots size={15} weight="bold" />
+          {discussionMessages.length > 0 && (
+            <span className="mt-1 block text-[9px] tabular-nums leading-none opacity-80">
+              {discussionMessages.length}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/*
         等终点时的常驻提示带。
         必须一直看得见：用户可能翻好几页去找终点，中途很容易忘记自己在划线。
       */}
@@ -760,6 +846,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             <p className="mb-3 line-clamp-3 text-[13px] leading-relaxed text-stone-700">
               {highlightSummary(activeHighlight.text, 120)}
             </p>
+            {/* 问角色排在最前面：这是划线之后最常做的事。 */}
+            <button
+              onClick={() => askAboutHighlight(activeHighlight)}
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-sm text-stone-50 transition active:scale-95"
+            >
+              <ChatCircleDots size={16} weight="bold" />
+              {discussionCharName ? `问${discussionCharName}` : '问角色'}
+            </button>
             <div className="flex gap-2">
               <button
                 onClick={removeActiveHighlight}
@@ -937,12 +1031,21 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                       {' '}{item.endOffset - item.startOffset} 字
                     </p>
                   </button>
-                  <button
-                    onClick={() => { onDeleteHighlight(item.id); showToast('划线已删除'); }}
-                    className="mt-2 flex items-center gap-1 text-[11px] text-red-600/90 transition active:scale-95"
-                  >
-                    <Trash size={12} weight="bold" /> 删除
-                  </button>
+                  <div className="mt-2 flex items-center gap-3">
+                    <button
+                      onClick={() => askAboutHighlight(item)}
+                      className="flex items-center gap-1 text-[11px] text-stone-600 transition active:scale-95"
+                    >
+                      <ChatCircleDots size={12} weight="bold" />
+                      {discussionCharName ? `问${discussionCharName}` : '问角色'}
+                    </button>
+                    <button
+                      onClick={() => { onDeleteHighlight(item.id); showToast('划线已删除'); }}
+                      className="ml-auto flex items-center gap-1 text-[11px] text-red-600/90 transition active:scale-95"
+                    >
+                      <Trash size={12} weight="bold" /> 删除
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -955,6 +1058,24 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
           已经是最后一页了
         </div>
+      )}
+
+      {/*
+        讨论面板。**挂在最外层、绝对定位盖上去**，不是布局里的一块——
+        正文那三层 flex 结构一个字节都不受它影响，分页测量照旧。
+        别为了「看起来整齐」把它搬进上面那个 flex 容器里。
+      */}
+      {discussionReady && (
+        <ReadingDiscussionPanel
+          open={discussionOpen}
+          charName={discussionCharName!}
+          windowName={discussionWindowName!}
+          messages={discussionMessages}
+          pendingQuote={pendingQuote}
+          onClearQuote={() => setPendingQuote(undefined)}
+          onSend={onSendDiscussion}
+          onClose={() => setDiscussionOpen(false)}
+        />
       )}
     </div>
   );
