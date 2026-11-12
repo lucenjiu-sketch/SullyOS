@@ -176,6 +176,21 @@ ln -sfn ~/push/node_modules /tmp/wtN/node_modules   # 省一次装依赖
 
 **数字一致才叫证明，「看着无关」不算。** 查完记得 `git worktree remove --force`。
 
+**16. 图标名不存在，构建才会报，测试一个字都不会说。**
+2026-11-12 补的。我在设置页用了 `ArchiveBox`，测试全过，
+`vite build` 直接失败：`"ArchiveBox" is not exported by @phosphor-icons/react`。
+
+查图标在不在**不能用 `require`**（那条路读出来全是 undefined，会以为所有图标都不存在）：
+
+```bash
+F=$(ls node_modules/.pnpm/@phosphor-icons+react*/node_modules/@phosphor-icons/react/dist/index.es.js)
+grep -c "as 图标名[,}]" $F    # 1 = 有，0 = 没有
+```
+
+这件事的一般形式：**测试过了不等于能构建。** 这个项目里
+图标名、路径别名、`import type` 用错地方，三样都是只有构建才抓得到。
+推给她之前那次 `vite build` 不能省。
+
 ---
 
 ## MCP 调不动那件事：已查实，不用再查

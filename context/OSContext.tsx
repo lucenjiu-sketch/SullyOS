@@ -40,6 +40,8 @@ import { migrateSharkpanAssets } from '../utils/sharkpanAssetMigration';
 import { stripCompanionChatStyleResidue } from '../utils/companionThemeIsolation';
 import { SULLY_DEFAULT_AVATAR_URL, shouldMigrateSullyAvatar } from '../utils/sullyAvatar';
 import { exportStoryTheaterAppearanceSetting, restoreStoryTheaterAppearanceSetting } from '../utils/storyTheaterBackup';
+import { buildReadingRoomBackup, parseReadingRoomBackup } from '../utils/readingRoomBackup';
+import { ReadingRoomStore } from '../features/readingRoom/store';
 import { writeV2Backup, assembleV2Backup, type BackupManifest, type ZipFileWriter, type ZipFileReader } from '../utils/backupFormat';
 import { externalizeVoiceMessageBlob, restoreVoiceMessageBlobs, shouldIncludeVoiceRelatedAssetInBackup } from '../utils/voiceMessageBackup';
 import { ensureCompanionVoiceAssetIdsForBackup, isCompanionVoiceAssetId } from '../utils/companionVoiceAssets';
@@ -3741,7 +3743,26 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // text_only 走 stripBase64（返回新树、不改原对象），直接用引用即可，省掉一次
           // 可能多达数 MB（壁纸 base64）的克隆。
           const cloneForInPlace = <T,>(v: T): T => (mode === 'text_only' ? v : deepCloneForExport(v));
-
+          // 共读室（书 / 正文 / 进度 / 划线 / 讨论窗口与消息 / 当前选择）。
+          // 独立 IndexedDB（SullyOS_ReadingRoom），不在上面那份 allStores 清单里，
+          // 所以单独读一次。media_only 不带：这一块全是文本。
+          //
+          // 读不出来时**不静默跳过**：以前这里是 `.catch(() => null)`，结果是
+          // 导出照样成功，但那份备份里一本书一条讨论都没有，而用户以为自己
+          // 存全了。久定的口径是「别的照样导，但要明确告诉我这一块没进去」，
+          // 所以这里只拦这一块，不让整份导出失败（聊天记录比书重要）。
+          let readingRoomExportFailed = false;
+          const readingRoomSnapshot = (mode === 'text_only' || mode === 'full')
+              ? await ReadingRoomStore.exportAll().catch(error => {
+                  readingRoomExportFailed = true;
+                  console.warn(`📖 [ReadingRoom] 共读室数据没能读出来，这份备份不含共读室: ${error?.message || error}`);
+                  return null;
+              })
+              : null;
+          if (readingRoomExportFailed) {
+              addToast('共读室的数据这次没能读出来，这份备份里不含书和讨论记录。其余数据正常。', 'error');
+          }
+          const readingRoomBackup = buildReadingRoomBackup(readingRoomSnapshot);
           const backupData: Partial<FullBackupData> = {
               friendFeed: mode === 'text_only' ? stripBackupImages(await readFriendFeed()) : undefined,
               friendFeedMedia: mode === 'media_only' ? collectFriendFeedMedia(await readFriendFeed()) : undefined,
@@ -3881,6 +3902,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               bm25Mode: (mode === 'text_only' || mode === 'full') ? (localStorage.getItem('bm25_mode') || undefined) : undefined,
               lastActiveCharId: (mode === 'text_only' || mode === 'full') ? (localStorage.getItem('os_last_active_char_id') || undefined) : undefined,
               storyTheaterAppearance: (mode === 'text_only' || mode === 'full') ? exportStoryTheaterAppearanceSetting() : undefined,
+              readingRoom: readingRoomBackup,
               eventNotifFlags: (mode === 'text_only' || mode === 'full') ? (() => {
                   const flags: Record<string, string> = {};
                   for (let i = 0; i < localStorage.length; i++) {
@@ -4791,6 +4813,25 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           if (typeof data.bm25Mode === 'string') localStorage.setItem('bm25_mode', data.bm25Mode);
           if (typeof data.lastActiveCharId === 'string') localStorage.setItem('os_last_active_char_id', data.lastActiveCharId);
           restoreStoryTheaterAppearanceSetting(data.storyTheaterAppearance);
+          /*
+           * 共读室。独立数据库，所以单独恢复。
+           *
+           * `parseReadingRoomBackup` 返回 null 的话**什么都不做**——
+           * 那是「这份备份里没有共读室这一块」（原版 SullyOS 导出的备份就是这样），
+           * 不是错误，更不该把现有的书架清空。
+           *
+           * 有数据时是**覆盖**：先清七张表再写入，和项目里别的数据一个口径
+           * （导入备份 = 回到那个时间点）。久拍板过。
+           *
+           * 失败只告警不抛错：共读室没恢复上不该让整份备份导入失败，
+           * 聊天记录和角色比书重要得多。
+           */
+          try {
+              const readingRoom = parseReadingRoomBackup(data.readingRoom);
+              if (readingRoom) await ReadingRoomStore.importAll(readingRoom);
+          } catch (error: any) {
+              console.warn(`📖 [ReadingRoom] 共读室数据没能恢复（其余备份不受影响）: ${error?.message || error}`);
+          }
           if (data.dreamCollection && typeof data.dreamCollection === 'object') localStorage.setItem('os_dream_collection', JSON.stringify(data.dreamCollection));
           if (typeof data.gotchiAccentHue === 'string' && /^\d+$/.test(data.gotchiAccentHue)) localStorage.setItem('tama_accent_hue', data.gotchiAccentHue);
           if (data.eventNotifFlags && typeof data.eventNotifFlags === 'object') {

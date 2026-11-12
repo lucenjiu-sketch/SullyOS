@@ -39,6 +39,7 @@ export enum AppID {
   VRWorld = 'vrworld', // 彼方 — 角色自主登入的虚拟世界（定时驱动，房间里看小说/听歌/留言，产出活动卡注入聊天+记忆）
   CharCreatorDev = 'char_creator_dev', // 捏脸系统开发模式 — 仅开发模式可见，向捏人器指定类目追加自定义部件
   WorldHome = 'world_home', // 家园 — 同世界观多角色共同生活的大世界（观测驱动演绎，每角色独立 LLM 调用 + NPC 世界引擎）
+  ReadingRoom = 'reading_room', // 共读室 — 导入本地 TXT 与角色逐段共读（划线讨论 + 手动归档进记忆宫殿）
 }
 
 export interface SystemLog {
@@ -4188,6 +4189,15 @@ export interface FullBackupData {
     bm25Mode?: string;
     lastActiveCharId?: string;
     storyTheaterAppearance?: string;
+    /**
+     * 共读室（书 / 正文 / 进度 / 划线 / 讨论窗口与消息 / 当前选择）。
+     *
+     * 独立数据库 `SullyOS_ReadingRoom`，不在 allStores 清单里，单独导出和恢复。
+     * **原版 SullyOS 没有这个字段**，它的导入逻辑逐字段点名取，读不到就忽略，
+     * 所以这份备份导进原版不会出错；反过来原版的备份导进来时这里是 undefined，
+     * 恢复那一步会跳过、不动现有数据。
+     */
+    readingRoom?: { version: number; data: unknown };
     eventNotifFlags?: Record<string, string>;  // sullyos_* 事件通知标记
     hotNewsSnapshots?: HotNewsSnapshot[];
     dreamCollection?: Record<string, { firstAt: number; count: number }>;  // 梦境盲盒收藏册（os_dream_collection，账号级 localStorage）

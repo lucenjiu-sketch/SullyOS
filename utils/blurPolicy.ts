@@ -150,6 +150,7 @@ const OPAQUE_FULLSCREEN_APPS: ReadonlySet<AppID> = new Set<AppID>([
     AppID.Guidebook,
     AppID.Handbook,
     AppID.HotNews,
+    AppID.ReadingRoom,
     AppID.SpecialMoments,
     AppID.VRWorld,
     AppID.WorldHome,
