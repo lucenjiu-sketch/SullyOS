@@ -343,6 +343,18 @@ const ReadingRoomApp: React.FC = () => {
     });
   }, [showError]);
 
+  /**
+   * 设置页的报错出口。
+   *
+   * **必须是稳定引用**：设置页用它当 `refreshWindows` 的依赖，而那个函数
+   * 又是读窗口那个 effect 的依赖。这里每次渲染新建一个箭头函数的话，
+   * 每次重渲染都会重读一遍窗口列表、把列表整个换掉，
+   * 滚动位置就被顶回最上面——选中靠下的窗口后要再滑一次才看得见选中态。
+   */
+  const handleSettingsError = useCallback((title: string, detail: string) => {
+    showError?.(title, detail);
+  }, [showError]);
+
   /** 换角色要把窗口一起清掉：窗口挂在角色下，留着上个角色的窗口 id 就错了。 */
   const handleSelectChar = useCallback((charId: string) => {
     persistSelection(
@@ -474,7 +486,7 @@ const ReadingRoomApp: React.FC = () => {
           selectedWindowId={selection.windowId}
           onSelectChar={handleSelectChar}
           onSelectWindow={handleSelectWindow}
-          onError={(title, detail) => showError?.(title, detail)}
+          onError={handleSettingsError}
         />
       ) : (
       <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 20 }}>

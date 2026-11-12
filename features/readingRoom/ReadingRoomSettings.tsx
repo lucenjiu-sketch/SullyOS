@@ -83,12 +83,23 @@ const ReadingRoomSettings: React.FC<Props> = ({
     [characters, selectedCharId],
   );
 
-  /** 换角色就重读窗口。不同角色的窗口不能混在一起，所以不做跨角色缓存。 */
+  /**
+   * 换角色就重读窗口。不同角色的窗口不能混在一起，所以不做跨角色缓存。
+   *
+   * 读完顺手决定停在哪一栏：全是已归档时停在空的「未归档」栏会让人
+   * 以为窗口丢了。**这件事只在这里做一次**，不要再挂一个盯着 `windows`
+   * 的 effect —— 那样归档 / 撤销归档改完列表，分栏会被强行切走，
+   * 用户正看着的那一栏自己跳掉。
+   */
   const refreshWindows = useCallback(async (charId: string | undefined) => {
     if (!charId) { setWindows([]); return; }
     setLoadingWindows(true);
     try {
-      setWindows(await ReadingRoomStore.listWindows(charId));
+      const rows = await ReadingRoomStore.listWindows(charId);
+      setWindows(rows);
+      if (rows.length > 0) {
+        setFilter(rows.some(window => !window.archivedAt) ? 'active' : 'archived');
+      }
     } catch (error: any) {
       onError('读不出这个角色的讨论窗口', error?.message || String(error));
       setWindows([]);
@@ -98,18 +109,6 @@ const ReadingRoomSettings: React.FC<Props> = ({
   }, [onError]);
 
   useEffect(() => { void refreshWindows(selectedCharId); }, [refreshWindows, selectedCharId]);
-
-  /**
-   * 进来时自动落在有东西的那一栏。
-   *
-   * 全是已归档的时候停在空的「未归档」栏，会让人以为窗口丢了。
-   * 协同工作那边也是这个处理。
-   */
-  useEffect(() => {
-    if (loadingWindows || windows.length === 0) return;
-    const hasActive = windows.some(window => !window.archivedAt);
-    setFilter(hasActive ? 'active' : 'archived');
-  }, [loadingWindows, windows]);
 
   const shown = useMemo(() => filterWindows(windows, filter), [windows, filter]);
   const activeCount = windows.filter(window => !window.archivedAt).length;
