@@ -41,7 +41,6 @@ export interface ReadingBookContent {
 }
 
 export type ReadingEncoding = 'utf-8' | 'gbk' | 'big5' | 'utf-16le' | 'utf-16be';
-
 /** 阅读进度。按字符偏移记，换字号、换排版都不会跑位。 */
 export interface ReadingProgress {
   bookId: string;
@@ -49,6 +48,34 @@ export interface ReadingProgress {
   offset: number;
   updatedAt: number;
 }
+
+/**
+ * 一条划线。
+ *
+ * **跨多少页都只存一条记录**，不按页拆分：位置用全文字符偏移表达，
+ * 与字号、屏幕、分页边界无关。改字号后分页会变，这条划线照样定位得到。
+ *
+ * `text` 存的是 `content.slice(startOffset, endOffset)` 的**原文**，
+ * 包含其中的换行和缩进空白。保真是为了发给角色时给出的是原话；
+ * 屏幕显示和发送前再去整理多余空白（见 `highlightDisplayText`）。
+ */
+export interface ReadingHighlight {
+  id: string;
+  bookId: string;
+  /** 全文起始字符偏移（含）。 */
+  startOffset: number;
+  /** 全文结束字符偏移（不含）。 */
+  endOffset: number;
+  /** 划线范围内的原文，含空白。 */
+  text: string;
+  /** 划线底色，取自 READING_HIGHLIGHT_COLORS。 */
+  color: string;
+  /** 用户自己写的批注；第三期归档会用到。留空表示只划了线。 */
+  note?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 
 export const readingRoomId = (prefix: string): string => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {

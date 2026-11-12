@@ -1,9 +1,19 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical } from '@phosphor-icons/react';
+import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash } from '@phosphor-icons/react';
 import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
 import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
 import { READING_PARAGRAPH_GAP_EM, splitParagraphs, verticalChapterRange } from './layout';
-import type { ReadingBook } from './types';
+import {
+  DEFAULT_HIGHLIGHT_COLOR,
+  highlightSummary,
+  IDLE_HIGHLIGHT_SELECTION,
+  isHighlightTruncated,
+  normalizeHighlightRange,
+  splitByHighlights,
+  type HighlightSelectionState,
+} from './highlight';
+import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint, sentenceRangeAt } from './caret';
+import type { ReadingBook, ReadingHighlight } from './types';
 
 /**
  * 沉浸式阅读视图。
@@ -42,9 +52,13 @@ interface ReadingViewProps {
   initialOffset: number;
   fontSize: number;
   flipMode: ReadingFlipMode;
+  /** 这本书已有的划线。全局共用，不分角色。 */
+  highlights: ReadingHighlight[];
   onChangeFontSize: (size: number) => void;
   onChangeFlipMode: (mode: ReadingFlipMode) => void;
   onOffsetChange: (offset: number) => void;
+  onCreateHighlight: (range: { startOffset: number; endOffset: number; text: string; color: string }) => void;
+  onDeleteHighlight: (highlightId: string) => void;
   onExit: () => void;
 }
 
@@ -52,6 +66,11 @@ interface ReadingViewProps {
 const SWIPE_THRESHOLD = 45;
 /** 翻页动画时长，与下面 inline transition 一致。 */
 const FLIP_ANIMATION_MS = 170;
+
+/** 长按多久算「按住」而不是点一下。久反馈太久或太灵敏的话，调这个值。 */
+const LONG_PRESS_MS = 400;
+/** 长按期间允许的手指漂移。超过就认为用户在滑动，不触发长按。 */
+const LONG_PRESS_TOLERANCE = 12;
 
 /** 上下两条固定留白带的高度（px，不含安全区）。正文永远落在它们中间。 */
 const TOP_BAND_HEIGHT = 30;
@@ -87,16 +106,32 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   initialOffset,
   fontSize,
   flipMode,
+  highlights,
   onChangeFontSize,
   onChangeFlipMode,
   onOffsetChange,
+  onCreateHighlight,
+  onDeleteHighlight,
   onExit,
 }) => {
   /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
   const [offset, setOffset] = useState(initialOffset);
   const [menuOpen, setMenuOpen] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
+  const [highlightListOpen, setHighlightListOpen] = useState(false);
   const [flipping, setFlipping] = useState<'next' | 'prev' | null>(null);
+
+  /**
+   * 划线交互状态。**翻页不会清掉它**——这正是跨页划线的全部依据：
+   * 起点记的是全文偏移，和当前显示哪一页无关。
+   */
+  const [selection, setSelection] = useState<HighlightSelectionState>(IDLE_HIGHLIGHT_SELECTION);
+  /** 刚长按到的位置，用来弹「从这里划 / 到这里结束」那个小条。 */
+  const [pendingPoint, setPendingPoint] = useState<{ offset: number; preview: string } | null>(null);
+  /** 点到已有划线时弹出的操作条。 */
+  const [activeHighlight, setActiveHighlight] = useState<ReadingHighlight | null>(null);
+  /** 一次性的提示文字（划线存好了、范围太长被截断之类）。 */
+  const [toast, setToast] = useState('');
 
   /** 当前块的页起点列表。测量得出，字号或屏幕变化后重算。 */
   const [pageStarts, setPageStarts] = useState<number[]>([]);
@@ -108,6 +143,10 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const touchRef = useRef<{ x: number; y: number } | null>(null);
   const programmaticScrollRef = useRef(false);
   const flipTimerRef = useRef<number | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  /** 这一次触摸是否已经被长按吃掉。吃掉后抬手不再判翻页。 */
+  const longPressFiredRef = useRef(false);
+  const toastTimerRef = useRef<number | null>(null);
 
   const chapterIndex = chapterIndexAtOffset(book.chapters, offset);
   const chapter = book.chapters[chapterIndex];
@@ -115,6 +154,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
 
   useEffect(() => () => {
     if (flipTimerRef.current !== null) window.clearTimeout(flipTimerRef.current);
+    if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToast(''), 2_200);
   }, []);
 
   /**
@@ -160,6 +207,16 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     () => splitParagraphs(content, pageStart, pageEnd),
     [content, pageEnd, pageStart],
   );
+
+  /**
+   * 只取和当前可见范围有交集的划线。
+   * 一本书可能有几百条划线，没必要让每个段落都去比对全部。
+   */
+  const visibleHighlights = useMemo(() => {
+    const from = flipMode === 'horizontal' ? pageStart : block.start - READING_BLOCK_SIZE;
+    const to = flipMode === 'horizontal' ? pageEnd : block.end + READING_BLOCK_SIZE;
+    return highlights.filter(item => item.endOffset > from && item.startOffset < to);
+  }, [block.end, block.start, flipMode, highlights, pageEnd, pageStart]);
 
   const commitOffset = useCallback((next: number) => {
     setOffset(next);
@@ -209,15 +266,128 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     commitOffset(next);
   }, [commitOffset]);
 
+  // ——— 划线 ———
+
+  /** 取消这一次划线，回到正常阅读。随时可用，不留残留状态。 */
+  const cancelSelection = useCallback(() => {
+    setSelection(IDLE_HIGHLIGHT_SELECTION);
+    setPendingPoint(null);
+  }, []);
+
+  /**
+   * 长按落点的处理。
+   *
+   * 先看按到的是不是已有划线——是就弹那条划线的操作条（删除 / 跳转），
+   * 不是才进入「定起点 / 定终点」的流程。
+   */
+  const handleLongPress = useCallback((x: number, y: number) => {
+    const point = resolveOffsetAtPoint(x, y);
+    if (point === null) return;
+
+    const hit = highlights.find(item => point >= item.startOffset && point < item.endOffset);
+    if (hit && selection.mode === 'idle') {
+      setActiveHighlight(hit);
+      setPendingPoint(null);
+      return;
+    }
+
+    // 给用户看一眼「按到的是这句」，比只显示一个光标位置好认。
+    const sentence = sentenceRangeAt(content, point);
+    setPendingPoint({
+      offset: point,
+      preview: highlightSummary(content.slice(sentence.startOffset, sentence.endOffset), 24),
+    });
+  }, [content, highlights, selection.mode]);
+
+  /** 把刚长按到的位置确定为起点，进入等终点状态。 */
+  const confirmStart = useCallback(() => {
+    if (!pendingPoint) return;
+    setSelection({ mode: 'selecting-end', startOffset: pendingPoint.offset });
+    setPendingPoint(null);
+  }, [pendingPoint]);
+
+  /**
+   * 把刚长按到的位置确定为终点，存下这条划线。
+   *
+   * 起点和终点之间的正文由全文偏移直接切出来，**不要求两点在同一页**：
+   * 中间隔多少页都是一条记录。
+   */
+  const confirmEnd = useCallback(() => {
+    if (!pendingPoint || selection.startOffset === null) return;
+    const first = selection.startOffset;
+    const second = pendingPoint.offset;
+    const range = normalizeHighlightRange(first, second, content.length);
+    if (!range) {
+      showToast('起点和终点是同一个位置，没有划出内容');
+      cancelSelection();
+      return;
+    }
+    onCreateHighlight({
+      ...range,
+      text: content.slice(range.startOffset, range.endOffset),
+      color: DEFAULT_HIGHLIGHT_COLOR,
+    });
+    showToast(isHighlightTruncated(first, second) ? '划线太长，已截断保存' : '划线已保存');
+    cancelSelection();
+  }, [cancelSelection, content, onCreateHighlight, pendingPoint, selection.startOffset, showToast]);
+
+  const removeActiveHighlight = useCallback(() => {
+    if (!activeHighlight) return;
+    onDeleteHighlight(activeHighlight.id);
+    setActiveHighlight(null);
+    showToast('划线已删除');
+  }, [activeHighlight, onDeleteHighlight, showToast]);
+
   // ——— 手势 ———
+  /**
+   * 长按和翻页怎么分开：
+   *
+   * 按下就起一个 400ms 的定时器，期间手指移动超过 12px 就取消它——
+   * 滑动翻页必然带位移，长按必然几乎不动，两者天然互斥。
+   * 定时器真的烧到了就记一个标记，抬手时直接忽略翻页判断，
+   * 否则「长按完抬手手指稍微歪了一点」会既划线又翻页。
+   */
+  const clearLongPress = useCallback(() => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
   const handleTouchStart = useCallback((event: React.TouchEvent) => {
     const touch = event.touches[0];
     touchRef.current = { x: touch.clientX, y: touch.clientY };
-  }, []);
+    longPressFiredRef.current = false;
+    clearLongPress();
+    // 多指（缩放之类）不参与划线。
+    if (event.touches.length > 1) return;
+    const { clientX, clientY } = touch;
+    longPressTimerRef.current = window.setTimeout(() => {
+      longPressTimerRef.current = null;
+      longPressFiredRef.current = true;
+      handleLongPress(clientX, clientY);
+    }, LONG_PRESS_MS);
+  }, [clearLongPress, handleLongPress]);
+
+  const handleTouchMove = useCallback((event: React.TouchEvent) => {
+    const origin = touchRef.current;
+    if (!origin || longPressTimerRef.current === null) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    const drifted = Math.abs(touch.clientX - origin.x) > LONG_PRESS_TOLERANCE
+      || Math.abs(touch.clientY - origin.y) > LONG_PRESS_TOLERANCE;
+    if (drifted) clearLongPress();
+  }, [clearLongPress]);
 
   const handleTouchEnd = useCallback((event: React.TouchEvent) => {
     const origin = touchRef.current;
     touchRef.current = null;
+    clearLongPress();
+    // 这一下已经被长按吃掉了，不要再翻页。
+    if (longPressFiredRef.current) {
+      longPressFiredRef.current = false;
+      return;
+    }
     if (!origin) return;
     const touch = event.changedTouches[0];
     const deltaX = touch.clientX - origin.x;
@@ -236,7 +406,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
 
     // 竖滑模式：上下留给滚动，往右滑唤出菜单。
     if (horizontal && deltaX >= SWIPE_THRESHOLD) setMenuOpen(true);
-  }, [flipMode, flipTo]);
+  }, [clearLongPress, flipMode, flipTo]);
 
   // ——— 竖滑 ———
   const verticalParagraphs = useMemo(() => {
@@ -303,6 +473,35 @@ const ReadingView: React.FC<ReadingViewProps> = ({
 
   const atBookStart = chapterIndex === 0 && pageIndex === 0 && block.start === 0;
   const atBookEnd = pageEnd >= content.length;
+
+  /**
+   * 段落正文：按划线切成若干片段，划过的加底色。
+   *
+   * 片段用 span 包起来，所以段落内部会有嵌套——`caret.ts` 取偏移那边用
+   * TreeWalker 累加文本长度，不依赖「段落里只有一个文本节点」这个假设。
+   *
+   * 底色用 backgroundColor，**不改行高也不加 padding**：
+   * 一旦影响排版高度，分页测量就会跟着变，而测量容器那边没有划线。
+   */
+  const renderParagraphBody = (paragraph: { offset: number; text: string }): React.ReactNode => {
+    const segments = splitByHighlights(
+      content,
+      paragraph.offset,
+      paragraph.offset + paragraph.text.length,
+      visibleHighlights,
+    );
+    if (segments.length === 0) return paragraph.text;
+    if (segments.length === 1 && !segments[0].highlight) return paragraph.text;
+    return segments.map(segment => (
+      segment.highlight
+        ? (
+          <span key={segment.offset} style={{ backgroundColor: segment.highlight.color, borderRadius: 2 }}>
+            {segment.text}
+          </span>
+        )
+        : <React.Fragment key={segment.offset}>{segment.text}</React.Fragment>
+    ));
+  };
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#f6ecd9]">
       {/*
@@ -330,6 +529,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             className="min-h-0 flex-1 overflow-hidden"
             style={{ paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
             onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
           >
             {/* 整页不可滚动：要滚才能读完一页就说明分页错了。 */}
@@ -344,10 +544,10 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               {pageParagraphs.map((paragraph, index) => (
                 <p
                   key={paragraph.offset}
-                  data-offset={paragraph.offset}
+                  {...{ [OFFSET_ATTRIBUTE]: paragraph.offset }}
                   style={{ margin: 0, marginTop: index > 0 ? `${READING_PARAGRAPH_GAP_EM}em` : 0 }}
                 >
-                  {paragraph.text}
+                  {renderParagraphBody(paragraph)}
                 </p>
               ))}
             </div>
@@ -357,6 +557,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             ref={verticalRef}
             onScroll={handleVerticalScroll}
             onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
             onTouchEnd={handleTouchEnd}
             className="min-h-0 flex-1 overflow-y-auto no-scrollbar"
             style={{ paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
@@ -364,14 +565,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             {verticalParagraphs.map((paragraph, index) => (
               <p
                 key={paragraph.offset}
-                data-offset={paragraph.offset}
+                {...{ [OFFSET_ATTRIBUTE]: paragraph.offset }}
                 style={{
                   ...textStyle,
                   margin: 0,
                   marginTop: index > 0 ? `${READING_PARAGRAPH_GAP_EM}em` : 0,
                 }}
               >
-                {paragraph.text}
+                {renderParagraphBody(paragraph)}
               </p>
             ))}
           </div>
@@ -396,13 +597,115 @@ const ReadingView: React.FC<ReadingViewProps> = ({
           visibility: 'hidden',
         }}
       />
-
-      {/* 第一次进来时提示手势，之后不再显示（只在最开头那一页出现）。 */}
-      {atBookStart && !menuOpen && (
+{/* 第一次进来时提示手势，之后不再显示（只在最开头那一页出现）。 */}
+      {atBookStart && !menuOpen && selection.mode === 'idle' && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+7px)] text-center text-[10px] text-stone-400/80">
-          {flipMode === 'horizontal' ? '左右滑翻页 · 向下滑唤出菜单' : '上下滑阅读 · 向右滑唤出菜单'}
+          {flipMode === 'horizontal' ? '左右滑翻页 · 向下滑唤出菜单 · 长按划线' : '上下滑阅读 · 向右滑唤出菜单 · 长按划线'}
         </div>
       )}
+
+      {/*
+        等终点时的常驻提示带。
+        必须一直看得见：用户可能翻好几页去找终点，中途很容易忘记自己在划线。
+      */}
+      {selection.mode === 'selecting-end' && (
+        <div
+          className="absolute inset-x-0 top-0 z-20 flex items-center gap-2 bg-amber-200/95 px-3 shadow-sm"
+          style={{ paddingTop: 'calc(var(--safe-top) + 6px)', paddingBottom: 6 }}
+        >
+          <Highlighter size={14} weight="bold" className="shrink-0 text-amber-800" />
+          <span className="flex-1 text-[11px] leading-tight text-amber-900">
+            起点已定，可以翻页 · 再长按一次定终点
+          </span>
+          <button
+            onClick={cancelSelection}
+            className="shrink-0 rounded-lg bg-amber-800/85 px-2.5 py-1 text-[11px] text-amber-50 transition active:scale-95"
+          >
+            取消
+          </button>
+        </div>
+      )}
+
+      {/* 长按落点后的小条：确认这里是起点还是终点。 */}
+      {pendingPoint && (
+        <div className="absolute inset-0 z-30" onClick={() => setPendingPoint(null)}>
+          <div
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
+            onClick={event => event.stopPropagation()}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)' }}
+          >
+            <p className="mb-1 text-[11px] text-stone-500">
+              {selection.mode === 'selecting-end' ? '把这里作为划线终点' : '从这里开始划线'}
+            </p>
+            <p className="mb-3 line-clamp-2 text-[13px] leading-relaxed text-stone-700">
+              {pendingPoint.preview || '（这一处没有文字）'}
+            </p>
+            <div className="flex gap-2">
+              {selection.mode === 'selecting-end' ? (
+                <button
+                  onClick={confirmEnd}
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-amber-700 py-2.5 text-sm text-amber-50 transition active:scale-95"
+                >
+                  <Check size={16} weight="bold" /> 完成划线
+                </button>
+              ) : (
+                <button
+                  onClick={confirmStart}
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-sm text-stone-50 transition active:scale-95"
+                >
+                  <Highlighter size={16} weight="bold" /> 从这里划
+                </button>
+              )}
+              <button
+                onClick={() => { setPendingPoint(null); if (selection.mode === 'selecting-end') cancelSelection(); }}
+                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 长按在已有划线上：删除，或跳到它的位置。 */}
+      {activeHighlight && (
+        <div className="absolute inset-0 z-30" onClick={() => setActiveHighlight(null)}>
+          <div
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
+            onClick={event => event.stopPropagation()}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)' }}
+          >
+            <p className="mb-1 text-[11px] text-stone-500">这条划线</p>
+            <p className="mb-3 line-clamp-3 text-[13px] leading-relaxed text-stone-700">
+              {highlightSummary(activeHighlight.text, 120)}
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={removeActiveHighlight}
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-red-100 py-2.5 text-sm text-red-700 transition active:scale-95"
+              >
+                <Trash size={16} weight="bold" /> 删除划线
+              </button>
+              <button
+                onClick={() => setActiveHighlight(null)}
+                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 一次性提示。放在底部中间，不挡正文。 */}
+      {toast && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-40 flex justify-center pb-[calc(var(--safe-bottom)+34px)]">
+          <span className="rounded-full bg-stone-800/85 px-3.5 py-1.5 text-[11px] text-stone-50 shadow-lg">
+            {toast}
+          </span>
+        </div>
+      )}
+
 
 
       {/* ——— 菜单 ——— */}
@@ -426,6 +729,15 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                 className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
               >
                 <List size={16} weight="bold" /> 目录
+              </button>
+              <button
+                onClick={() => { setMenuOpen(false); setHighlightListOpen(true); }}
+                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
+              >
+                <Highlighter size={16} weight="bold" /> 划线
+                {highlights.length > 0 && (
+                  <span className="tabular-nums text-[11px] text-stone-500">{highlights.length}</span>
+                )}
               </button>
               <span className="ml-auto text-xs tabular-nums text-stone-400">{percent}%</span>
             </div>
@@ -505,8 +817,60 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         </div>
       )}
 
+      {/* ——— 划线列表 ——— */}
+      {highlightListOpen && (
+        <div className="absolute inset-0 z-40 flex" onClick={() => setHighlightListOpen(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            className="relative ml-auto flex h-full w-[86%] max-w-sm flex-col bg-[#fbf6ec] shadow-2xl"
+            onClick={event => event.stopPropagation()}
+            style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)' }}
+          >
+            <div className="border-b border-stone-300 px-4 py-3">
+              <p className="truncate text-sm font-semibold">我的划线</p>
+              <p className="text-[11px] text-stone-500">
+                {highlights.length > 0 ? `${highlights.length} 条 · 按书里的顺序排` : '还没有划线'}
+              </p>
+            </div>
+            <div className="flex-1 overflow-y-auto no-scrollbar">
+              {highlights.length === 0 ? (
+                <p className="px-4 py-6 text-[12px] leading-relaxed text-stone-500">
+                  在正文上长按，选「从这里划」，翻页后再长按一次定终点。
+                  划线可以跨页，中间隔多少页都算同一条。
+                </p>
+              ) : highlights.map(item => (
+                <div key={item.id} className="border-b border-stone-200/70 px-4 py-3">
+                  <button
+                    onClick={() => { setHighlightListOpen(false); commitOffset(item.startOffset); }}
+                    className="w-full text-left"
+                  >
+                    <span
+                      className="mb-1 inline-block h-1.5 w-7 rounded-full"
+                      style={{ backgroundColor: item.color }}
+                    />
+                    <p className="line-clamp-3 text-[13px] leading-relaxed text-stone-700">
+                      {highlightSummary(item.text, 120)}
+                    </p>
+                    <p className="mt-1 text-[10px] text-stone-400">
+                      第{chapterIndexAtOffset(book.chapters, item.startOffset) + 1}章 ·
+                      {' '}{item.endOffset - item.startOffset} 字
+                    </p>
+                  </button>
+                  <button
+                    onClick={() => { onDeleteHighlight(item.id); showToast('划线已删除'); }}
+                    className="mt-2 flex items-center gap-1 text-[11px] text-red-600/90 transition active:scale-95"
+                  >
+                    <Trash size={12} weight="bold" /> 删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 读到最后一页时给个收尾提示，免得以为是卡住了。 */}
-      {atBookEnd && !menuOpen && (
+      {atBookEnd && !menuOpen && selection.mode === 'idle' && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
           已经是最后一页了
         </div>

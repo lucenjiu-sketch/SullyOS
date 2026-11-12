@@ -1,5 +1,5 @@
 import { spaceDatabaseName, SESSION_SPACE_ID, assertUserSpaceAvailable } from '../../utils/userSpaces';
-import type { ReadingBook, ReadingBookContent, ReadingProgress } from './types';
+import type { ReadingBook, ReadingBookContent, ReadingHighlight, ReadingProgress } from './types';
 
 /**
  * 共读室的独立数据库，不动主库。
@@ -9,12 +9,20 @@ import type { ReadingBook, ReadingBookContent, ReadingProgress } from './types';
  *
  * 第一期不接入备份导出（Settings → 导出）。清浏览器数据、换设备会丢，
  * 三期做完后再统一接 OSContext 的备份通道。
+ *
+ * ## 版本历史
+ *
+ * - v1：books / contents / progress
+ * - v2：加 highlights（划线）。划线按 bookId 建索引，列一本书的划线不必全表扫。
+ *   **升级是加表，不改旧表**，所以 v1 存的书和进度原样保留。
  */
 
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_BOOKS = 'books';
 const STORE_CONTENTS = 'contents';
 const STORE_PROGRESS = 'progress';
+const STORE_HIGHLIGHTS = 'highlights';
+const INDEX_HIGHLIGHT_BOOK = 'by_book';
 
 const connections = new Map<string, Promise<IDBDatabase>>();
 
@@ -34,6 +42,11 @@ export const openReadingRoomSpace = (spaceId = SESSION_SPACE_ID): Promise<IDBDat
       }
       if (!db.objectStoreNames.contains(STORE_PROGRESS)) {
         db.createObjectStore(STORE_PROGRESS, { keyPath: 'bookId' });
+      }
+      // v2 新增。用 createObjectStore 的返回值直接建索引，不必再开事务。
+      if (!db.objectStoreNames.contains(STORE_HIGHLIGHTS)) {
+        const store = db.createObjectStore(STORE_HIGHLIGHTS, { keyPath: 'id' });
+        store.createIndex(INDEX_HIGHLIGHT_BOOK, 'bookId', { unique: false });
       }
     };
     request.onsuccess = () => {
@@ -115,13 +128,25 @@ export const ReadingRoomStore = {
     return row ? row.content : null;
   },
 
-  /** 删书会连带删掉正文和进度；划线和讨论在第二期有各自的表，到时一并处理。 */
+  /** 删书会连带删掉正文、进度和划线；讨论窗口在下一次推送时一并处理。 */
   deleteBook: async (bookId: string): Promise<void> => {
     const db = await openDatabase();
-    const transaction = db.transaction([STORE_BOOKS, STORE_CONTENTS, STORE_PROGRESS], 'readwrite');
+    const transaction = db.transaction(
+      [STORE_BOOKS, STORE_CONTENTS, STORE_PROGRESS, STORE_HIGHLIGHTS],
+      'readwrite',
+    );
     transaction.objectStore(STORE_BOOKS).delete(bookId);
     transaction.objectStore(STORE_CONTENTS).delete(bookId);
     transaction.objectStore(STORE_PROGRESS).delete(bookId);
+    // 划线按 id 为主键，只能通过索引逐条删。
+    const index = transaction.objectStore(STORE_HIGHLIGHTS).index(INDEX_HIGHLIGHT_BOOK);
+    const cursorRequest = index.openCursor(IDBKeyRange.only(bookId));
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) return;
+      cursor.delete();
+      cursor.continue();
+    };
     await commitTransaction(transaction);
   },
 
@@ -143,5 +168,28 @@ export const ReadingRoomStore = {
     const db = await openDatabase();
     const transaction = db.transaction(STORE_PROGRESS, 'readonly');
     return requestResult(transaction.objectStore(STORE_PROGRESS).getAll()) as Promise<ReadingProgress[]>;
+  },
+
+  /** 一本书的所有划线，按在正文里出现的顺序返回。 */
+  listHighlights: async (bookId: string): Promise<ReadingHighlight[]> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_HIGHLIGHTS, 'readonly');
+    const index = transaction.objectStore(STORE_HIGHLIGHTS).index(INDEX_HIGHLIGHT_BOOK);
+    const rows = await requestResult(index.getAll(IDBKeyRange.only(bookId))) as ReadingHighlight[];
+    return rows.sort((a, b) => a.startOffset - b.startOffset || a.endOffset - b.endOffset);
+  },
+
+  saveHighlight: async (highlight: ReadingHighlight): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_HIGHLIGHTS, 'readwrite');
+    transaction.objectStore(STORE_HIGHLIGHTS).put(highlight);
+    await commitTransaction(transaction);
+  },
+
+  deleteHighlight: async (highlightId: string): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(STORE_HIGHLIGHTS, 'readwrite');
+    transaction.objectStore(STORE_HIGHLIGHTS).delete(highlightId);
+    await commitTransaction(transaction);
   },
 };

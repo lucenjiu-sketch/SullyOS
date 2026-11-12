@@ -5,14 +5,20 @@ import { ReadingRoomStore } from '../features/readingRoom/store';
 import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/parse';
 import { progressPercent } from '../features/readingRoom/paginate';
 import { coverPalette, coverTitleLines } from '../features/readingRoom/layout';
+import { sortHighlightsByPosition } from '../features/readingRoom/highlight';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
-import { readingRoomId, type ReadingBook, type ReadingEncoding } from '../features/readingRoom/types';
+import {
+  readingRoomId,
+  type ReadingBook,
+  type ReadingEncoding,
+  type ReadingHighlight,
+} from '../features/readingRoom/types';
 import { trackEvent } from '../utils/analytics';
 
 /**
- * 共读室 · 第一期：书架 + 沉浸式阅读器。
+ * 共读室 · 书架 + 沉浸式阅读器 + 划线。
  *
- * 划线和与角色讨论在第二期，归档进记忆宫殿在第三期。
+ * 与角色讨论划线、归档进记忆宫殿还没做（第二期剩余部分和第三期）。
  * 正文全程只留在本地 IndexedDB，不进任何 API 请求。
  */
 
@@ -46,6 +52,8 @@ const ReadingRoomApp: React.FC = () => {
   const [openBook, setOpenBook] = useState<ReadingBook | null>(null);
   const [content, setContent] = useState('');
   const [initialOffset, setInitialOffset] = useState(0);
+  /** 当前打开那本书的划线。全局共用，不分角色。 */
+  const [highlights, setHighlights] = useState<ReadingHighlight[]>([]);
   /** 长按书封弹出的操作面板。 */
   const [actionBook, setActionBook] = useState<ReadingBook | null>(null);
 
@@ -166,9 +174,10 @@ const ReadingRoomApp: React.FC = () => {
 
   const handleOpenBook = useCallback(async (book: ReadingBook) => {
     try {
-      const [text, progress] = await Promise.all([
+      const [text, progress, marks] = await Promise.all([
         ReadingRoomStore.getContent(book.id),
         ReadingRoomStore.getProgress(book.id),
+        ReadingRoomStore.listHighlights(book.id),
       ]);
       if (text === null) {
         addToast('这本书的正文找不到了，请重新导入', 'error');
@@ -176,6 +185,7 @@ const ReadingRoomApp: React.FC = () => {
       }
       setInitialOffset(progress?.offset || 0);
       setContent(text);
+      setHighlights(marks);
       setOpenBook(book);
       trackEvent('共读室打开书');
     } catch (error: any) {
@@ -215,6 +225,44 @@ const ReadingRoomApp: React.FC = () => {
     setProgressByBook(previous => ({ ...previous, [bookId]: offset }));
   }, []);
 
+  /**
+   * 新建一条划线。
+   *
+   * 本地状态先更新（界面立刻出底色），再落库。写失败时回滚并提示——
+   * 不能让用户看见一条其实没存上的划线。
+   */
+  const handleCreateHighlight = useCallback(async (
+    range: { startOffset: number; endOffset: number; text: string; color: string },
+  ) => {
+    if (!openBook) return;
+    const now = Date.now();
+    const record: ReadingHighlight = {
+      id: readingRoomId('hl'),
+      bookId: openBook.id,
+      ...range,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setHighlights(previous => sortHighlightsByPosition([...previous, record]));
+    try {
+      await ReadingRoomStore.saveHighlight(record);
+    } catch (error: any) {
+      setHighlights(previous => previous.filter(item => item.id !== record.id));
+      showError?.('划线没保存上', error?.message || String(error));
+    }
+  }, [openBook, showError]);
+
+  const handleDeleteHighlight = useCallback(async (highlightId: string) => {
+    const removed = highlights.find(item => item.id === highlightId);
+    setHighlights(previous => previous.filter(item => item.id !== highlightId));
+    try {
+      await ReadingRoomStore.deleteHighlight(highlightId);
+    } catch (error: any) {
+      if (removed) setHighlights(previous => sortHighlightsByPosition([...previous, removed]));
+      showError?.('划线没删掉', error?.message || String(error));
+    }
+  }, [highlights, showError]);
+
   // ——— 阅读 ———
   if (openBook) {
     return (
@@ -224,10 +272,13 @@ const ReadingRoomApp: React.FC = () => {
         initialOffset={initialOffset}
         fontSize={fontSize}
         flipMode={flipMode}
+        highlights={highlights}
         onChangeFontSize={setFontSize}
         onChangeFlipMode={setFlipMode}
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
-        onExit={() => { setOpenBook(null); setContent(''); void refreshShelf(); }}
+        onCreateHighlight={range => { void handleCreateHighlight(range); }}
+        onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
+        onExit={() => { setOpenBook(null); setContent(''); setHighlights([]); void refreshShelf(); }}
       />
     );
   }
