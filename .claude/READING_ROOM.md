@@ -1,20 +1,136 @@
 # 共读室（ReadingRoom）· 交接
 
 接手前先读 `.claude/HANDOFF.md`（那些规矩仍然适用，尤其第 1、2、3 条）。
-这份只记共读室这件事。**2026-11-12 更新（第二次，底部两键 + 设置页验收后）。**
+这份只记共读室这件事。**2026-11-12 更新（第三次，消息表 + 改名 + 预览推送后）。**
 
-## 当前状态：第一期 + 划线 + 底部两键设置页都已验过，下一步做讨论窗口
+## 当前状态：数据层已就位，下一步做讨论面板（不接 AI）
 
 - 分支 `feat/reading-room`，已推 origin。**没有合 master，master 干净。**
-- 最新提交 `bdc2da18`（底部两键 + 设置页）——**久验过了，说「这一块没问题了」。**
+- 最新提交 `cb838b04`（讨论消息表 v4 + 窗口改名 + 消息预览）——**等久验收。**
 - 久在 Vercel 用「分支专属预览链接」测，不用 Create Deployment（她说直接就有）。
 
-**接手第一件事：直接开做「讨论窗口 + 引用发送」（见下面「下一步」）。
-不要重新设计已经验过的部分，不要问她第一期、划线、设置页怎么样——都过了。
-她说这一块「内容很大」，所以是她主动新开的窗口，预算要花在这件事上。**
+**久把第二期拆成三包，是她同意的分法，照这个走，别攒一大包：**
+
+| 包 | 内容 | 状态 |
+|---|---|---|
+| 1 | 消息表（v4）+ 窗口改名 + 消息预览 | **已推 `cb838b04`，等验收** |
+| 2 | 讨论面板滑出 + 半屏/全屏 + 问角色 + 引用卡片，**先不接 AI** | 下一步 |
+| 3 | 接真 API + 流式 + 角色上下文 | 没开始 |
+
+第 2 包故意不接 AI：先让她验手感（盖不盖得住正文、正文有没有被挤、
+引用在不在、键盘挡不挡输入框），发出去的消息直接显示在面板里就行。
+手感不对的话，这时候改比接完 AI 再改便宜得多。
 
 另外：本地 master 有一个未推送的提交 `2d0905ae`（更早窗口的 HANDOFF 更新）。
 不影响干活，她没说要推，别自己推。
+
+## 久在这次拍板的三件事（别再问一遍）
+
+1. **半屏→全屏只做按钮，不做拖动把手。** 她原话「那就只做按钮」。
+   理由当时跟她讲了：拖动和翻页抢手势，划线那边就是因此放弃拖把手的。
+   以后她要是想要拖的手感再加，**现在别主动加**。
+2. **记忆召回加了 `reading_room` 这个新入口**，和 `collaboration` 同档
+   走精确实体召回。她原话「加一个共读室自己的标签」。
+   代价她知道：动了两个上游文件（`memoryPalace/trace.ts` 和 `pipeline.ts`），
+   以后合上游可能撞一下，手工接回来就行。
+   **不要为了省事改回中性标签**——那会让角色认不出她提到的人名地名。
+3. **第二期拆三包，每包她真机验过才往下走。**
+
+## GPT 那份开发说明（久 2026-11-12 给的）哪里不对
+
+她给的那份很详细，大方向对，按它做。但有四处和代码不符，**已查实**：
+
+1. 它说 `resolveDialogueApi(globalApi, character)`「签名已核实」——
+   **实际是三个参数**，第三个是可选的 appApi。两个参数调也能跑，不影响功能。
+2. 它说 `ContextBuilder.buildCharacterRequest()` 不存在——
+   **那是上一个窗口的我写错了，它存在**（`utils/context.ts` 导出，
+   BankApp / CallApp / 日记 / 攻略本等二十多处在用）。
+   **这正是共读室第 3 包该走的路**：一次装好人设、世界观、世界书、
+   用户资料、长期记忆，**而且天生不带日常私聊历史**。
+3. 它说「参考协同的沉浸式模式但别带入私聊」——这在协同那边是**两个函数**，
+   它混成一句了。带私聊的是 `buildLiveCollaborationChatContext`
+   （内部真去读聊天记录），不带的是 `buildCoreContext`。
+   **共读室要走后者，前者一行都别碰**，找错函数就会把私聊全搬进来。
+4. 它要求「列表排序优先按最近消息时间」——**现有 `filterWindows` 按
+   `updatedAt` 倒序，有测试锁着**。存消息时 `updatedAt` 一起更新了，
+   所以排序逻辑一行没动。`lastMessageAt` 只拿来显示。
+
+还有一件它没提但是真坑的：**项目里没有 Markdown 库**
+（`package.json` 里没有 marked / react-markdown）。协同是自己手写了一个
+小解析器（`features/collaboration/markdown.ts`）。第 3 包复用它，
+所以 Markdown 只能到基础：粗体、斜体、代码、列表、引用。表格没有。
+**装新依赖要久点头，别自己装。**
+
+## 第 1 包（`cb838b04`）做了什么
+
+### 数据库升到 v4
+
+`store.ts` **DB_VERSION 3 → 4**，加一张 `messages` 表（`by_window` 索引），
+**旧表一个字没改**，v1–v3 的书 / 正文 / 进度 / 划线 / 窗口原样保留（有测试）。
+
+### 新增的类型
+
+```ts
+ReadingDiscussionMessage   // id / windowId / role / content / reference? / createdAt
+ReadingMessageReference    // bookId / bookTitle / chapterTitle / highlightId? / quote
+```
+
+`ReadingDiscussionWindow` 加了 `lastMessagePreview` 和 `lastMessageAt`。
+
+### 这一包的关键决定（别重构掉）
+
+**引用里只有书名 / 章节 / 划线原文。** `buildHighlightContext` 那个
+`before` / `after`**一个字都不进库**——存了的话，之后每次读历史都会把
+前后文带回来，等于反复发给模型。有两条测试锁着（纯逻辑层和库层各一条，
+都是 `expect(JSON.stringify(...)).not.toContain('before')`）。
+
+**消息只挂 windowId，没有 bookId。** 和窗口那条一样的理由：一个窗口堆着
+好几本书的讨论，是哪本写在 `reference` 里。有测试。
+
+**`deleteWindow` 现在连带删消息**，同一个事务、索引游标锁死单个 windowId。
+原来那条「等消息表做出来再回来补」的注释已经作废删掉了。
+有测试锁「不碰同角色的其它窗口」。
+
+**`deleteBook` 故意不删讨论消息。** 窗口不属于书，按书删会在历史中间挖个洞。
+引用里存了**当时的书名**（不是每次去书表查），所以书删掉、改名之后，
+翻历史照样看得出在说哪本。有测试。
+
+**`renameWindow` 在名字没真的变时返回同一个对象**（`===` 成立），
+调用方靠它跳过写库。不然点开改名弹窗什么都没改就按确定，也会刷新
+`updatedAt`，这个窗口就莫名跳到列表最前面。和 `reconcileSelection` 同一个套路。
+
+**`saveMessage(message, window?)` 两张表一个事务。** 消息写进去了但窗口预览
+没更新，列表会显示上一条，看着像消息没发出去。
+**窗口那一份由调用方算好传进来**（用 `applyMessageToWindow`），
+store 里不做读-改-写——跨两个事务的话中间那一下别人改过就会被覆盖。
+
+**预览存摘要不存整条消息**（上限 50 字）。窗口记录每次列表刷新都会全部读出来，
+挂上完整聊天内容等于列个窗口就把所有讨论读一遍。
+
+**空内容的消息不覆盖已有预览。** 流式刚开始时内容是空的，不挡这一下的话
+列表里会闪出一条空预览。
+
+### 验证命令（**四个**测试文件，别只跑三个）
+
+```bash
+cd ~/push
+npx vitest run utils/readingRoom.test.ts utils/readingRoomHighlight.test.ts \
+  utils/readingRoomDiscussion.test.ts utils/readingRoomStore.test.ts      # 119 passed
+npx vitest run utils/memoryPalace                                          # 402 passed
+npx vitest run utils/safeAreaApps.test.ts utils/blurPolicy.test.ts \
+  utils/appPreload.test.ts utils/appErrorBoundary.test.ts                  # 28 passed
+NODE_OPTIONS="--max-old-space-size=3072" timeout 900 npx vite build        # 必跑
+# 成功标志是最后那行 Static cache: 23 shell files / 1324 versioned resources
+```
+
+`utils/readingRoomStore.test.ts` 是这一包新建的，**真的读写 IndexedDB**
+（fake-indexeddb 由 test-setup.ts 注入）。每个用例用各自唯一的 id 隔离，
+**不要去 deleteDatabase** —— store.ts 内部是单例连接，会把删库请求 block 住。
+
+改了 `memoryPalace` 那两个文件，所以那 402 个测试这次也要跑。
+
+全量测试有 109 个失败，**全部来自上游，不是我们的**。
+见 HANDOFF 第 15 条的三方对照结论，别去修。
 
 ## 这两个窗口（2026-11-12）做完了什么
 
@@ -86,7 +202,7 @@ GPT 给过她一份方案，大方向对（两次长按定起止、按全文偏�
 - 划线列表**留在阅读页原位置**（GPT 那份说明明确要求，她没反对）。
   交接单之前写的「搬进设置页」作废。
 
-新窗口命名她说「按你的来」，就是「讨论 1」「讨论 2」。改名还没做。
+新窗口命名她说「按你的来」，就是「讨论 1」「讨论 2」。改名第 1 包已经做了。
 
 #### 新增的文件和表
 
@@ -132,7 +248,89 @@ F=$(ls node_modules/.pnpm/@phosphor-icons+react*/node_modules/@phosphor-icons/re
 grep -c "as 图标名[,}]" $F    # 1 = 有，0 = 没有
 ```
 
-## 下一步：讨论窗口 + 引用发送（这一块她说「内容很大」）
+## 下一步：第 2 包 · 讨论面板（**不接 AI**）
+
+### 这一包要做的
+
+1. 阅读页右侧一个**低存在感的小把手**，点一下滑出讨论面板。
+   没选角色或窗口时点它要**明确提示去设置页选**，不许静默新建窗口。
+2. 面板从右边滑出，**盖在正文右半边**。久强调过：**不要挤压正文**，是覆盖不是压缩。
+3. **默认半屏，一个按钮切全屏**，再按回半屏。**不做拖动把手**（她拍板了）。
+4. 划线的操作条和划线列表各加一个「问角色」入口。
+   **点它不发送**：打开面板、在输入框**上方**出一块引用卡片
+   （书名 + 章节 + 划线原文），她在下面写感想，一起发。
+5. 发出去的消息和一条占位回复直接显示在面板里，**这一包不调 API**。
+   消息照样落库（第 1 包的表已经能用了），退出重进要还在。
+
+### 这一包的脆点（开工前要跟久讲）
+
+- **讨论面板必须是独立组件，不要写进 `ReadingView.tsx`。**
+  阅读页的分页测量依赖正文区的真实高度（见 `ReadingView` 顶部注释），
+  面板和阅读页并排、盖在上面，正文宽度和测量容器一行都不碰——
+  「不许挤压正文」就从结构上成立，不靠小心。
+- **面板内部的点击 / 长按 / 滑动都要拦住**，不能冒泡到正文去触发翻页和划线。
+- **键盘弹出时输入框会被挡**。项目里有 `--keyboard-inset` 这个 CSS 变量
+  （`utils/iosStandalone.ts` 设的），但**没在共读室验过**，
+  这条要让久在真机上看。
+- 半屏宽度下角色的长回复会显得挤。全屏按钮就是为这个做的。
+
+### 第 2 包做完让她测
+
+1. 阅读页右边有小把手，点一下面板滑出来**盖住**正文右半边（不是把字挤窄）
+2. 面板打开时正文停在原来那一页，字号和分页没变
+3. 没选角色/窗口时点把手，有明确提示，不是静默发生什么
+4. 划线后能点「问角色」，输入框上方出现引用卡片（书名 + 章节 + 划线原文）
+5. 引用卡片在半屏/全屏切换之后还在，没丢
+6. 半屏按一下变全屏，再按回半屏
+7. 在面板里滑动不会误翻页；关掉面板后翻页照常
+8. 键盘弹出时输入框还看得见
+9. 发一条消息，退出阅读页重新进来，这条还在
+10. 换一本书在同一个窗口里继续发，历史里分得清是哪本书
+
+## 第 3 包：接真 API（没开始）
+
+### 已经查实的用法
+
+**API 解析**：`utils/characterApi.ts` 的
+`resolveDialogueApi(globalApi, char, appApi?)`——角色独立 API 优先，
+没配就跟随全局。角色那份存在 `char.dialogueApi`。**直接用，别自己写优先级。**
+**两边都没配时要在界面上说清楚，不能静默失败**（这条当时跟久讲过）。
+
+**角色上下文**：走 `ContextBuilder.buildCharacterRequest(input, messages)`
+（`utils/context.ts`）。它一次装好人设、世界观、世界书、用户资料、长期记忆，
+**而且不带日常私聊历史**——正好是久要的「还是平时那个角色，但讨论历史独立」。
+
+**记忆召回**：`injectMemoryPalace(char, recentMessages, queryHint, userName,
+{ entryPoint: 'reading_room' })`。`reading_room` 这个入口第 1 包已经加好了。
+
+**发请求**：`utils/safeApi.ts` 的 `safeFetchJson(url, options, retries,
+timeout, meta, streamHooks)`，流式走 `streamHooks.onDelta`。
+
+**Markdown**：复用 `features/collaboration/markdown.ts`
+（`parseCollaborationMarkdown`）。项目里没有 Markdown 库，别装新依赖。
+
+### 发给角色的内容怎么拼
+
+用 `highlight.ts` 的 `buildHighlightContext`（划线 + 前后各 320 字符，
+有测试锁「不含全书」），外面套久要的那句话：
+「用户正在读《某书》，她引用了这一段'……'」。
+
+**前后文只进这一轮请求**：不存库（第 1 包的类型已经从结构上挡住了），
+也不能从历史消息里重新拼回来。历史只带书名 / 章节 / 划线原文 / 当时的感想。
+
+**当前这条用户消息只能进请求一次**，不要同时发一份精简版和一份带前后文的。
+
+### 第 3 包不要碰的东西
+
+- **不要用 `runCollaborationTurn`**：它走协同自己的 API Profile，
+  不是久要的「角色独立 API 优先 + 全局兜底」。
+- **不要用 `buildLiveCollaborationChatContext`**：它内部真去读日常私聊记录。
+- **不要把共读室消息写进日常私聊历史**，也不要读别的共读窗口的历史。
+- **不要塞进协同工作的数据库**，两边互不干扰是久要的。
+
+归档写记忆宫殿的完整例子（第三期用）在 `apps/Chat.tsx:3326` 的
+`handleCollaborationArchiveToMemory`（走 `importExternalMemoryText`
++ `mergePalaceFragmentsIntoMemories`）。
 
 ## 她要的东西（原话意思，不要擅自改需求）
 
@@ -147,22 +345,10 @@ grep -c "as 图标名[,}]" $F    # 1 = 有，0 = 没有
 | 一 | 书架 + 阅读器 | **已验收** |
 | 二 | 划线 | **已验收** |
 | 二 | 底部两键 + 设置页（选对象/选窗口） | **已验收** |
-| 二 | 讨论窗口 + 引用发送 | **下一步，就做这个** |
+| 二 | 消息表 + 改名 + 预览（第 1 包） | **已推 `cb838b04`，等验收** |
+| 二 | 讨论面板，不接 AI（第 2 包） | **下一步** |
+| 二 | 接真 API（第 3 包） | 没开始 |
 | 三 | 归档进记忆宫殿 | 没开始 |
-
-### 她定下来的交互（第二期剩余部分，别再问一遍）
-
-1. **讨论窗口从右边滑出，盖在正文右半边。**
-   她强调：**不要挤压原本读书的文字**，是覆盖不是压缩。
-2. **点「问角色」不立刻发送。** 右边窗口的输入框**上方**出现一块引用
-   （引着划线原文），她在下面写感想，两样一起发出去。
-3. **发给 AI 的内容在协同工作那套基础上调整**：告诉它现在是共读室场景、
-   在读哪本书哪一章、划了哪句、前后少量原文、她写的感想。
-4. 她说过「可以看一看 operit 里 CoRead 的 ai 参考一下，
-   毕竟我一开始想法的灵感就来源于此」。
-   **CoRead 的划线数据能直接读**：`coread2_tools:get_highlights`
-   （返回划线文字 / 章节 / 用户批注 / 时间；批注是后挂上去的）。
-   看过了，结构和我们这套一致，不用照抄代码。
 
 ### 她明确回答过的问题（别再问一遍）
 
@@ -170,41 +356,41 @@ grep -c "as 图标名[,}]" $F    # 1 = 有，0 = 没有
 2. **划线全局共用，不分角色。** 她原话：「不管选择哪个角色
    用户都能看见自己在书上的划线。」已经按这个实现了。
 3. **讨论用的 API：角色的独立 API 优先，没配就跟随当前全局。**
-   现成函数：`utils/characterApi.ts` 的 `resolveDialogueApi(globalApi, char, appApi?)`
-   （**查实过，函数在，签名是三个参数**）。
-   角色那份存在 `char.dialogueApi`（`DialogueApiConfig`）。**直接用，别自己写。**
 4. **第一期不接备份**，三期做完一起接。她接受了「清缓存会丢书」。
 5. **章节目录要做**，她会尽量找目录清晰的 TXT。
 6. **页码不要**（她说不重要，已去掉）。底部那条带子**留空**。
 7. **跨段可以划线**（她要的就是能框一整段对话）。
-8. **窗口不分书**（2026-11-12 新增，和第 1 条合起来看）。切书继续用原来选的窗口，
-   书名靠发送内容告诉角色。**选窗口纯粹是用户的事，代码不要替她换。**
-9. **底栏在 App 里，不在书里**（2026-11-12 新增）。阅读页保持整屏。
-10. **划线列表留在阅读页**（2026-11-12 新增）。不要搬进设置页。
+8. **窗口不分书**。切书继续用原来选的窗口，书名靠发送内容告诉角色。
+   **选窗口纯粹是用户的事，代码不要替她换。**
+9. **底栏在 App 里，不在书里**。阅读页保持整屏。
+10. **划线列表留在阅读页**。不要搬进设置页。
+11. **半屏→全屏只做按钮，不做拖动把手**（2026-11-12 第三次新增）。
+12. **记忆召回用 `reading_room` 这个新入口**（2026-11-12 第三次新增）。
 
-## 代码长什么样（已验收的三块）
+## 代码长什么样
 
 ### 文件清单
 
 ```
-features/readingRoom/types.ts        数据结构（书/章节/正文/进度/划线/窗口/当前选择）
+features/readingRoom/types.ts        数据结构（书/章节/正文/进度/划线/窗口/选择/消息）
 features/readingRoom/parse.ts        解码 + 章节识别（纯函数）
 features/readingRoom/paginate.ts     章节定位 + 块切分（纯函数）
 features/readingRoom/measure.ts      按屏幕容量二分分页（纯函数，不碰 DOM）
 features/readingRoom/layout.ts       段落切分 + 段间距 + 书封配色（纯函数）
 features/readingRoom/highlight.ts    划线纯逻辑：区间/与页求交/切片/微调/上下文
 features/readingRoom/caret.ts        触摸点 → 全文偏移（唯一碰浏览器排版的地方）
-features/readingRoom/discussion.ts   窗口纯逻辑：分栏/命名/归档/失效选择修复
-features/readingRoom/store.ts        IndexedDB（SullyOS_ReadingRoom，DB_VERSION 3）
+features/readingRoom/discussion.ts   窗口和消息的纯逻辑：分栏/命名/改名/预览/失效修复
+features/readingRoom/store.ts        IndexedDB（SullyOS_ReadingRoom，DB_VERSION 4）
 features/readingRoom/ReadingView.tsx 沉浸式阅读视图 + 划线交互
-features/readingRoom/ReadingRoomSettings.tsx  设置页（选角色 + 选窗口）
+features/readingRoom/ReadingRoomSettings.tsx  设置页（选角色 + 选窗口 + 改名）
 apps/ReadingRoomApp.tsx              书架 + 底栏 + 调度 + 划线和选择的读写
-utils/readingRoom.test.ts            36 个用例，全过
-utils/readingRoomHighlight.test.ts   33 个用例，全过（划线那套）
-utils/readingRoomDiscussion.test.ts  22 个用例，全过（窗口和选择那套）
+utils/readingRoom.test.ts            36 个用例
+utils/readingRoomHighlight.test.ts   33 个用例（划线那套）
+utils/readingRoomDiscussion.test.ts  42 个用例（窗口、改名、消息、选择）
+utils/readingRoomStore.test.ts       8 个用例（真读写 IndexedDB：v4 升级/隔离/级联删）
 ```
 
-**验证命令要跑三个测试文件**，别只跑第一个。
+**第 2 包要新建的**：讨论面板组件（独立文件，**不要写进 `ReadingView.tsx`**）。
 
 ### 接线点（加新 App 要碰的 7 处，已全部接好）
 
@@ -326,34 +512,21 @@ system prompt（`files.ts` 上限 30 万字符），一本长篇装不下也不�
   `handleCollaborationArchiveToMemory`（走 `importExternalMemoryText`
   + `mergePalaceFragmentsIntoMemories`）
 
-**GPT 说错的几处，别照着找**：
-- 它说 `ContextBuilder.buildCharacterRequest()` —— **这个函数不存在**
+**GPT 说错的几处，别照着找**（这几条上面「GPT 那份开发说明哪里不对」有完整版）：
 - 它说 TXT 上传/解析/IndexedDB「已经有了」—— 协同那套砍到 30 万字符，共读室不能用
 - 它表格里「划线/摘要/询问角色」那几栏本来是空的，它在列待做项不是已有项
 
-### 建议的做法
+### 第 2、3 包具体怎么做，看上面那两节
 
-**窗口表已经建好了**（v3，`windows` + `by_char` 索引），
-当前选择也有了（`selection` 单行）。**下一步要加的是「讨论消息」表**：
-挂在共读室数据库里，**升 DB_VERSION 到 4**。
-消息挂 `windowId`（照 `by_char` 那个写法建 `by_window` 索引）。
-
-**消息里要存上这条讨论是哪本书的**（因为窗口不分书）：
-存 `bookId` + 划线 id + 当时的书名，不然翻历史时分不清在说哪本。
-
-`ReadingRoomStore.deleteWindow` 现在只删窗口本身，
-**消息表做出来之后要回去给它补上「连带删消息」**（照 `deleteBook` 那段
-索引游标的写法）。函数里的注释写着这件事。
+消息表、`by_window` 索引、`deleteWindow` 连带删消息 —— **第 1 包都做完了**，
+不要照这一节下面的旧描述再做一遍。
 
 **选择从哪里读**：`ReadingRoomStore.getSelection()` 返回 `charId` + `windowId`，
 进 App 时已经被 `reconcileSelection` 修过一遍了。角色对象自己从
 `useOS()` 的 `characters` 里按 id 找。
 
-**不要塞进协同工作的数据库**，两边互不干扰是久要的。
-
-发给角色的内容用 `highlight.ts` 的 `buildHighlightContext`，
-它已经按「划线 + 前后各 320 字符」切好了，有测试锁着「不含全书」。
-**外面再套一层她要的那句话**：「用户正在读《某书》，她引用了这一段'……'」。
+**消息从哪里读**：`ReadingRoomStore.listMessages(windowId)`，已按时间正序。
+存消息用 `saveMessage(message, applyMessageToWindow(window, message))`。
 
 ## 验收清单（让她测这些）
 
@@ -378,22 +551,28 @@ system prompt（`files.ts` 上限 30 万字符），一本长篇装不下也不�
 15. 新建窗口自动选中，归档后跑到已归档栏，删除可用
 16. 退出重进，选的角色和窗口还记得；换书不改选择
 
-### 做完讨论窗口 + 引用发送之后让她测
+### 第 1 包（`cb838b04`）等她验这些
 
-1. 划线后能点「问角色」，右边窗口滑出来**盖住**正文右半边（不是把字挤窄）
-2. 输入框上方有引用块（引着划线原文），她在下面写感想，一起发出去
-3. 角色回话里能看出它知道在读哪本书、哪一章、划了哪句
-4. 没选角色或没选窗口时有明确提示，不是静默失败
-5. 角色和全局都没配 API 时有明确报错（脆点第 7 条）
-6. 讨论历史退出重进还在
-7. 换一本书在同一个窗口里继续讨论，历史里分得清是哪本书
+1. 设置页每个窗口卡片上有「改名」，点开能改，改完列表里就是新名字
+2. 改名弹窗按取消，名字没变
+3. 什么都不改按「改好了」，这个窗口不会跳到列表最前面
+4. 退出共读室重进，改过的名字还在
+5. 窗口卡片上显示「还没有讨论记录」（现在还没有消息，这是对的）
+6. 删窗口会问一句，确认后窗口消失，选中态跟着清掉
+7. 书架、阅读、划线、选角色这些老功能一个都没坏
+
+**先提醒她把页面彻底关掉重开**：这次升了数据库版本（v3 → v4），
+不彻底重开可能弹「共读室数据库被其它标签页占用」。
+
+### 第 2、3 包的验收清单在上面各自那一节
 
 ## 验证命令
 
 ```bash
 cd ~/push
 npx vitest run utils/readingRoom.test.ts utils/readingRoomHighlight.test.ts \
-  utils/readingRoomDiscussion.test.ts                                        # 91 passed
+  utils/readingRoomDiscussion.test.ts utils/readingRoomStore.test.ts         # 119 passed
+npx vitest run utils/memoryPalace                                            # 402 passed
 npx vitest run utils/safeAreaApps.test.ts utils/blurPolicy.test.ts \
   utils/appPreload.test.ts utils/appErrorBoundary.test.ts                    # 28 passed
 NODE_OPTIONS="--max-old-space-size=3072" timeout 900 npx vite build          # 必跑
