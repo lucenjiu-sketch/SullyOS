@@ -188,3 +188,25 @@ export const readingRoomId = (prefix: string): string => {
   }
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 };
+
+/**
+ * 整个共读室在备份里的样子。
+ *
+ * 七张表一一对应，**包括书的正文**（`contents`）——久选的方案 A：
+ * 换设备以后书还在、接着读。只备份划线不备份正文的话，重新导入的 TXT
+ * 必须和原来逐字节一致，否则划线会静默错位。
+ *
+ * 每个字段都是可选的：**原版 SullyOS 导出的备份里没有这一块**，
+ * 恢复时要当成「这台设备以前没有共读室数据」，不是错误。
+ * 反过来也成立——这份备份导进原版，原版读不到的字段会被原样忽略
+ * （导入逻辑是一个一个字段点名取的，见 `OSContext` 的 `importFullData`）。
+ */
+export interface ReadingRoomBackupData {
+  books?: ReadingBook[];
+  contents?: ReadingBookContent[];
+  progress?: ReadingProgress[];
+  highlights?: ReadingHighlight[];
+  windows?: ReadingDiscussionWindow[];
+  messages?: ReadingDiscussionMessage[];
+  selection?: ReadingSelection;
+}

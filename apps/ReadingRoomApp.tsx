@@ -787,8 +787,8 @@ const ReadingRoomApp: React.FC = () => {
         <div className="mb-4 flex gap-2 rounded-xl bg-stone-700 px-3 py-2.5 text-[11px] leading-relaxed text-stone-100">
           <WarningCircle size={15} weight="fill" className="mt-0.5 shrink-0 text-amber-300" />
           <span>
-            书只存在这台设备上，<b>不会进备份</b>，清浏览器数据或换设备会丢。
-            角色暂时还不会回话（正在接）。长按书封可以改名或删除。
+            书、划线和讨论都会进备份（导出时选「文本」或「完整」）。
+            <b>但清浏览器数据会丢</b>，记得隔一段时间导出一次。长按书封可以改名或删除。
           </span>
         </div>
 

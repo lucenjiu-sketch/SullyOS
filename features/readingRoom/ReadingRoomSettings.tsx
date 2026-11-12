@@ -500,7 +500,8 @@ const ReadingRoomSettings: React.FC<Props> = ({
       <p className="mt-6 flex gap-2 px-1 text-[10px] leading-relaxed text-stone-400">
         <Archive size={13} weight="bold" className="mt-0.5 shrink-0" />
         <span>
-          窗口和当前选择都存在这台设备上，和书一样不会进备份。
+          书、划线、窗口和讨论都会进备份（导出时选「文本」或「完整」）。
+          导入备份会<b>覆盖</b>这里现有的书和讨论。
           归档只是收起来，不会删掉里面的内容。
           「写进记忆」是另一件事：那段话会存进角色的长期记忆，撤销归档不会把它删掉。
         </span>

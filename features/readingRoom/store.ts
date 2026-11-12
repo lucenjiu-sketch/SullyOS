@@ -7,6 +7,7 @@ import {
   type ReadingDiscussionWindow,
   type ReadingHighlight,
   type ReadingProgress,
+  type ReadingRoomBackupData,
   type ReadingSelection,
 } from './types';
 
@@ -18,6 +19,10 @@ import {
  *
  * 第一期不接入备份导出（Settings → 导出）。清浏览器数据、换设备会丢，
  * 三期做完后再统一接 OSContext 的备份通道。
+ *
+ * **2026-11-12：已经接上了。** 见文件末尾的 `exportAll` / `importAll`，
+ * 以及 `utils/readingRoomBackup.ts`（校验层）和 OSContext 里那两处调用。
+ * 书的正文也进备份（久选的方案 A）。
  *
  * ## 版本历史
  *
@@ -338,6 +343,78 @@ export const ReadingRoomStore = {
     const transaction = db.transaction(STORE_SELECTION, 'readwrite');
     // 主键强制成固定值：多出第二行的话，「当前选择」就有两个答案了。
     transaction.objectStore(STORE_SELECTION).put({ ...selection, id: READING_SELECTION_ID });
+    await commitTransaction(transaction);
+  },
+
+  // ─── 备份用：整库读 / 整库覆盖 ───────────────────────────
+  //
+  // 上面那些方法都是按 id 或索引取的（界面只需要当前这本书、当前这个窗口）。
+  // 备份要的是**全表**，所以单独开两个方法，不要为了备份去改上面的签名。
+
+  /**
+   * 把整个共读室读成一个普通对象，交给备份通道。
+   *
+   * 包括书的正文。久选的就是这个（方案 A）：换设备以后书还在、接着读。
+   * 另一种做法是只备份划线不备份正文，但划线按「全文字符偏移」存，
+   * 重新导入的 TXT 必须和原来逐字节一致，否则划线会**静默错位**——
+   * 她半年后未必找得到当初那个文件，所以不走那条路。
+   */
+  exportAll: async (): Promise<ReadingRoomBackupData> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(
+      [STORE_BOOKS, STORE_CONTENTS, STORE_PROGRESS, STORE_HIGHLIGHTS, STORE_WINDOWS, STORE_MESSAGES, STORE_SELECTION],
+      'readonly',
+    );
+    const [books, contents, progress, highlights, windows, messages, selection] = await Promise.all([
+      requestResult(transaction.objectStore(STORE_BOOKS).getAll()) as Promise<ReadingBook[]>,
+      requestResult(transaction.objectStore(STORE_CONTENTS).getAll()) as Promise<ReadingBookContent[]>,
+      requestResult(transaction.objectStore(STORE_PROGRESS).getAll()) as Promise<ReadingProgress[]>,
+      requestResult(transaction.objectStore(STORE_HIGHLIGHTS).getAll()) as Promise<ReadingHighlight[]>,
+      requestResult(transaction.objectStore(STORE_WINDOWS).getAll()) as Promise<ReadingDiscussionWindow[]>,
+      requestResult(transaction.objectStore(STORE_MESSAGES).getAll()) as Promise<ReadingDiscussionMessage[]>,
+      requestResult(transaction.objectStore(STORE_SELECTION).get(READING_SELECTION_ID)) as Promise<ReadingSelection | undefined>,
+    ]);
+    return { books, contents, progress, highlights, windows, messages, selection: selection || undefined };
+  },
+
+  /**
+   * 用备份里的数据**覆盖**整个共读室。
+   *
+   * 覆盖式还原，和项目里别的数据一致：导入备份就是「回到那个时间点」。
+   * 所以先清空七张表再写入——合并式会让导入后出现一半旧书一半新书，
+   * 而用户根本分不清哪本是哪次的。
+   *
+   * **一个事务做完。** 中途失败的话 IndexedDB 整体回滚，
+   * 不会留下「书清掉了但新书没写进来」的空书架。
+   */
+  importAll: async (data: ReadingRoomBackupData): Promise<void> => {
+    const db = await openDatabase();
+    const transaction = db.transaction(
+      [STORE_BOOKS, STORE_CONTENTS, STORE_PROGRESS, STORE_HIGHLIGHTS, STORE_WINDOWS, STORE_MESSAGES, STORE_SELECTION],
+      'readwrite',
+    );
+    const books = transaction.objectStore(STORE_BOOKS);
+    const contents = transaction.objectStore(STORE_CONTENTS);
+    const progress = transaction.objectStore(STORE_PROGRESS);
+    const highlights = transaction.objectStore(STORE_HIGHLIGHTS);
+    const windows = transaction.objectStore(STORE_WINDOWS);
+    const messages = transaction.objectStore(STORE_MESSAGES);
+    const selection = transaction.objectStore(STORE_SELECTION);
+    books.clear();
+    contents.clear();
+    progress.clear();
+    highlights.clear();
+    windows.clear();
+    messages.clear();
+    selection.clear();
+    for (const row of data.books || []) books.put(row);
+    for (const row of data.contents || []) contents.put(row);
+    for (const row of data.progress || []) progress.put(row);
+    for (const row of data.highlights || []) highlights.put(row);
+    for (const row of data.windows || []) windows.put(row);
+    for (const row of data.messages || []) messages.put(row);
+    // 主键强制成固定值，理由同 saveSelection。
+    if (data.selection) selection.put({ ...data.selection, id: READING_SELECTION_ID });
     await commitTransaction(transaction);
   },
 };
