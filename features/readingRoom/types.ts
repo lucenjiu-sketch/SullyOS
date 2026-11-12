@@ -141,6 +141,13 @@ export interface ReadingDiscussionMessage {
   content: string;
   /** 这条消息引用的划线。闲聊消息没有这个字段。 */
   reference?: ReadingMessageReference;
+  /**
+   * 角色这一轮的思考链（心象）。只有开了思考链的角色才有。
+   *
+   * 和正文分开存：混进 `content` 的话，列表预览和下一轮发给模型的历史
+   * 都会把思考过程当成它说出口的话。
+   */
+  thinkingChain?: string;
   createdAt: number;
 }
 

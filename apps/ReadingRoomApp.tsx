@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { ArrowLeft, Books, Plus, Trash, WarningCircle, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
+import { DB } from '../utils/db';
+import type { Emoji, EmojiCategory } from '../types';
 import { ReadingRoomStore } from '../features/readingRoom/store';
 import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/parse';
 import { progressPercent } from '../features/readingRoom/paginate';
@@ -12,6 +14,8 @@ import {
   emptySelection,
   reconcileSelection,
 } from '../features/readingRoom/discussion';
+import { runReadingTurn } from '../features/readingRoom/engine';
+import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
@@ -63,7 +67,7 @@ const formatCharCount = (count: number): string => (
 );
 
 const ReadingRoomApp: React.FC = () => {
-  const { closeApp, addToast, showError, characters } = useOS();
+  const { closeApp, addToast, showError, characters, apiConfig, userProfile } = useOS();
 
   const [tab, setTab] = useState<ReadingRoomTab>('shelf');
   const [books, setBooks] = useState<ReadingBook[]>([]);
@@ -93,6 +97,25 @@ const ReadingRoomApp: React.FC = () => {
    */
   const [discussionMessages, setDiscussionMessages] = useState<ReadingDiscussionMessage[]>([]);
   const [discussionWindow, setDiscussionWindow] = useState<ReadingDiscussionWindow | null>(null);
+  /** 正在等角色回话。 */
+  const [discussionSending, setDiscussionSending] = useState(false);
+  /** 这一轮的流式增量。 */
+  const [discussionStreaming, setDiscussionStreaming] = useState('');
+  /** 上一轮失败的原因。**失败不删用户消息**，只挂这条提示。 */
+  const [discussionError, setDiscussionError] = useState<string | undefined>();
+  /** 表情包清单。共读室允许发表情（久定的），所以要自己读一份。 */
+  const [emojis, setEmojis] = useState<Emoji[]>([]);
+  const [emojiCategories, setEmojiCategories] = useState<EmojiCategory[]>([]);
+
+  /**
+   * 这一轮生成的中断器。
+   *
+   * 切窗口、关 App、点停止都靠它。**也是「上一个窗口的流式不写进另一个窗口」
+   * 的实现点**：切窗口时先 abort，正在飞的那轮就不会再落库。
+   */
+  const turnAbortRef = useRef<AbortController | null>(null);
+  /** 这一轮属于哪个窗口。回复到达时比对一次，不等就丢掉。 */
+  const turnWindowRef = useRef<string | null>(null);
 
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = Number(localStorage.getItem(FONT_SIZE_KEY));
@@ -372,9 +395,16 @@ const ReadingRoomApp: React.FC = () => {
    * **只读当前 windowId 的消息**，别的窗口一条都不混进来（store 用 by_window
    * 索引保证）。`cancelled` 那个闸是为了防止快速连切窗口时，先发出的那次
    * 慢请求后回来、把晚选的窗口历史盖掉。
+   *
+   * 切窗口时**先掐掉正在飞的那一轮**：否则上一个窗口的回复会落到这个窗口里。
    */
   useEffect(() => {
     const windowId = selection.windowId;
+    turnAbortRef.current?.abort();
+    turnAbortRef.current = null;
+    setDiscussionSending(false);
+    setDiscussionStreaming('');
+    setDiscussionError(undefined);
     if (!windowId) { setDiscussionMessages([]); setDiscussionWindow(null); return; }
     let cancelled = false;
     void (async () => {
@@ -393,34 +423,128 @@ const ReadingRoomApp: React.FC = () => {
     return () => { cancelled = true; };
   }, [selection.charId, selection.windowId]);
 
+  /** 表情包清单读一次。共读室允许发表情，不读的话模型会被告知「没有可用表情」。 */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [rows, cats] = await Promise.all([DB.getEmojis(), DB.getEmojiCategories()]);
+        if (cancelled) return;
+        setEmojis(rows);
+        setEmojiCategories(cats);
+      } catch (error) {
+        // 读不到表情不该挡住讨论，只是这一轮不告诉模型有哪些表情。
+        console.warn('[ReadingRoom] 表情清单没读出来', error);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  /** 关 App / 卸载时掐掉在飞的那一轮，别让它继续往已经没了的界面里写。 */
+  useEffect(() => () => { turnAbortRef.current?.abort(); }, []);
+
+  /** 存一条消息，顺带刷新窗口上的预览。窗口那份由调用方算好，store 一个事务写两张表。 */
+  const persistMessage = useCallback(async (message: ReadingDiscussionMessage) => {
+    const nextWindow = discussionWindow ? applyMessageToWindow(discussionWindow, message) : undefined;
+    await ReadingRoomStore.saveMessage(message, nextWindow);
+    if (nextWindow) setDiscussionWindow(nextWindow);
+  }, [discussionWindow]);
+
   /**
-   * 发一条讨论消息。
+   * 发一条讨论消息，然后等角色回话。
    *
-   * **这一包只落库，不调 API**（角色回复是下一包）。
+   * 顺序是刻意的：
+   * 1. **先存用户那条**。请求失败、她中途停掉、页面被回收——这条都还在。
+   *    久的要求：「请求失败时自己刚发的那条消息还在，不会被吞掉。」
+   * 2. 取这一轮的前后文（`buildHighlightContext`）。**只用于这一轮**，不进库。
+   * 3. 跑请求，流式增量进 `discussionStreaming`。
+   * 4. 成功才存角色那条。
    *
-   * 存进去的引用只有书名 / 章节 / 划线原文——划线前后那些原文属于请求
-   * 那一轮，不进库，所以这里不去取 `buildHighlightContext`。
-   *
-   * 本地先加（界面立刻看见自己说的话），写失败再撤回并提示；
-   * 不能让她看着一条其实没存上的消息。
+   * 中途失败不回滚第 1 步，只把原因挂到 `discussionError`。
    */
   const handleSendDiscussion = useCallback(async (
     text: string,
     reference?: ReadingMessageReference,
+    range?: { startOffset: number; endOffset: number },
   ) => {
     const windowId = selection.windowId;
     if (!windowId) { addToast?.('还没选讨论窗口'); return; }
-    const message = createDiscussionMessage({ windowId, role: 'user', content: text, reference });
-    setDiscussionMessages(previous => [...previous, message]);
+    const char = characters.find(item => item.id === selection.charId);
+    if (!char) { addToast?.('还没选共读对象'); return; }
+
+    setDiscussionError(undefined);
+    const userMessage = createDiscussionMessage({ windowId, role: 'user', content: text, reference });
+    // 历史快照在加这条之前取：当前这一轮单独传给模型，不能在历史里出现第二遍。
+    const history = discussionMessages;
+    setDiscussionMessages(previous => [...previous, userMessage]);
+
     try {
-      const nextWindow = discussionWindow ? applyMessageToWindow(discussionWindow, message) : undefined;
-      await ReadingRoomStore.saveMessage(message, nextWindow);
-      if (nextWindow) setDiscussionWindow(nextWindow);
+      await persistMessage(userMessage);
     } catch (error: any) {
-      setDiscussionMessages(previous => previous.filter(item => item.id !== message.id));
+      setDiscussionMessages(previous => previous.filter(item => item.id !== userMessage.id));
       showError?.('这条讨论没存上', error?.message || String(error));
+      return;
     }
-  }, [addToast, discussionWindow, selection.windowId, showError]);
+
+    // 前后文现取现用。拿不到就只发划线原文，不该因此整轮失败。
+    const excerpt = resolveTurnExcerpt(content || null, reference, range);
+
+    const controller = new AbortController();
+    turnAbortRef.current = controller;
+    turnWindowRef.current = windowId;
+    setDiscussionSending(true);
+    setDiscussionStreaming('');
+
+    try {
+      const result = await runReadingTurn({
+        globalApi: apiConfig,
+        char,
+        user: userProfile,
+        emojis,
+        categories: emojiCategories,
+        history,
+        text,
+        reference,
+        excerpt,
+        signal: controller.signal,
+        onDelta: full => {
+          // 窗口已经被切走了就别再往界面上写。
+          if (turnWindowRef.current !== windowId) return;
+          setDiscussionStreaming(full);
+        },
+      });
+      // 回复回来时她可能已经切到别的窗口了，这一轮作废。
+      if (turnWindowRef.current !== windowId || controller.signal.aborted) return;
+      const reply = createDiscussionMessage({
+        windowId,
+        role: 'assistant',
+        content: result.content,
+        thinkingChain: result.thinkingChain,
+      });
+      setDiscussionMessages(previous => [...previous, reply]);
+      await persistMessage(reply);
+    } catch (error: any) {
+      // 她自己点的停止不算错误，不弹提示。
+      const aborted = error?.name === 'AbortError' || controller.signal.aborted;
+      if (!aborted && turnWindowRef.current === windowId) {
+        setDiscussionError(error?.message || String(error));
+      }
+    } finally {
+      if (turnAbortRef.current === controller) {
+        turnAbortRef.current = null;
+        turnWindowRef.current = null;
+      }
+      setDiscussionSending(false);
+      setDiscussionStreaming('');
+    }
+  }, [
+    addToast, apiConfig, characters, content, discussionMessages, emojiCategories, emojis,
+    persistMessage, selection.charId, selection.windowId, showError, userProfile,
+  ]);
+
+  const handleStopDiscussion = useCallback(() => {
+    turnAbortRef.current?.abort();
+  }, []);
 
   const discussionChar = characters.find(char => char.id === selection.charId);
 
@@ -437,12 +561,17 @@ const ReadingRoomApp: React.FC = () => {
         discussionCharName={discussionChar?.name}
         discussionWindowName={discussionWindow?.name}
         discussionMessages={discussionMessages}
+        discussionSending={discussionSending}
+        discussionStreaming={discussionStreaming}
+        discussionError={discussionError}
         onChangeFontSize={setFontSize}
         onChangeFlipMode={setFlipMode}
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
         onCreateHighlight={range => { void handleCreateHighlight(range); }}
         onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
-        onSendDiscussion={(text, reference) => { void handleSendDiscussion(text, reference); }}
+        onSendDiscussion={(text, reference, range) => { void handleSendDiscussion(text, reference, range); }}
+        onStopDiscussion={handleStopDiscussion}
+        onDismissDiscussionError={() => setDiscussionError(undefined)}
         onExit={() => { setOpenBook(null); setContent(''); setHighlights([]); void refreshShelf(); }}
       />
     );

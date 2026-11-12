@@ -68,13 +68,30 @@ interface ReadingViewProps {
   discussionWindowName?: string;
   /** 当前窗口的讨论消息。由 App 负责读库，这里只显示。 */
   discussionMessages: ReadingDiscussionMessage[];
+  /** 正在等角色回话。 */
+  discussionSending: boolean;
+  /** 这一轮的流式增量。 */
+  discussionStreaming: string;
+  /** 上一轮失败的原因。 */
+  discussionError?: string;
   onChangeFontSize: (size: number) => void;
   onChangeFlipMode: (mode: ReadingFlipMode) => void;
   onOffsetChange: (offset: number) => void;
   onCreateHighlight: (range: { startOffset: number; endOffset: number; text: string; color: string }) => void;
   onDeleteHighlight: (highlightId: string) => void;
-  /** 发一条讨论消息。这一包只落库，不调 API。 */
-  onSendDiscussion: (text: string, reference?: ReadingMessageReference) => void;
+  /**
+   * 发一条讨论消息。
+   *
+   * `range` 是划线在全文里的位置，App 用它现取前后文（`buildHighlightContext`）。
+   * **前后文不经过这里也不进库**，只属于那一轮请求。
+   */
+  onSendDiscussion: (
+    text: string,
+    reference?: ReadingMessageReference,
+    range?: { startOffset: number; endOffset: number },
+  ) => void;
+  onStopDiscussion: () => void;
+  onDismissDiscussionError: () => void;
   onExit: () => void;
 }
 
@@ -126,12 +143,17 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   discussionCharName,
   discussionWindowName,
   discussionMessages,
+  discussionSending,
+  discussionStreaming,
+  discussionError,
   onChangeFontSize,
   onChangeFlipMode,
   onOffsetChange,
   onCreateHighlight,
   onDeleteHighlight,
   onSendDiscussion,
+  onStopDiscussion,
+  onDismissDiscussionError,
   onExit,
 }) => {
   /** 当前阅读位置（全文字符偏移）。所有视图状态都由它派生。 */
@@ -165,8 +187,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
    *
    * **放在阅读页而不是面板里**：面板关掉会卸载它自己的 state，
    * 而久要求「引用不能因为打开面板、切半屏全屏而丢失」。
+   *
+   * 连带记住划线的全文范围（`range`）：发送时 App 要用它现取前后文。
+   * **范围本身不进库**，存进消息里的引用只有书名 / 章节 / 划线原文。
    */
-  const [pendingQuote, setPendingQuote] = useState<ReadingMessageReference | undefined>();
+  const [pendingQuote, setPendingQuote] = useState<{
+    reference: ReadingMessageReference;
+    range: { startOffset: number; endOffset: number };
+  } | undefined>();
 
   /** 当前块的页起点列表。测量得出，字号或屏幕变化后重算。 */
   const [pageStarts, setPageStarts] = useState<number[]>([]);
@@ -418,11 +446,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       || '未分章';
     if (!openDiscussion()) return;
     setPendingQuote({
-      bookId: book.id,
-      bookTitle: book.title,
-      chapterTitle,
-      highlightId: highlight.id,
-      quote: highlightDisplayText(highlight.text),
+      reference: {
+        bookId: book.id,
+        bookTitle: book.title,
+        chapterTitle,
+        highlightId: highlight.id,
+        quote: highlightDisplayText(highlight.text),
+      },
+      range: { startOffset: highlight.startOffset, endOffset: highlight.endOffset },
     });
     setActiveHighlight(null);
     setHighlightListOpen(false);
@@ -1071,9 +1102,14 @@ const ReadingView: React.FC<ReadingViewProps> = ({
           charName={discussionCharName!}
           windowName={discussionWindowName!}
           messages={discussionMessages}
-          pendingQuote={pendingQuote}
+          pendingQuote={pendingQuote?.reference}
+          sending={discussionSending}
+          streamingText={discussionStreaming}
+          errorText={discussionError}
           onClearQuote={() => setPendingQuote(undefined)}
-          onSend={onSendDiscussion}
+          onSend={(text, reference) => onSendDiscussion(text, reference, pendingQuote?.range)}
+          onStop={onStopDiscussion}
+          onDismissError={onDismissDiscussionError}
           onClose={() => setDiscussionOpen(false)}
         />
       )}

@@ -141,6 +141,7 @@ export function createDiscussionMessage(input: {
   role: ReadingDiscussionMessage['role'];
   content: string;
   reference?: ReadingMessageReference;
+  thinkingChain?: string;
   now?: number;
 }): ReadingDiscussionMessage {
   const createdAt = input.now ?? Date.now();
@@ -150,6 +151,7 @@ export function createDiscussionMessage(input: {
     role: input.role,
     content: input.content,
     ...(input.reference ? { reference: input.reference } : {}),
+    ...(input.thinkingChain ? { thinkingChain: input.thinkingChain } : {}),
     createdAt,
   };
 }
