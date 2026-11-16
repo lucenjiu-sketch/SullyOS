@@ -30,7 +30,7 @@ const routeMinimaxByRegion: ProxyOptions['configure'] = (proxy) => {
 //
 // 显示规则：
 //   - 默认在 main / master 上隐藏（视为正式发布），其他分支显示
-//   - CI detached HEAD 优先读 GITHUB_REF_NAME / VERCEL_GIT_COMMIT_REF / CF_PAGES_BRANCH / BRANCH(Netlify)
+//   - CI detached HEAD 优先读 GITHUB_REF_NAME / VERCEL_GIT_COMMIT_REF / CF_PAGES_BRANCH / WORKERS_CI_BRANCH / BRANCH(Netlify)
 //   - VITE_HIDE_BUILD_BADGE=1 强制隐藏（覆盖默认）
 //   - VITE_SHOW_BUILD_BADGE=1 强制显示（在 master 本地调试用）
 const RELEASE_BRANCHES = new Set(['main', 'master']);
@@ -45,6 +45,10 @@ function readBranch(): string {
   if (process.env.GITHUB_REF_NAME) return process.env.GITHUB_REF_NAME;
   if (process.env.VERCEL_GIT_COMMIT_REF) return process.env.VERCEL_GIT_COMMIT_REF;
   if (process.env.CF_PAGES_BRANCH) return process.env.CF_PAGES_BRANCH;
+  // Cloudflare Workers Builds 用 WORKERS_CI_BRANCH，和 Pages 的 CF_PAGES_BRANCH 不同名。
+  // 不读它的话会落到下面的 git 命令，而 CI 是 detached HEAD，返回字面量 'HEAD'，
+  // 于是 master 部署也被当成非发布分支，右下角冒出构建水印。
+  if (process.env.WORKERS_CI_BRANCH) return process.env.WORKERS_CI_BRANCH;
   if (process.env.BRANCH) return process.env.BRANCH;
   try {
     return execSync('git rev-parse --abbrev-ref HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
@@ -56,6 +60,7 @@ function readCommit(): string {
   if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA.slice(0, 7);
   if (process.env.VERCEL_GIT_COMMIT_SHA) return process.env.VERCEL_GIT_COMMIT_SHA.slice(0, 7);
   if (process.env.CF_PAGES_COMMIT_SHA) return process.env.CF_PAGES_COMMIT_SHA.slice(0, 7);
+  if (process.env.WORKERS_CI_COMMIT_SHA) return process.env.WORKERS_CI_COMMIT_SHA.slice(0, 7);
   if (process.env.COMMIT_REF) return process.env.COMMIT_REF.slice(0, 7);
   try {
     return execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
