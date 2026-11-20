@@ -23,6 +23,27 @@ export const READING_HIGHLIGHT_COLORS = [
 
 export const DEFAULT_HIGHLIGHT_COLOR = READING_HIGHLIGHT_COLORS[0];
 
+/**
+ * 颜色的人话名字，给选色按钮做 aria-label。
+ * 顺序必须和 READING_HIGHLIGHT_COLORS 一一对应。
+ */
+export const READING_HIGHLIGHT_COLOR_NAMES = ['黄色', '绿色', '蓝色', '粉色'] as const;
+
+/**
+ * 把存下来的颜色归一成「一定能用」的值。
+ *
+ * 为什么需要它：备份校验层对 `color` 是 `str(row.color) || ''`（容错，不丢整条），
+ * 所以库里可能存在空串；更早的数据也可能带着已经不在色板里的值。
+ * 直接把空串塞进 `backgroundColor` 会让那条划线在屏幕上**什么都不显示**，
+ * 而用户以为自己划过了。兜底成默认黄比显示不出来好。
+ */
+export const resolveHighlightColor = (color: string | undefined): string => {
+  if (!color) return DEFAULT_HIGHLIGHT_COLOR;
+  return (READING_HIGHLIGHT_COLORS as readonly string[]).includes(color)
+    ? color
+    : DEFAULT_HIGHLIGHT_COLOR;
+};
+
 /** 一条划线最多能覆盖多少字符。防止误操作把半本书划成一条。 */
 export const MAX_HIGHLIGHT_CHARS = 5_000;
 

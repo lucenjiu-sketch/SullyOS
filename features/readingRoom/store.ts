@@ -195,6 +195,42 @@ export const ReadingRoomStore = {
     await commitTransaction(transaction);
   },
 
+  /**
+   * 一次删掉多本书。
+   *
+   * 和逐本调 `deleteBook` 的区别：**整批在同一个事务里**。
+   * 逐本删会出现「删到第三本时失败，前两本已经没了」这种半成品状态，
+   * 而用户那边只看到一句报错，根本不知道删掉了几本。
+   *
+   * 连带删掉的东西和 `deleteBook` 完全一致（正文 / 进度 / 那些书的划线），
+   * 讨论消息同样不动——窗口不属于书。
+   */
+  deleteBooks: async (bookIds: string[]): Promise<void> => {
+    if (bookIds.length === 0) return;
+    const db = await openDatabase();
+    const transaction = db.transaction(
+      [STORE_BOOKS, STORE_CONTENTS, STORE_PROGRESS, STORE_HIGHLIGHTS],
+      'readwrite',
+    );
+    const books = transaction.objectStore(STORE_BOOKS);
+    const contents = transaction.objectStore(STORE_CONTENTS);
+    const progress = transaction.objectStore(STORE_PROGRESS);
+    const highlightIndex = transaction.objectStore(STORE_HIGHLIGHTS).index(INDEX_HIGHLIGHT_BOOK);
+    for (const bookId of bookIds) {
+      books.delete(bookId);
+      contents.delete(bookId);
+      progress.delete(bookId);
+      const cursorRequest = highlightIndex.openCursor(IDBKeyRange.only(bookId));
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor) return;
+        cursor.delete();
+        cursor.continue();
+      };
+    }
+    await commitTransaction(transaction);
+  },
+
   getProgress: async (bookId: string): Promise<ReadingProgress | null> => {
     const db = await openDatabase();
     const transaction = db.transaction(STORE_PROGRESS, 'readonly');

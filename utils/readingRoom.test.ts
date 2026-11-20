@@ -18,6 +18,7 @@ import {
 import {
   coverPalette,
   coverTitleLines,
+  resolveCoverUrl,
   READING_PARAGRAPH_GAP_EM,
   splitParagraphs,
   verticalChapterRange,
@@ -239,6 +240,39 @@ describe('共读室 · 排版与书封', () => {
   it('过长的书名在封面上截断', () => {
     expect(coverTitleLines('短名')).toBe('短名');
     expect(coverTitleLines('一二三四五六七八九十', 4)).toBe('一二三四…');
+  });
+
+  /*
+   * 自定义封面的地址会直接进 <img src>（渲染）和备份文件（纯文本、可被编辑）。
+   * 所以协议白名单挡在这个纯函数里，渲染处和导入校验共用同一条判断。
+   */
+  it('封面只认 data:image、http、https 三种，其余一律退回默认封面', () => {
+    expect(resolveCoverUrl('https://img.example.com/a.jpg')).toBe('https://img.example.com/a.jpg');
+    expect(resolveCoverUrl('http://img.example.com/a.jpg')).toBe('http://img.example.com/a.jpg');
+    expect(resolveCoverUrl('data:image/jpeg;base64,AAAA')).toBe('data:image/jpeg;base64,AAAA');
+    // 大小写不该影响判断（有的图床返回的链接是大写协议）。
+    expect(resolveCoverUrl('HTTPS://img.example.com/a.jpg')).toBe('HTTPS://img.example.com/a.jpg');
+  });
+
+  it('封面地址挡掉伪协议和非图片的 data URL', () => {
+    expect(resolveCoverUrl('javascript:alert(1)')).toBeNull();
+    expect(resolveCoverUrl('  javascript:alert(1)  ')).toBeNull();
+    expect(resolveCoverUrl('JavaScript:alert(1)')).toBeNull();
+    // data: 但不是图片——塞进 img 不会显示，塞进别处就不好说了。
+    expect(resolveCoverUrl('data:text/html,<script>1</script>')).toBeNull();
+    expect(resolveCoverUrl('file:///etc/passwd')).toBeNull();
+  });
+
+  it('封面地址为空、缺失、非字符串时返回 null（走默认渐变封面）', () => {
+    expect(resolveCoverUrl(undefined)).toBeNull();
+    expect(resolveCoverUrl(null)).toBeNull();
+    expect(resolveCoverUrl('')).toBeNull();
+    expect(resolveCoverUrl('   ')).toBeNull();
+    expect(resolveCoverUrl(42 as unknown as string)).toBeNull();
+  });
+
+  it('封面地址两端的空白会被去掉（粘贴链接常带尾随空格）', () => {
+    expect(resolveCoverUrl('  https://img.example.com/a.jpg \n')).toBe('https://img.example.com/a.jpg');
   });
 
   it('竖滑渲染窗口夹在章节范围内，不越界', () => {

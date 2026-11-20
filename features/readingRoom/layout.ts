@@ -71,6 +71,26 @@ export const coverTitleLines = (title: string, maxChars = 18): string => (
 );
 
 /**
+ * 把存下来的封面地址归一成「能安全塞进 CSS / img」的值，不能用就返回 null。
+ *
+ * **只认三种**：`data:image/`、`https://`、`http://`。
+ * 其它一律丢掉——重点是挡住 `javascript:` 这类伪协议。备份文件是纯文本，
+ * 被人编辑过（或者从别处拿来一份）就可能带进任意字符串，而这个值
+ * 会直接进 `backgroundImage: url(...)`。挡在这里比挡在渲染处可靠。
+ *
+ * 返回 null 的书走默认渐变封面，不报错——看到渐变色比看到一个破图框好。
+ */
+export const resolveCoverUrl = (coverUrl: string | undefined | null): string | null => {
+  if (typeof coverUrl !== 'string') return null;
+  const value = coverUrl.trim();
+  if (!value) return null;
+  const lower = value.toLowerCase();
+  if (lower.startsWith('data:image/')) return value;
+  if (lower.startsWith('https://') || lower.startsWith('http://')) return value;
+  return null;
+};
+
+/**
  * 段落之间的间距（em，相对当前字号）。
  *
  * 原文的空行**不照排**：一个空行等于一整行高度，有的 TXT 段间有两三个空行，

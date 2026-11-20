@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
-import { ArrowLeft, Books, Plus, Trash, WarningCircle, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
+import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal, ImageSquare, Check } from '@phosphor-icons/react';
 import { DB } from '../utils/db';
+import { processImage } from '../utils/file';
 import type { Emoji, EmojiCategory } from '../types';
 import { ReadingRoomStore } from '../features/readingRoom/store';
 import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/parse';
 import { progressPercent } from '../features/readingRoom/paginate';
-import { coverPalette, coverTitleLines } from '../features/readingRoom/layout';
+import { coverPalette, coverTitleLines, resolveCoverUrl } from '../features/readingRoom/layout';
 import { sortHighlightsByPosition } from '../features/readingRoom/highlight';
 import {
   applyMessageToWindow,
@@ -25,6 +26,17 @@ import {
 } from '../features/readingRoom/archive';
 import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
+import { resolveReadingThemeMode, type ReadingThemeMode } from '../features/readingRoom/theme';
+import {
+  describeDeleteConfirm,
+  EMPTY_SHELF_SELECTION,
+  isAllSelected,
+  reconcileShelfSelection,
+  selectedBooks,
+  toggleSelectAll,
+  toggleShelfSelection,
+  type ShelfSelection,
+} from '../features/readingRoom/shelf';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
   readingRoomId,
@@ -54,9 +66,11 @@ import { trackEvent } from '../utils/analytics';
 
 const FONT_SIZE_KEY = 'sullyos_reading_font_size';
 const FLIP_MODE_KEY = 'sullyos_reading_flip_mode';
-
+/** 日间 / 夜间。手动切、跨书记住，不跟系统深色模式（久定的）。 */
+const THEME_MODE_KEY = 'sullyos_reading_theme_mode';
 /** 共读室里的两个页面。阅读页不在这套里，它由 `openBook` 单独接管整屏。 */
 type ReadingRoomTab = 'shelf' | 'settings';
+
 
 const ENCODING_LABELS: Record<ReadingEncoding, string> = {
   'utf-8': 'UTF-8',
@@ -132,8 +146,20 @@ const ReadingRoomApp: React.FC = () => {
   const [flipMode, setFlipMode] = useState<ReadingFlipMode>(() => (
     localStorage.getItem(FLIP_MODE_KEY) === 'vertical' ? 'vertical' : 'horizontal'
   ));
+  const [themeMode, setThemeMode] = useState<ReadingThemeMode>(() => (
+    resolveReadingThemeMode(localStorage.getItem(THEME_MODE_KEY))
+  ));
+  /** 书架管理模式（勾选 + 批量删）。退出时清掉勾选。 */
+  const [managing, setManaging] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<ShelfSelection>(EMPTY_SHELF_SELECTION);
+  /** 正在删这一批。按着按钮不放会重复触发，用它挡掉。 */
+  const [deletingBatch, setDeletingBatch] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 换封面用的相册选择框。和导入 TXT 那个分开，accept 不一样。 */
+  const coverInputRef = useRef<HTMLInputElement>(null);
+  /** 正在给哪本书换封面。选完图片要用它定位，所以不能跟着面板一起关掉。 */
+  const coverTargetRef = useRef<ReadingBook | null>(null);
   /** 上次导入的原始字节，供「换个编码重读」复用，不必让用户再选一次文件。 */
   const lastBufferRef = useRef<{ bookId: string; fileName: string; buffer: ArrayBuffer } | null>(null);
   const longPressRef = useRef<{ timer: number | null; fired: boolean }>({ timer: null, fired: false });
@@ -185,6 +211,7 @@ const ReadingRoomApp: React.FC = () => {
 
   useEffect(() => { localStorage.setItem(FONT_SIZE_KEY, String(fontSize)); }, [fontSize]);
   useEffect(() => { localStorage.setItem(FLIP_MODE_KEY, flipMode); }, [flipMode]);
+  useEffect(() => { localStorage.setItem(THEME_MODE_KEY, themeMode); }, [themeMode]);
   useEffect(() => () => {
     if (longPressRef.current.timer !== null) window.clearTimeout(longPressRef.current.timer);
   }, []);
@@ -314,6 +341,102 @@ const ReadingRoomApp: React.FC = () => {
     }
   }, [refreshShelf, showError]);
 
+  /**
+   * 换封面：把 coverUrl 写进书记录。传 undefined 就是恢复默认渐变封面。
+   *
+   * 不做乐观更新——封面是一张图，等落库再刷新书架只差一瞬，
+   * 而「界面换了但其实没存上」在这里特别容易让人以为成功了。
+   */
+  const applyCover = useCallback(async (book: ReadingBook, coverUrl: string | undefined) => {
+    try {
+      await ReadingRoomStore.saveBook({ ...book, coverUrl, updatedAt: Date.now() });
+      await refreshShelf();
+      addToast(coverUrl ? '封面换好了' : '已恢复默认封面', 'success');
+    } catch (error: any) {
+      showError?.('封面没保存上', error?.message || String(error));
+    }
+  }, [addToast, refreshShelf, showError]);
+
+  /** 从相册选一张图当封面。压到 400px 宽再存，和项目里换头像同一条路。 */
+  const handlePickCover = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // 先清空 input：同一张图连选两次也要能触发 onChange。
+    event.target.value = '';
+    const book = coverTargetRef.current;
+    coverTargetRef.current = null;
+    if (!file || !book) return;
+    try {
+      /*
+       * 400px 宽足够：书架一行三本，单个封面在手机上也就 120px 左右。
+       * 压缩这一步不能省——原图动辄两三 MB，而封面是 data URL 整条进备份的。
+       */
+      const dataUrl = await processImage(file, { maxWidth: 400, quality: 0.85 });
+      await applyCover(book, dataUrl);
+    } catch (error: any) {
+      showError?.('这张图没能用作封面', error?.message || String(error));
+    }
+  }, [applyCover, showError]);
+
+  /** 粘一个图床链接当封面。只认 http(s)，其它协议挡在 resolveCoverUrl 里。 */
+  const handlePasteCover = useCallback(async (book: ReadingBook) => {
+    const input = window.prompt('粘贴图片链接（http 或 https 开头）', book.coverUrl?.startsWith('http') ? book.coverUrl : '');
+    if (input === null) return;
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    if (!resolveCoverUrl(trimmed)) {
+      addToast('这个链接用不了，要以 http:// 或 https:// 开头', 'error');
+      return;
+    }
+    setActionBook(null);
+    await applyCover(book, trimmed);
+  }, [addToast, applyCover]);
+
+  /*
+   * 书架变了就把勾选对一遍（换封面会刷新书架、恢复备份会整批换掉）。
+   * `reconcileShelfSelection` 没变化时返回同一个集合，所以这个 effect
+   * 不会自己把自己再触发一次。
+   */
+  useEffect(() => {
+    setSelectedIds(previous => reconcileShelfSelection(previous, books));
+  }, [books]);
+
+  /** 退出管理模式。勾选一并清掉——下次进来重新选，不留上次的残留。 */
+  const exitManaging = useCallback(() => {
+    setManaging(false);
+    setSelectedIds(EMPTY_SHELF_SELECTION);
+  }, []);
+
+  /**
+   * 批量删除。
+   *
+   * 两件刻意的事：
+   * - 确认框把书名列出来（`describeDeleteConfirm`）。勾错了只看数字看不出来，
+   *   而删完没有退路。
+   * - 整批走 `deleteBooks` 一个事务，不是循环单删——避免「删到一半失败，
+   *   前几本已经没了」这种她无法判断的状态。
+   */
+  const handleDeleteSelected = useCallback(async () => {
+    const targets = selectedBooks(selectedIds, books);
+    if (targets.length === 0 || deletingBatch) return;
+    if (!window.confirm(describeDeleteConfirm(targets))) return;
+    setDeletingBatch(true);
+    try {
+      await ReadingRoomStore.deleteBooks(targets.map(book => book.id));
+      // 正在读的那本被删了就退回书架，否则会停在一本已经不存在的书上。
+      if (openBook && targets.some(book => book.id === openBook.id)) {
+        setOpenBook(null);
+        setContent('');
+      }
+      await refreshShelf();
+      exitManaging();
+      addToast(`已删掉 ${targets.length} 本`, 'success');
+    } catch (error: any) {
+      showError?.('这批书没能删掉', error?.message || String(error));
+    } finally {
+      setDeletingBatch(false);
+    }
+  }, [addToast, books, deletingBatch, exitManaging, openBook, refreshShelf, selectedIds, showError]);
+
   /** 翻页时就落库，不等退出——手机上随时可能被系统回收。 */
   const persistProgress = useCallback((bookId: string, offset: number) => {
     void ReadingRoomStore.saveProgress({ bookId, offset, updatedAt: Date.now() })
@@ -356,6 +479,28 @@ const ReadingRoomApp: React.FC = () => {
     } catch (error: any) {
       if (removed) setHighlights(previous => sortHighlightsByPosition([...previous, removed]));
       showError?.('划线没删掉', error?.message || String(error));
+    }
+  }, [highlights, showError]);
+
+  /**
+   * 改一条划线的颜色。
+   *
+   * 和新建划线同一个套路：本地先变色，写失败再退回原来的颜色。
+   * `saveHighlight` 是整条 put，所以要把原记录完整带上，只换 color。
+   */
+  const handleRecolorHighlight = useCallback(async (highlightId: string, color: string) => {
+    const target = highlights.find(item => item.id === highlightId);
+    if (!target || target.color === color) return;
+    const previousColor = target.color;
+    const updated: ReadingHighlight = { ...target, color, updatedAt: Date.now() };
+    setHighlights(previous => previous.map(item => (item.id === highlightId ? updated : item)));
+    try {
+      await ReadingRoomStore.saveHighlight(updated);
+    } catch (error: any) {
+      setHighlights(previous => previous.map(item => (
+        item.id === highlightId ? { ...item, color: previousColor } : item
+      )));
+      showError?.('划线颜色没保存上', error?.message || String(error));
     }
   }, [highlights, showError]);
 
@@ -716,6 +861,7 @@ const ReadingRoomApp: React.FC = () => {
         initialOffset={initialOffset}
         fontSize={fontSize}
         flipMode={flipMode}
+        themeMode={themeMode}
         highlights={highlights}
         discussionCharName={discussionChar?.name}
         discussionWindowName={discussionWindow?.name}
@@ -725,9 +871,11 @@ const ReadingRoomApp: React.FC = () => {
         discussionError={discussionError}
         onChangeFontSize={setFontSize}
         onChangeFlipMode={setFlipMode}
+        onChangeThemeMode={setThemeMode}
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
         onCreateHighlight={range => { void handleCreateHighlight(range); }}
         onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
+        onRecolorHighlight={(id, color) => { void handleRecolorHighlight(id, color); }}
         onSendDiscussion={(text, reference, range) => { void handleSendDiscussion(text, reference, range); }}
         onStopDiscussion={handleStopDiscussion}
         onDismissDiscussionError={() => setDiscussionError(undefined)}
@@ -762,13 +910,29 @@ const ReadingRoomApp: React.FC = () => {
             <ArrowLeft size={20} weight="bold" className="text-stone-600" />
           </button>
           <h1 className="text-[17px] font-bold">{tab === 'settings' ? '共读设置' : '共读室'}</h1>
-          <span className="ml-auto text-[11px] text-stone-400">
-            {tab === 'shelf' && books.length > 0 ? `${books.length} 本` : ''}
-          </span>
+          {/*
+            管理按钮只在书架页出现，而且书架为空时不显示——
+            没有书可管，摆一个点了没反应的按钮只会让人疑惑。
+          */}
+          {tab === 'shelf' && books.length > 0 ? (
+            <button
+              onClick={() => (managing ? exitManaging() : setManaging(true))}
+              className={`ml-auto rounded-lg px-2.5 py-1.5 text-xs transition active:scale-95 ${
+                managing ? 'bg-stone-700 text-stone-50' : 'bg-stone-200/80 text-stone-600'
+              }`}
+            >
+              {managing ? '完成' : '管理'}
+            </button>
+          ) : (
+            <span className="ml-auto text-[11px] text-stone-400">
+              {tab === 'shelf' && books.length > 0 ? `${books.length} 本` : ''}
+            </span>
+          )}
         </div>
       </div>
 
       <input ref={fileInputRef} type="file" accept=".txt,text/plain" className="hidden" onChange={handlePickFile} />
+      <input ref={coverInputRef} type="file" accept="image/*" className="hidden" onChange={event => { void handlePickCover(event); }} />
 
       {tab === 'settings' ? (
         <ReadingRoomSettings
@@ -784,14 +948,6 @@ const ReadingRoomApp: React.FC = () => {
         />
       ) : (
       <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 20 }}>
-        <div className="mb-4 flex gap-2 rounded-xl bg-stone-700 px-3 py-2.5 text-[11px] leading-relaxed text-stone-100">
-          <WarningCircle size={15} weight="fill" className="mt-0.5 shrink-0 text-amber-300" />
-          <span>
-            书、划线和讨论都会进备份（导出时选「文本」或「完整」）。
-            <b>但清浏览器数据会丢</b>，记得隔一段时间导出一次。长按书封可以改名或删除。
-          </span>
-        </div>
-
         {loading ? (
           <p className="py-20 text-center text-sm text-stone-400">正在翻开书架…</p>
         ) : (
@@ -800,30 +956,82 @@ const ReadingRoomApp: React.FC = () => {
               const offset = progressByBook[book.id] || 0;
               const percent = progressPercent(book, offset);
               const palette = coverPalette(book.id);
+              const cover = resolveCoverUrl(book.coverUrl);
+              const checked = selectedIds.has(book.id);
               return (
                 <div key={book.id} className="flex flex-col">
                   <button
-                    onPointerDown={() => startLongPress(book)}
-                    onPointerUp={cancelLongPress}
-                    onPointerLeave={cancelLongPress}
-                    onPointerCancel={cancelLongPress}
-                    onClick={() => { if (!longPressRef.current.fired) void handleOpenBook(book); }}
-                    onContextMenu={event => { event.preventDefault(); setActionBook(book); }}
+                    /*
+                      管理模式下不挂长按（长按菜单里有删除，和批量删会打架），
+                      点一下就是勾选/取消。正常模式照旧：点开书、长按出菜单。
+                    */
+                    onPointerDown={managing ? undefined : () => startLongPress(book)}
+                    onPointerUp={managing ? undefined : cancelLongPress}
+                    onPointerLeave={managing ? undefined : cancelLongPress}
+                    onPointerCancel={managing ? undefined : cancelLongPress}
+                    onClick={() => {
+                      if (managing) {
+                        setSelectedIds(previous => toggleShelfSelection(previous, book.id));
+                        return;
+                      }
+                      if (!longPressRef.current.fired) void handleOpenBook(book);
+                    }}
+                    onContextMenu={event => {
+                      event.preventDefault();
+                      if (!managing) setActionBook(book);
+                    }}
+                    aria-pressed={managing ? checked : undefined}
                     className="relative aspect-[3/4] w-full overflow-hidden rounded-[3px] text-left shadow-[2px_3px_8px_rgba(0,0,0,0.18)] transition-transform active:scale-[0.97]"
                     style={{ background: `linear-gradient(145deg, ${palette.from}, ${palette.to})` }}
                   >
+                    {/*
+                      自定义封面铺在渐变色上面。
+                      用 img 而不是 backgroundImage：img 有 onError，
+                      图床链接哪天挂了可以把它摘掉、露出下面的渐变封面，
+                      不会留一个破图框（久知道这条退路，图挂了只会看到颜色变回去）。
+                    */}
+                    {cover && (
+                      <img
+                        src={cover}
+                        alt=""
+                        className="absolute inset-0 h-full w-full object-cover"
+                        onError={event => { event.currentTarget.style.display = 'none'; }}
+                      />
+                    )}
                     {/* 书脊：靠左一条更深的窄边，让纯色块看起来像一本书。 */}
                     <span className="absolute inset-y-0 left-0 w-[6px] bg-black/15" />
-                    <span
-                      className="absolute inset-x-0 top-0 px-2 pb-2 pt-3 text-[11px] font-semibold leading-snug"
-                      style={{ color: palette.ink, wordBreak: 'break-word' }}
-                    >
-                      {coverTitleLines(book.title)}
-                    </span>
+                    {/*
+                      有自定义封面时不再压书名——图上多半自带书名，
+                      再叠一层会糊成一团。书名在封面下面那行照样显示。
+                    */}
+                    {!cover && (
+                      <span
+                        className="absolute inset-x-0 top-0 px-2 pb-2 pt-3 text-[11px] font-semibold leading-snug"
+                        style={{ color: palette.ink, wordBreak: 'break-word' }}
+                      >
+                        {coverTitleLines(book.title)}
+                      </span>
+                    )}
                     {percent > 0 && (
                       <span className="absolute bottom-1 right-1 rounded-sm bg-black/35 px-1 py-[1px] text-[9px] tabular-nums text-white/95">
                         {percent === 100 ? '读完' : `${percent}%`}
                       </span>
+                    )}
+                    {/*
+                      管理模式的勾选圈。选中时整张封面压一层暗罩，
+                      让「选了哪几本」在一眼之内看得出来，而不是去数小圆圈。
+                    */}
+                    {managing && (
+                      <>
+                        {checked && <span className="absolute inset-0 bg-black/35" />}
+                        <span
+                          className={`absolute left-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full border-2 ${
+                            checked ? 'border-white bg-orange-600' : 'border-white/90 bg-black/25'
+                          }`}
+                        >
+                          {checked && <Check size={12} weight="bold" className="text-white" />}
+                        </span>
+                      </>
                     )}
                   </button>
                   <p className="mt-1.5 line-clamp-2 text-[11px] leading-snug text-stone-600">{book.title}</p>
@@ -831,7 +1039,11 @@ const ReadingRoomApp: React.FC = () => {
               );
             })}
 
-            {/* 最后一格：虚线空框 + 加号，点它上传 TXT。 */}
+            {/*
+              最后一格：虚线空框 + 加号，点它上传 TXT。
+              管理模式下藏掉——那一格不是书，摆在勾选网格里只会被误点。
+            */}
+            {!managing && (
             <div className="flex flex-col">
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -845,6 +1057,7 @@ const ReadingRoomApp: React.FC = () => {
               </button>
               <p className="mt-1.5 text-[11px] text-stone-400">上传 TXT</p>
             </div>
+            )}
           </div>
         )}
 
@@ -860,11 +1073,34 @@ const ReadingRoomApp: React.FC = () => {
       {/*
         底栏：书架 / 设置。
         **只在这两页出现，阅读页没有它**——阅读页整屏接管，多一条带子会挤掉正文行数。
+
+        管理模式下换成「全选 / 已选 N 本 / 删除」那条操作栏：
+        两条带子叠着会把书架挤掉一行，而管理模式下也不该去切设置页。
       */}
       <div
         className="shrink-0 border-t border-stone-200/80 bg-[#f7f4ee]"
         style={{ paddingBottom: 'var(--safe-bottom)' }}
       >
+        {managing && tab === 'shelf' ? (
+          <div className="flex items-center gap-2 px-3 py-2.5">
+            <button
+              onClick={() => setSelectedIds(previous => toggleSelectAll(previous, books))}
+              className="rounded-lg bg-stone-200/80 px-3 py-2 text-xs text-stone-700 transition active:scale-95"
+            >
+              {isAllSelected(selectedIds, books) ? '取消全选' : '全选'}
+            </button>
+            <span className="text-[11px] tabular-nums text-stone-500">
+              已选 {selectedIds.size} 本
+            </span>
+            <button
+              onClick={() => { void handleDeleteSelected(); }}
+              disabled={selectedIds.size === 0 || deletingBatch}
+              className="ml-auto rounded-lg bg-red-600 px-3.5 py-2 text-xs font-semibold text-red-50 transition active:scale-95 disabled:bg-stone-200 disabled:text-stone-400"
+            >
+              {deletingBatch ? '正在删…' : '删除'}
+            </button>
+          </div>
+        ) : (
         <div className="flex">
           {([
             ['shelf', '书架', BookOpen],
@@ -884,6 +1120,7 @@ const ReadingRoomApp: React.FC = () => {
             );
           })}
         </div>
+        )}
       </div>
 
       {/* ——— 长按书封的操作面板 ——— */}
@@ -905,12 +1142,45 @@ const ReadingRoomApp: React.FC = () => {
                 {ENCODING_LABELS[actionBook.encoding]}
               </p>
             </div>
-            <button
+<button
               onClick={() => handleRename(actionBook)}
               className="flex w-full items-center gap-2 px-4 py-3.5 text-left text-sm active:bg-stone-100"
             >
               <PencilSimple size={16} weight="bold" className="text-stone-500" /> 改书名
             </button>
+
+            {/* ——— 封面 ——— */}
+            <div className="flex items-center gap-2 border-t border-stone-200 px-4 pb-1 pt-3 text-[11px] text-stone-400">
+              <ImageSquare size={14} weight="bold" /> 封面
+            </div>
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
+              <button
+                onClick={() => {
+                  // 先记下是哪本书，再打开相册——面板会被系统的选图界面盖掉。
+                  coverTargetRef.current = actionBook;
+                  setActionBook(null);
+                  coverInputRef.current?.click();
+                }}
+                className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+              >
+                从相册选
+              </button>
+              <button
+                onClick={() => { void handlePasteCover(actionBook); }}
+                className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+              >
+                粘图片链接
+              </button>
+              {resolveCoverUrl(actionBook.coverUrl) && (
+                <button
+                  onClick={() => { setActionBook(null); void applyCover(actionBook, undefined); }}
+                  className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+                >
+                  恢复默认
+                </button>
+              )}
+            </div>
+
             <div className="flex items-center gap-2 border-t border-stone-200 px-4 pb-1 pt-3 text-[11px] text-stone-400">
               <TextAa size={14} weight="bold" /> 文字乱码时换个编码重读
             </div>

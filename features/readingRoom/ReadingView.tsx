@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash, CaretLeft, CaretRight, ChatCircleDots } from '@phosphor-icons/react';
+import { ArrowLeft, List, Minus, Plus, ArrowsHorizontal, ArrowsVertical, Highlighter, Check, Trash, CaretLeft, CaretRight, ChatCircleDots, Sun, Moon } from '@phosphor-icons/react';
 import { chapterIndexAtOffset, pageAtOffset, progressPercent } from './paginate';
 import { paginateBlock, pageIndexForOffset, READING_BLOCK_SIZE } from './measure';
 import { READING_PARAGRAPH_GAP_EM, splitParagraphs, verticalChapterRange } from './layout';
@@ -12,12 +12,16 @@ import {
   isHighlightTruncated,
   normalizeHighlightRange,
   nudgeOffset,
+  READING_HIGHLIGHT_COLOR_NAMES,
+  READING_HIGHLIGHT_COLORS,
+  resolveHighlightColor,
   splitByHighlights,
   type HighlightSelectionState,
 } from './highlight';
 // sentenceRangeAt 没在这里用：它是「偏移解析完全不准」时的退路
 // （长按直接选整句），留在 caret.ts 里备用，有测试锁着。
 import { OFFSET_ATTRIBUTE, resolveOffsetAtPoint } from './caret';
+import { resolveReadingTheme, type ReadingThemeMode } from './theme';
 import ReadingDiscussionPanel from './ReadingDiscussionPanel';
 import type { ReadingBook, ReadingDiscussionMessage, ReadingHighlight, ReadingMessageReference } from './types';
 import type { Emoji, EmojiCategory } from '../../types';
@@ -51,7 +55,18 @@ import type { Emoji, EmojiCategory } from '../../types';
 
 export type ReadingFlipMode = 'horizontal' | 'vertical';
 
-export const READING_FONT_SIZES = [16, 18, 20, 22, 24, 26] as const;
+/**
+ * 可选字号（px）。
+ *
+ * 小字区间按 1px 细分、大字按 2px 跳：13–18 这一段每一级的观感差别很明显，
+ * 到 20 以上再 1px 一级就几乎看不出来，档位只会变多不会变好用。
+ *
+ * **最小值从 16 下探到 13** 是久的要求（16 对她还是偏大）。
+ * 改这个数组要注意：`ReadingRoomApp` 里读 localStorage 时会校验存的值
+ * 在不在这个数组里，不在就退回默认 20。所以**只加不删**是安全的，
+ * 删掉某一档会让正用着那一档的人被重置回 20。
+ */
+export const READING_FONT_SIZES = [13, 14, 15, 16, 17, 18, 20, 22, 24, 26] as const;
 
 interface ReadingViewProps {
   book: ReadingBook;
@@ -59,6 +74,8 @@ interface ReadingViewProps {
   initialOffset: number;
   fontSize: number;
   flipMode: ReadingFlipMode;
+  /** 日间 / 夜间。手动切，不跟系统深色模式（久定的）。 */
+  themeMode: ReadingThemeMode;
   /** 这本书已有的划线。全局共用，不分角色。 */
   highlights: ReadingHighlight[];
   /**
@@ -77,9 +94,12 @@ interface ReadingViewProps {
   discussionError?: string;
   onChangeFontSize: (size: number) => void;
   onChangeFlipMode: (mode: ReadingFlipMode) => void;
+  onChangeThemeMode: (mode: ReadingThemeMode) => void;
   onOffsetChange: (offset: number) => void;
   onCreateHighlight: (range: { startOffset: number; endOffset: number; text: string; color: string }) => void;
   onDeleteHighlight: (highlightId: string) => void;
+  /** 改一条已有划线的颜色。不用删了重划（久的要求）。 */
+  onRecolorHighlight: (highlightId: string, color: string) => void;
   /**
    * 发一条讨论消息。
    *
@@ -145,6 +165,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   initialOffset,
   fontSize,
   flipMode,
+  themeMode,
   highlights,
   discussionCharName,
   discussionWindowName,
@@ -154,9 +175,11 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   discussionError,
   onChangeFontSize,
   onChangeFlipMode,
+  onChangeThemeMode,
   onOffsetChange,
   onCreateHighlight,
   onDeleteHighlight,
+  onRecolorHighlight,
   onSendDiscussion,
   onStopDiscussion,
   onDismissDiscussionError,
@@ -186,6 +209,13 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const [pendingOffset, setPendingOffset] = useState<number | null>(null);
   /** 点到已有划线时弹出的操作条。 */
   const [activeHighlight, setActiveHighlight] = useState<ReadingHighlight | null>(null);
+  /**
+   * 下一条划线用哪个颜色。
+   *
+   * 记在组件里而不是每次重置成黄色：连着划几条通常是同一个用途
+   * （比如都在标人物），每条都要重选一次颜色很烦。
+   */
+  const [draftColor, setDraftColor] = useState<string>(DEFAULT_HIGHLIGHT_COLOR);
   /** 一次性的提示文字（划线存好了、范围太长被截断之类）。 */
   const [toast, setToast] = useState('');
 
@@ -414,11 +444,20 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     onCreateHighlight({
       ...range,
       text: content.slice(range.startOffset, range.endOffset),
-      color: DEFAULT_HIGHLIGHT_COLOR,
+      color: draftColor,
     });
     showToast(isHighlightTruncated(first, second) ? '划线太长，已截断保存' : '划线已保存');
     cancelSelection();
-  }, [cancelSelection, content, onCreateHighlight, pendingOffset, selection.startOffset, showToast]);
+  }, [cancelSelection, content, draftColor, onCreateHighlight, pendingOffset, selection.startOffset, showToast]);
+
+  /** 改一条已有划线的颜色。顺手把下一条的默认色也跟上，符合「我现在想用这个色」。 */
+  const recolorActiveHighlight = useCallback((color: string) => {
+    if (!activeHighlight) return;
+    setDraftColor(color);
+    // 面板上那条也要立刻变色，否则看着像没生效（库里的更新由 App 负责）。
+    setActiveHighlight(previous => (previous ? { ...previous, color } : previous));
+    onRecolorHighlight(activeHighlight.id, color);
+  }, [activeHighlight, onRecolorHighlight]);
 
   const removeActiveHighlight = useCallback(() => {
     if (!activeHighlight) return;
@@ -603,6 +642,9 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     }
   }, [onOffsetChange]);
 
+/** 当前主题的那一套颜色。所有写死的色值都从这里取。 */
+  const theme = resolveReadingTheme(themeMode);
+
   const bumpFontSize = useCallback((step: 1 | -1) => {
     const index = READING_FONT_SIZES.indexOf(fontSize as typeof READING_FONT_SIZES[number]);
     const base = index < 0 ? 1 : index;
@@ -623,12 +665,41 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     fontSize,
     lineHeight: 1.9,
     fontFamily: '"Noto Serif SC", Georgia, serif',
-    color: '#3a3027',
+    color: theme.bodyInk,
     wordBreak: 'break-word',
   };
 
   const atBookStart = chapterIndex === 0 && pageIndex === 0 && block.start === 0;
   const atBookEnd = pageEnd >= content.length;
+
+  /**
+   * 一排可选的划线颜色。创建划线和改色两处共用。
+   *
+   * 选中态用深色描边表示，不用对勾——色点只有 22px，塞个勾会把颜色本身挡掉。
+   */
+  const renderColorRow = (current: string, onPick: (color: string) => void): React.ReactNode => (
+    <div className="flex items-center gap-2">
+      <span className="text-[11px]" style={{ color: theme.sheetMutedInk }}>颜色</span>
+      {READING_HIGHLIGHT_COLORS.map((color, index) => {
+        const selected = resolveHighlightColor(current) === color;
+        return (
+          <button
+            key={color}
+            onClick={() => onPick(color)}
+            aria-label={READING_HIGHLIGHT_COLOR_NAMES[index]}
+            aria-pressed={selected}
+            className="h-[22px] w-[22px] rounded-full transition active:scale-90"
+            style={{
+              backgroundColor: color,
+              boxShadow: selected
+                ? `0 0 0 2px ${theme.sheetBg}, 0 0 0 4px ${theme.swatchRingActive}`
+                : `0 0 0 1px ${theme.swatchRing}`,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
 
   /**
    * 段落正文：按划线切成若干片段，划过的加底色。
@@ -667,7 +738,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     /** 在一个片段里把落点/起点那一个字再切出来单独上色。 */
     const renderSegment = (segment: { text: string; offset: number; highlight: ReadingHighlight | null }): React.ReactNode => {
       const base: React.CSSProperties = segment.highlight
-        ? { backgroundColor: segment.highlight.color, borderRadius: 2 }
+        ? { backgroundColor: resolveHighlightColor(segment.highlight.color), borderRadius: 2 }
         : {};
       const mark = marks.find(item => item.offset >= segment.offset && item.offset < segment.offset + segment.text.length);
       if (!mark) {
@@ -675,8 +746,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       }
       const cut = mark.offset - segment.offset;
       const markStyle: React.CSSProperties = mark.kind === 'caret'
-        ? { backgroundColor: '#C2410C', color: '#FFF7ED', borderRadius: 2 }
-        : { backgroundColor: 'rgba(194, 65, 12, 0.3)', borderRadius: 2 };
+        ? { backgroundColor: theme.caretBg, color: theme.caretInk, borderRadius: 2 }
+        : { backgroundColor: theme.anchorBg, borderRadius: 2 };
       return (
         <span key={segment.offset} style={base}>
           {segment.text.slice(0, cut)}
@@ -689,7 +760,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     return segments.map(renderSegment);
   };
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#f6ecd9]">
+    <div className="relative h-full w-full overflow-hidden" style={{ backgroundColor: theme.pageBg }}>
       {/*
         三层竖向结构：顶带 / 正文 / 底带。
         正文那一层是 flex-1 且自身没有纵向 padding，所以它的 clientHeight
@@ -701,8 +772,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       >
         {/* 顶带：固定高度，放很淡的章节名。正文不会再压到它上面。 */}
         <div
-          className="pointer-events-none flex shrink-0 items-end text-[11px] text-stone-400/90"
-          style={{ height: TOP_BAND_HEIGHT, paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING }}
+          className="pointer-events-none flex shrink-0 items-end text-[11px]"
+          style={{ height: TOP_BAND_HEIGHT, paddingLeft: SIDE_PADDING, paddingRight: SIDE_PADDING, color: theme.bandInk }}
         >
           <span className="line-clamp-1">
             第{chapterIndex + 1}章{chapter?.title && chapter.title !== '全文' ? ` ${chapter.title}` : ''}
@@ -785,7 +856,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       />
 {/* 第一次进来时提示手势，之后不再显示（只在最开头那一页出现）。 */}
       {atBookStart && !menuOpen && selection.mode === 'idle' && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+7px)] text-center text-[10px] text-stone-400/80">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+7px)] text-center text-[10px]" style={{ color: theme.bandInk }}>
           {flipMode === 'horizontal' ? '左右滑翻页 · 向下滑唤出菜单 · 长按划线' : '上下滑阅读 · 向右滑唤出菜单 · 长按划线'}
         </div>
       )}
@@ -798,7 +869,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       {!discussionOpen && !menuOpen && selection.mode === 'idle' && pendingOffset === null && (
         <button
           onClick={() => openDiscussion()}
-          className="absolute right-0 top-1/2 z-30 -translate-y-1/2 rounded-l-xl bg-stone-700/35 py-3 pl-1.5 pr-1 text-stone-50 backdrop-blur-sm transition active:scale-95"
+          className="absolute right-0 top-1/2 z-30 -translate-y-1/2 rounded-l-xl py-3 pl-1.5 pr-1 backdrop-blur-sm transition active:scale-95"
+          style={{ backgroundColor: theme.handleBg, color: theme.handleInk }}
           aria-label="打开讨论"
         >
           <ChatCircleDots size={15} weight="bold" />
@@ -816,16 +888,17 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       */}
       {selection.mode === 'selecting-end' && (
         <div
-          className="absolute inset-x-0 top-0 z-20 flex items-center gap-2 bg-amber-200/95 px-3 shadow-sm"
-          style={{ paddingTop: 'calc(var(--safe-top) + 6px)', paddingBottom: 6 }}
+          className="absolute inset-x-0 top-0 z-20 flex items-center gap-2 px-3 shadow-sm"
+          style={{ paddingTop: 'calc(var(--safe-top) + 6px)', paddingBottom: 6, backgroundColor: theme.noticeBg }}
         >
-          <Highlighter size={14} weight="bold" className="shrink-0 text-amber-800" />
-          <span className="flex-1 text-[11px] leading-tight text-amber-900">
+          <Highlighter size={14} weight="bold" className="shrink-0" style={{ color: theme.noticeIconInk }} />
+          <span className="flex-1 text-[11px] leading-tight" style={{ color: theme.noticeInk }}>
             起点已定，可以翻页 · 再长按一次定终点
           </span>
           <button
             onClick={cancelSelection}
-            className="shrink-0 rounded-lg bg-amber-800/85 px-2.5 py-1 text-[11px] text-amber-50 transition active:scale-95"
+            className="shrink-0 rounded-lg px-2.5 py-1 text-[11px] transition active:scale-95"
+            style={{ backgroundColor: theme.noticeButtonBg, color: theme.noticeButtonInk }}
           >
             取消
           </button>
@@ -836,18 +909,21 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       {pendingOffset !== null && caretPreview && (
         <div className="absolute inset-0 z-30" onClick={() => setPendingOffset(null)}>
           <div
-            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
             onClick={event => event.stopPropagation()}
-            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)' }}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)', backgroundColor: theme.sheetBg }}
           >
-            <p className="mb-1.5 text-[11px] text-stone-500">
+            <p className="mb-1.5 text-[11px]" style={{ color: theme.sheetMutedInk }}>
               {selection.mode === 'selecting-end' ? '终点落在这个字上（这个字会划进去）' : '起点落在这个字上'}
             </p>
 
             {/* 落点那个字反白显示，和正文里的高亮是同一个位置。 */}
-            <p className="mb-3 break-all text-[13px] leading-relaxed text-stone-500">
+            <p className="mb-3 break-all text-[13px] leading-relaxed" style={{ color: theme.sheetMutedInk }}>
               {caretPreview.before}
-              <span className="rounded bg-orange-700 px-0.5 font-semibold text-orange-50">
+              <span
+                className="rounded px-0.5 font-semibold"
+                style={{ backgroundColor: theme.caretBg, color: theme.caretInk }}
+              >
                 {caretPreview.charAt || '␀'}
               </span>
               {caretPreview.after}
@@ -855,43 +931,51 @@ const ReadingView: React.FC<ReadingViewProps> = ({
 
             {/* 微调：系统性偏移靠重选解决不了，只能一格一格挪。 */}
             <div className="mb-3 flex items-center gap-2">
-              <span className="text-[11px] text-stone-500">微调</span>
+              <span className="text-[11px]" style={{ color: theme.sheetMutedInk }}>微调</span>
               <button
                 onClick={() => nudgePending(-1)}
-                className="rounded-lg bg-stone-200/80 px-3 py-1.5 transition active:scale-90"
+                className="rounded-lg px-3 py-1.5 transition active:scale-90"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
                 aria-label="往前挪一个字"
               >
                 <CaretLeft size={14} weight="bold" />
               </button>
               <button
                 onClick={() => nudgePending(1)}
-                className="rounded-lg bg-stone-200/80 px-3 py-1.5 transition active:scale-90"
+                className="rounded-lg px-3 py-1.5 transition active:scale-90"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
                 aria-label="往后挪一个字"
               >
                 <CaretRight size={14} weight="bold" />
               </button>
-              <span className="ml-auto text-[10px] text-stone-400">选不准就取消重按</span>
+              <span className="ml-auto text-[10px]" style={{ color: theme.sheetFaintInk }}>选不准就取消重按</span>
             </div>
+
+            {/* 选色：起点那一步也显示，让用户划之前就知道会是什么颜色。 */}
+            <div className="mb-3">{renderColorRow(draftColor, setDraftColor)}</div>
 
             <div className="flex gap-2">
               {selection.mode === 'selecting-end' ? (
                 <button
                   onClick={confirmEnd}
-                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-amber-700 py-2.5 text-sm text-amber-50 transition active:scale-95"
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2.5 text-sm transition active:scale-95"
+                  style={{ backgroundColor: theme.confirmBg, color: theme.confirmInk }}
                 >
                   <Check size={16} weight="bold" /> 完成划线
                 </button>
               ) : (
                 <button
                   onClick={confirmStart}
-                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-sm text-stone-50 transition active:scale-95"
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2.5 text-sm transition active:scale-95"
+                  style={{ backgroundColor: theme.primaryBg, color: theme.primaryInk }}
                 >
                   <Highlighter size={16} weight="bold" /> 从这里划
                 </button>
               )}
               <button
                 onClick={() => { setPendingOffset(null); if (selection.mode === 'selecting-end') cancelSelection(); }}
-                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
+                className="rounded-xl px-4 py-2.5 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 取消
               </button>
@@ -904,18 +988,21 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       {activeHighlight && (
         <div className="absolute inset-0 z-30" onClick={() => setActiveHighlight(null)}>
           <div
-            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl px-4 pt-4 shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
             onClick={event => event.stopPropagation()}
-            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)' }}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 14px)', backgroundColor: theme.sheetBg }}
           >
-            <p className="mb-1 text-[11px] text-stone-500">这条划线</p>
-            <p className="mb-3 line-clamp-3 text-[13px] leading-relaxed text-stone-700">
+            <p className="mb-1 text-[11px]" style={{ color: theme.sheetMutedInk }}>这条划线</p>
+            <p className="mb-3 line-clamp-3 text-[13px] leading-relaxed" style={{ color: theme.sheetInk }}>
               {highlightSummary(activeHighlight.text, 120)}
             </p>
+            {/* 改色：点一下立刻生效并落库，不用删了重划。 */}
+            <div className="mb-3">{renderColorRow(activeHighlight.color, recolorActiveHighlight)}</div>
             {/* 问角色排在最前面：这是划线之后最常做的事。 */}
             <button
               onClick={() => askAboutHighlight(activeHighlight)}
-              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-sm text-stone-50 transition active:scale-95"
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl py-2.5 text-sm transition active:scale-95"
+              style={{ backgroundColor: theme.primaryBg, color: theme.primaryInk }}
             >
               <ChatCircleDots size={16} weight="bold" />
               {discussionCharName ? `问${discussionCharName}` : '问角色'}
@@ -923,13 +1010,15 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             <div className="flex gap-2">
               <button
                 onClick={removeActiveHighlight}
-                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-red-100 py-2.5 text-sm text-red-700 transition active:scale-95"
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2.5 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.dangerBg, color: theme.dangerInk }}
               >
                 <Trash size={16} weight="bold" /> 删除划线
               </button>
               <button
                 onClick={() => setActiveHighlight(null)}
-                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-sm transition active:scale-95"
+                className="rounded-xl px-4 py-2.5 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 关闭
               </button>
@@ -941,7 +1030,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
       {/* 一次性提示。放在底部中间，不挡正文。 */}
       {toast && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 z-40 flex justify-center pb-[calc(var(--safe-bottom)+34px)]">
-          <span className="rounded-full bg-stone-800/85 px-3.5 py-1.5 text-[11px] text-stone-50 shadow-lg">
+          <span className="rounded-full px-3.5 py-1.5 text-[11px] shadow-lg" style={{ backgroundColor: theme.toastBg, color: theme.toastInk }}>
             {toast}
           </span>
         </div>
@@ -954,74 +1043,121 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         <div className="absolute inset-0 z-30" onClick={() => setMenuOpen(false)}>
           <div className="absolute inset-0 bg-black/25" />
           <div
-            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl shadow-[0_-8px_30px_rgba(0,0,0,0.18)]"
             onClick={event => event.stopPropagation()}
-            style={{ paddingBottom: 'calc(var(--safe-bottom) + 12px)' }}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 12px)', backgroundColor: theme.sheetBg }}
           >
             <div className="flex items-center gap-3 px-4 pt-4">
               <button
                 onClick={onExit}
-                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
+                className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 <ArrowLeft size={16} weight="bold" /> 书架
               </button>
               <button
                 onClick={() => { setMenuOpen(false); setChaptersOpen(true); }}
-                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
+                className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 <List size={16} weight="bold" /> 目录
               </button>
               <button
                 onClick={() => { setMenuOpen(false); setHighlightListOpen(true); }}
-                className="flex items-center gap-1.5 rounded-xl bg-stone-200/80 px-3 py-2 text-sm transition active:scale-95"
+                className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 <Highlighter size={16} weight="bold" /> 划线
                 {highlights.length > 0 && (
-                  <span className="tabular-nums text-[11px] text-stone-500">{highlights.length}</span>
+                  <span className="tabular-nums text-[11px]" style={{ color: theme.sheetMutedInk }}>{highlights.length}</span>
                 )}
               </button>
-              <span className="ml-auto text-xs tabular-nums text-stone-400">{percent}%</span>
+              <span className="ml-auto text-xs tabular-nums" style={{ color: theme.sheetFaintInk }}>{percent}%</span>
             </div>
 
-            <div className="mt-4 flex items-center gap-3 px-4">
-              <span className="w-10 text-xs text-stone-500">字号</span>
-              <button
-                onClick={() => bumpFontSize(-1)}
-                disabled={fontSize <= READING_FONT_SIZES[0]}
-                className="rounded-lg bg-stone-200/80 p-2 transition active:scale-90 disabled:opacity-35"
-                aria-label="缩小字号"
-              >
-                <Minus size={16} weight="bold" />
-              </button>
-              <span className="w-8 text-center text-sm tabular-nums">{fontSize}</span>
-              <button
-                onClick={() => bumpFontSize(1)}
-                disabled={fontSize >= READING_FONT_SIZES[READING_FONT_SIZES.length - 1]}
-                className="rounded-lg bg-stone-200/80 p-2 transition active:scale-90 disabled:opacity-35"
-                aria-label="放大字号"
-              >
-                <Plus size={16} weight="bold" />
-              </button>
+            {/*
+              字号：A- / 当前值 / A+ 三格并成一条，和截图里那种分段控件一致。
+              保留 A- / A+ 的点按方式（久要求的），没有改成拖动滑块——
+              滑块在这个弹层里只有一行高，手指盖住就看不到当前值了。
+            */}
+            <div className="mt-4 px-4">
+              <div className="flex overflow-hidden rounded-2xl" style={{ backgroundColor: theme.chipBg }}>
+                <button
+                  onClick={() => bumpFontSize(-1)}
+                  disabled={fontSize <= READING_FONT_SIZES[0]}
+                  className="flex flex-1 items-center justify-center py-3 transition active:scale-95 disabled:opacity-30"
+                  style={{ color: theme.chipInk }}
+                  aria-label="缩小字号"
+                >
+                  <span className="text-[15px] font-semibold">A</span>
+                  <Minus size={11} weight="bold" className="-mt-1.5" />
+                </button>
+                <span
+                  className="flex w-16 items-center justify-center border-x text-sm tabular-nums"
+                  style={{ borderColor: theme.divider, color: theme.chipInk }}
+                >
+                  {fontSize}
+                </span>
+                <button
+                  onClick={() => bumpFontSize(1)}
+                  disabled={fontSize >= READING_FONT_SIZES[READING_FONT_SIZES.length - 1]}
+                  className="flex flex-1 items-center justify-center py-3 transition active:scale-95 disabled:opacity-30"
+                  style={{ color: theme.chipInk }}
+                  aria-label="放大字号"
+                >
+                  <span className="text-[15px] font-semibold">A</span>
+                  <Plus size={11} weight="bold" className="-mt-1.5" />
+                </button>
+              </div>
             </div>
 
-            <div className="mt-4 flex items-center gap-3 px-4 pb-4">
-              <span className="w-10 shrink-0 text-xs text-stone-500">翻页</span>
+            {/* 日间 / 夜间。手动切，不跟系统深色模式（久定的）。 */}
+            <div className="mt-2.5 flex gap-2 px-4">
+              {([
+                ['day', '日间', Sun],
+                ['night', '夜间', Moon],
+              ] as const).map(([mode, label, Icon]) => {
+                const active = themeMode === mode;
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => onChangeThemeMode(mode)}
+                    aria-pressed={active}
+                    className="flex flex-1 items-center justify-center gap-1.5 rounded-2xl py-2.5 text-sm transition active:scale-95"
+                    style={active
+                      ? { backgroundColor: theme.primaryBg, color: theme.primaryInk }
+                      : { backgroundColor: theme.chipBg, color: theme.sheetMutedInk }}
+                  >
+                    <Icon size={15} weight={active ? 'fill' : 'regular'} /> {label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="mt-2.5 flex items-center gap-3 px-4 pb-4">
+              <span className="w-10 shrink-0 text-xs" style={{ color: theme.sheetMutedInk }}>翻页</span>
               <div className="flex flex-1 gap-2">
                 <button
                   onClick={() => onChangeFlipMode('horizontal')}
-                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm transition active:scale-95 ${flipMode === 'horizontal' ? 'bg-stone-700 text-stone-50' : 'bg-stone-200/80'}`}
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm transition active:scale-95"
+                  style={flipMode === 'horizontal'
+                    ? { backgroundColor: theme.primaryBg, color: theme.primaryInk }
+                    : { backgroundColor: theme.chipBg, color: theme.chipInk }}
                 >
                   <ArrowsHorizontal size={16} weight="bold" /> 左右滑
                 </button>
                 <button
                   onClick={() => onChangeFlipMode('vertical')}
-                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm transition active:scale-95 ${flipMode === 'vertical' ? 'bg-stone-700 text-stone-50' : 'bg-stone-200/80'}`}
+                  className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm transition active:scale-95"
+                  style={flipMode === 'vertical'
+                    ? { backgroundColor: theme.primaryBg, color: theme.primaryInk }
+                    : { backgroundColor: theme.chipBg, color: theme.chipInk }}
                 >
                   <ArrowsVertical size={16} weight="bold" /> 上下滑
                 </button>
               </div>
             </div>
-            <p className="px-4 pb-1 text-[10px] leading-relaxed text-stone-400">
+            <p className="px-4 pb-1 text-[10px] leading-relaxed" style={{ color: theme.sheetFaintInk }}>
               {flipMode === 'horizontal' ? '左右滑翻页，向下滑唤出这个菜单' : '上下滑阅读，向右滑唤出这个菜单'}
             </p>
           </div>
@@ -1033,13 +1169,13 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         <div className="absolute inset-0 z-40 flex" onClick={() => setChaptersOpen(false)}>
           <div className="absolute inset-0 bg-black/40" />
           <div
-            className="relative ml-auto flex h-full w-[80%] max-w-sm flex-col bg-[#fbf6ec] shadow-2xl"
+            className="relative ml-auto flex h-full w-[80%] max-w-sm flex-col shadow-2xl"
             onClick={event => event.stopPropagation()}
-            style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)' }}
+            style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)', backgroundColor: theme.sheetBg }}
           >
-            <div className="border-b border-stone-300 px-4 py-3">
-              <p className="truncate text-sm font-semibold">{book.title}</p>
-              <p className="text-[11px] text-stone-500">
+            <div className="border-b px-4 py-3" style={{ borderColor: theme.divider }}>
+              <p className="truncate text-sm font-semibold" style={{ color: theme.sheetInk }}>{book.title}</p>
+              <p className="text-[11px]" style={{ color: theme.sheetMutedInk }}>
                 {book.chaptersDetected ? `${book.chapters.length} 章 · ${percent}%` : '这本 TXT 没识别出章节'}
               </p>
             </div>
@@ -1048,7 +1184,12 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                 <button
                   key={`${item.start}_${index}`}
                   onClick={() => goToOffset(item.start)}
-                  className={`w-full border-b border-stone-200/70 px-4 py-3 text-left text-sm active:bg-stone-200/60 ${index === chapterIndex ? 'bg-stone-200/80 font-semibold' : ''}`}
+                  className={`w-full border-b px-4 py-3 text-left text-sm ${index === chapterIndex ? 'font-semibold' : ''}`}
+                  style={{
+                    borderColor: theme.dividerSoft,
+                    color: theme.sheetInk,
+                    backgroundColor: index === chapterIndex ? theme.rowCurrentBg : 'transparent',
+                  }}
                 >
                   <span className="line-clamp-1">{item.title}</span>
                 </button>
@@ -1063,51 +1204,60 @@ const ReadingView: React.FC<ReadingViewProps> = ({
         <div className="absolute inset-0 z-40 flex" onClick={() => setHighlightListOpen(false)}>
           <div className="absolute inset-0 bg-black/40" />
           <div
-            className="relative ml-auto flex h-full w-[86%] max-w-sm flex-col bg-[#fbf6ec] shadow-2xl"
+            className="relative ml-auto flex h-full w-[86%] max-w-sm flex-col shadow-2xl"
             onClick={event => event.stopPropagation()}
-            style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)' }}
+            style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)', backgroundColor: theme.sheetBg }}
           >
-            <div className="border-b border-stone-300 px-4 py-3">
-              <p className="truncate text-sm font-semibold">我的划线</p>
-              <p className="text-[11px] text-stone-500">
+            <div className="border-b px-4 py-3" style={{ borderColor: theme.divider }}>
+              <p className="truncate text-sm font-semibold" style={{ color: theme.sheetInk }}>我的划线</p>
+              <p className="text-[11px]" style={{ color: theme.sheetMutedInk }}>
                 {highlights.length > 0 ? `${highlights.length} 条 · 按书里的顺序排` : '还没有划线'}
               </p>
             </div>
             <div className="flex-1 overflow-y-auto no-scrollbar">
               {highlights.length === 0 ? (
-                <p className="px-4 py-6 text-[12px] leading-relaxed text-stone-500">
+                <p className="px-4 py-6 text-[12px] leading-relaxed" style={{ color: theme.sheetMutedInk }}>
                   在正文上长按，选「从这里划」，翻页后再长按一次定终点。
                   划线可以跨页，中间隔多少页都算同一条。
                 </p>
               ) : highlights.map(item => (
-                <div key={item.id} className="border-b border-stone-200/70 px-4 py-3">
+                <div key={item.id} className="border-b px-4 py-3" style={{ borderColor: theme.dividerSoft }}>
                   <button
                     onClick={() => { setHighlightListOpen(false); commitOffset(item.startOffset); }}
                     className="w-full text-left"
                   >
                     <span
                       className="mb-1 inline-block h-1.5 w-7 rounded-full"
-                      style={{ backgroundColor: item.color }}
+                      style={{ backgroundColor: resolveHighlightColor(item.color) }}
                     />
-                    <p className="line-clamp-3 text-[13px] leading-relaxed text-stone-700">
+                    <p className="line-clamp-3 text-[13px] leading-relaxed" style={{ color: theme.sheetInk }}>
                       {highlightSummary(item.text, 120)}
                     </p>
-                    <p className="mt-1 text-[10px] text-stone-400">
+                    <p className="mt-1 text-[10px]" style={{ color: theme.sheetFaintInk }}>
                       第{chapterIndexAtOffset(book.chapters, item.startOffset) + 1}章 ·
                       {' '}{item.endOffset - item.startOffset} 字
                     </p>
                   </button>
+                  {/* 在列表里也能改色：翻回正文找那一条太费事。 */}
+                  <div className="mt-2">
+                    {renderColorRow(item.color, color => {
+                      setDraftColor(color);
+                      onRecolorHighlight(item.id, color);
+                    })}
+                  </div>
                   <div className="mt-2 flex items-center gap-3">
                     <button
                       onClick={() => askAboutHighlight(item)}
-                      className="flex items-center gap-1 text-[11px] text-stone-600 transition active:scale-95"
+                      className="flex items-center gap-1 text-[11px] transition active:scale-95"
+                      style={{ color: theme.sheetMutedInk }}
                     >
                       <ChatCircleDots size={12} weight="bold" />
                       {discussionCharName ? `问${discussionCharName}` : '问角色'}
                     </button>
                     <button
                       onClick={() => { onDeleteHighlight(item.id); showToast('划线已删除'); }}
-                      className="ml-auto flex items-center gap-1 text-[11px] text-red-600/90 transition active:scale-95"
+                      className="ml-auto flex items-center gap-1 text-[11px] transition active:scale-95"
+                      style={{ color: theme.dangerInk }}
                     >
                       <Trash size={12} weight="bold" /> 删除
                     </button>
@@ -1121,7 +1271,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
 
       {/* 读到最后一页时给个收尾提示，免得以为是卡住了。 */}
       {atBookEnd && !menuOpen && selection.mode === 'idle' && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px] text-stone-400/80">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 pb-[calc(var(--safe-bottom)+14px)] text-center text-[10px]" style={{ color: theme.bandInk }}>
           已经是最后一页了
         </div>
       )}
@@ -1136,6 +1286,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
           open={discussionOpen}
           charName={discussionCharName!}
           windowName={discussionWindowName!}
+          theme={theme}
           messages={discussionMessages}
           pendingQuote={pendingQuote?.reference}
           sending={discussionSending}
