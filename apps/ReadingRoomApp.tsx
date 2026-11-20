@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
-import { ArrowLeft, Books, Plus, Trash, WarningCircle, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
+import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
 import { DB } from '../utils/db';
 import type { Emoji, EmojiCategory } from '../types';
 import { ReadingRoomStore } from '../features/readingRoom/store';
@@ -356,6 +356,28 @@ const ReadingRoomApp: React.FC = () => {
     } catch (error: any) {
       if (removed) setHighlights(previous => sortHighlightsByPosition([...previous, removed]));
       showError?.('划线没删掉', error?.message || String(error));
+    }
+  }, [highlights, showError]);
+
+  /**
+   * 改一条划线的颜色。
+   *
+   * 和新建划线同一个套路：本地先变色，写失败再退回原来的颜色。
+   * `saveHighlight` 是整条 put，所以要把原记录完整带上，只换 color。
+   */
+  const handleRecolorHighlight = useCallback(async (highlightId: string, color: string) => {
+    const target = highlights.find(item => item.id === highlightId);
+    if (!target || target.color === color) return;
+    const previousColor = target.color;
+    const updated: ReadingHighlight = { ...target, color, updatedAt: Date.now() };
+    setHighlights(previous => previous.map(item => (item.id === highlightId ? updated : item)));
+    try {
+      await ReadingRoomStore.saveHighlight(updated);
+    } catch (error: any) {
+      setHighlights(previous => previous.map(item => (
+        item.id === highlightId ? { ...item, color: previousColor } : item
+      )));
+      showError?.('划线颜色没保存上', error?.message || String(error));
     }
   }, [highlights, showError]);
 
@@ -728,6 +750,7 @@ const ReadingRoomApp: React.FC = () => {
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
         onCreateHighlight={range => { void handleCreateHighlight(range); }}
         onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
+        onRecolorHighlight={(id, color) => { void handleRecolorHighlight(id, color); }}
         onSendDiscussion={(text, reference, range) => { void handleSendDiscussion(text, reference, range); }}
         onStopDiscussion={handleStopDiscussion}
         onDismissDiscussionError={() => setDiscussionError(undefined)}
@@ -784,14 +807,6 @@ const ReadingRoomApp: React.FC = () => {
         />
       ) : (
       <div className="flex-1 overflow-y-auto no-scrollbar px-4" style={{ paddingBottom: 20 }}>
-        <div className="mb-4 flex gap-2 rounded-xl bg-stone-700 px-3 py-2.5 text-[11px] leading-relaxed text-stone-100">
-          <WarningCircle size={15} weight="fill" className="mt-0.5 shrink-0 text-amber-300" />
-          <span>
-            书、划线和讨论都会进备份（导出时选「文本」或「完整」）。
-            <b>但清浏览器数据会丢</b>，记得隔一段时间导出一次。长按书封可以改名或删除。
-          </span>
-        </div>
-
         {loading ? (
           <p className="py-20 text-center text-sm text-stone-400">正在翻开书架…</p>
         ) : (

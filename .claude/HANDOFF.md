@@ -191,6 +191,33 @@ grep -c "as 图标名[,}]" $F    # 1 = 有，0 = 没有
 图标名、路径别名、`import type` 用错地方，三样都是只有构建才抓得到。
 推给她之前那次 `vite build` 不能省。
 
+**17. `git fetch origin` 在这个仓库不会更新远端快照 —— 已修好，但要知道症状。**
+2026-11-16 补的。久问「本地跟远端一致吗」，我差点回她「你有 26 个提交没推上去」。
+
+`remote.origin.fetch` 原来被写成只拉一个老分支：
+`+refs/heads/feat/rp-prompt-toggle:refs/remotes/origin/feat/rp-prompt-toggle`。
+于是 `git fetch origin master` 只更新 `FETCH_HEAD`，**`refs/remotes/origin/master`
+一直停在旧 sha**（当时停在 11-11 的 `0ac05496`，而远端实际已是 `a6ce8572`）。
+
+症状：`git rev-list --left-right --count origin/master...master` 报 `0  26`，
+看起来本地领先 26 个提交、一堆东西没推。**全是假的**，那 26 个提交早就在 GitHub 上。
+
+当场的正确查法（不改配置也能确认）：
+```bash
+GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote origin master   # 直接问远端要 sha
+git rev-parse master                                           # 和本地比
+```
+两个 sha 一样就是一致的。**`ls-remote` 是唯一不会被本地过期快照骗到的那一条。**
+
+配置已经在 2026-11-16 改回标准值（久点头后改的）：
+```bash
+git config --unset-all remote.origin.fetch
+git config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+```
+验证过：裸 `git fetch origin` 现在能正常带回九个分支。只动了 `.git/config`，
+没碰代码、没推送。所以**下一个我大概不会再遇到这个症状**，但万一又看到
+「本地凭空领先一堆提交」，先 `git config --get-all remote.origin.fetch` 看一眼。
+
 ---
 
 ## MCP 调不动那件事：已查实，不用再查

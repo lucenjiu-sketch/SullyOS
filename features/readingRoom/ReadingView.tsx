@@ -12,6 +12,9 @@ import {
   isHighlightTruncated,
   normalizeHighlightRange,
   nudgeOffset,
+  READING_HIGHLIGHT_COLOR_NAMES,
+  READING_HIGHLIGHT_COLORS,
+  resolveHighlightColor,
   splitByHighlights,
   type HighlightSelectionState,
 } from './highlight';
@@ -80,6 +83,8 @@ interface ReadingViewProps {
   onOffsetChange: (offset: number) => void;
   onCreateHighlight: (range: { startOffset: number; endOffset: number; text: string; color: string }) => void;
   onDeleteHighlight: (highlightId: string) => void;
+  /** 改一条已有划线的颜色。不用删了重划（久的要求）。 */
+  onRecolorHighlight: (highlightId: string, color: string) => void;
   /**
    * 发一条讨论消息。
    *
@@ -157,6 +162,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   onOffsetChange,
   onCreateHighlight,
   onDeleteHighlight,
+  onRecolorHighlight,
   onSendDiscussion,
   onStopDiscussion,
   onDismissDiscussionError,
@@ -186,6 +192,13 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const [pendingOffset, setPendingOffset] = useState<number | null>(null);
   /** 点到已有划线时弹出的操作条。 */
   const [activeHighlight, setActiveHighlight] = useState<ReadingHighlight | null>(null);
+  /**
+   * 下一条划线用哪个颜色。
+   *
+   * 记在组件里而不是每次重置成黄色：连着划几条通常是同一个用途
+   * （比如都在标人物），每条都要重选一次颜色很烦。
+   */
+  const [draftColor, setDraftColor] = useState<string>(DEFAULT_HIGHLIGHT_COLOR);
   /** 一次性的提示文字（划线存好了、范围太长被截断之类）。 */
   const [toast, setToast] = useState('');
 
@@ -414,11 +427,20 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     onCreateHighlight({
       ...range,
       text: content.slice(range.startOffset, range.endOffset),
-      color: DEFAULT_HIGHLIGHT_COLOR,
+      color: draftColor,
     });
     showToast(isHighlightTruncated(first, second) ? '划线太长，已截断保存' : '划线已保存');
     cancelSelection();
-  }, [cancelSelection, content, onCreateHighlight, pendingOffset, selection.startOffset, showToast]);
+  }, [cancelSelection, content, draftColor, onCreateHighlight, pendingOffset, selection.startOffset, showToast]);
+
+  /** 改一条已有划线的颜色。顺手把下一条的默认色也跟上，符合「我现在想用这个色」。 */
+  const recolorActiveHighlight = useCallback((color: string) => {
+    if (!activeHighlight) return;
+    setDraftColor(color);
+    // 面板上那条也要立刻变色，否则看着像没生效（库里的更新由 App 负责）。
+    setActiveHighlight(previous => (previous ? { ...previous, color } : previous));
+    onRecolorHighlight(activeHighlight.id, color);
+  }, [activeHighlight, onRecolorHighlight]);
 
   const removeActiveHighlight = useCallback(() => {
     if (!activeHighlight) return;
@@ -631,6 +653,32 @@ const ReadingView: React.FC<ReadingViewProps> = ({
   const atBookEnd = pageEnd >= content.length;
 
   /**
+   * 一排可选的划线颜色。创建划线和改色两处共用。
+   *
+   * 选中态用深色描边表示，不用对勾——色点只有 22px，塞个勾会把颜色本身挡掉。
+   */
+  const renderColorRow = (current: string, onPick: (color: string) => void): React.ReactNode => (
+    <div className="flex items-center gap-2">
+      <span className="text-[11px] text-stone-500">颜色</span>
+      {READING_HIGHLIGHT_COLORS.map((color, index) => {
+        const selected = resolveHighlightColor(current) === color;
+        return (
+          <button
+            key={color}
+            onClick={() => onPick(color)}
+            aria-label={READING_HIGHLIGHT_COLOR_NAMES[index]}
+            aria-pressed={selected}
+            className={`h-[22px] w-[22px] rounded-full transition active:scale-90 ${
+              selected ? 'ring-2 ring-stone-700 ring-offset-1' : 'ring-1 ring-stone-300'
+            }`}
+            style={{ backgroundColor: color }}
+          />
+        );
+      })}
+    </div>
+  );
+
+  /**
    * 段落正文：按划线切成若干片段，划过的加底色。
    *
    * 片段用 span 包起来，所以段落内部会有嵌套——`caret.ts` 取偏移那边用
@@ -667,7 +715,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
     /** 在一个片段里把落点/起点那一个字再切出来单独上色。 */
     const renderSegment = (segment: { text: string; offset: number; highlight: ReadingHighlight | null }): React.ReactNode => {
       const base: React.CSSProperties = segment.highlight
-        ? { backgroundColor: segment.highlight.color, borderRadius: 2 }
+        ? { backgroundColor: resolveHighlightColor(segment.highlight.color), borderRadius: 2 }
         : {};
       const mark = marks.find(item => item.offset >= segment.offset && item.offset < segment.offset + segment.text.length);
       if (!mark) {
@@ -873,6 +921,9 @@ const ReadingView: React.FC<ReadingViewProps> = ({
               <span className="ml-auto text-[10px] text-stone-400">选不准就取消重按</span>
             </div>
 
+            {/* 选色：起点那一步也显示，让用户划之前就知道会是什么颜色。 */}
+            <div className="mb-3">{renderColorRow(draftColor, setDraftColor)}</div>
+
             <div className="flex gap-2">
               {selection.mode === 'selecting-end' ? (
                 <button
@@ -912,6 +963,8 @@ const ReadingView: React.FC<ReadingViewProps> = ({
             <p className="mb-3 line-clamp-3 text-[13px] leading-relaxed text-stone-700">
               {highlightSummary(activeHighlight.text, 120)}
             </p>
+            {/* 改色：点一下立刻生效并落库，不用删了重划。 */}
+            <div className="mb-3">{renderColorRow(activeHighlight.color, recolorActiveHighlight)}</div>
             {/* 问角色排在最前面：这是划线之后最常做的事。 */}
             <button
               onClick={() => askAboutHighlight(activeHighlight)}
@@ -1087,7 +1140,7 @@ const ReadingView: React.FC<ReadingViewProps> = ({
                   >
                     <span
                       className="mb-1 inline-block h-1.5 w-7 rounded-full"
-                      style={{ backgroundColor: item.color }}
+                      style={{ backgroundColor: resolveHighlightColor(item.color) }}
                     />
                     <p className="line-clamp-3 text-[13px] leading-relaxed text-stone-700">
                       {highlightSummary(item.text, 120)}

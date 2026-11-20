@@ -10,7 +10,9 @@ import {
   MAX_HIGHLIGHT_CHARS,
   normalizeHighlightRange,
   nudgeOffset,
+  READING_HIGHLIGHT_COLOR_NAMES,
   READING_HIGHLIGHT_COLORS,
+  resolveHighlightColor,
   sortHighlightsByPosition,
   splitByHighlights,
 } from '../features/readingRoom/highlight';
@@ -175,6 +177,29 @@ describe('共读室 · 划线列表顺序与配色', () => {
       expect(alpha).toBeGreaterThan(0);
       expect(alpha).toBeLessThan(1);
     });
+  });
+
+  it('每个颜色都有对应的人话名字，一一对应不错位', () => {
+    expect(READING_HIGHLIGHT_COLOR_NAMES).toHaveLength(READING_HIGHLIGHT_COLORS.length);
+    READING_HIGHLIGHT_COLOR_NAMES.forEach(name => expect(name.length).toBeGreaterThan(0));
+  });
+
+  it('色板里的颜色原样返回', () => {
+    READING_HIGHLIGHT_COLORS.forEach(color => {
+      expect(resolveHighlightColor(color)).toBe(color);
+    });
+  });
+
+  /*
+   * 这几条守的是「划线存在库里但屏幕上什么都不显示」。
+   * 备份校验层对 color 是 `str(row.color) || ''`，所以空串真的会进库；
+   * 空串塞进 backgroundColor 不报错，只是没有底色——用户以为自己没划上。
+   */
+  it('空的、缺失的、不认识的颜色都兜底成默认色，不会让划线隐形', () => {
+    expect(resolveHighlightColor('')).toBe(DEFAULT_HIGHLIGHT_COLOR);
+    expect(resolveHighlightColor(undefined)).toBe(DEFAULT_HIGHLIGHT_COLOR);
+    expect(resolveHighlightColor('rgba(1, 2, 3, 0.5)')).toBe(DEFAULT_HIGHLIGHT_COLOR);
+    expect(resolveHighlightColor('transparent')).toBe(DEFAULT_HIGHLIGHT_COLOR);
   });
 });
 
