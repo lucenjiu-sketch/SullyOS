@@ -243,6 +243,34 @@ describe('共读室备份 · 坏数据筛除', () => {
     expect(parsed?.books?.[0].chapters[0].title).toBe('好的');
   });
 
+  it('自定义封面跟着备份走，坏协议的封面被摘掉但书还在', () => {
+    const good = parseReadingRoomBackup({
+      data: { books: [book({ coverUrl: 'https://img.example.com/a.jpg' })] },
+    });
+    expect(good?.books?.[0].coverUrl).toBe('https://img.example.com/a.jpg');
+
+    const dataUrl = parseReadingRoomBackup({
+      data: { books: [book({ coverUrl: 'data:image/png;base64,AAAA' })] },
+    });
+    expect(dataUrl?.books?.[0].coverUrl).toBe('data:image/png;base64,AAAA');
+
+    /*
+     * 备份是纯文本、可以被编辑，而封面地址会直接进 <img src>。
+     * 坏协议只摘掉封面、不丢整本书——那本书会退回默认渐变封面。
+     */
+    const bad = parseReadingRoomBackup({
+      data: { books: [book({ coverUrl: 'javascript:alert(1)' })] },
+    });
+    expect(bad?.books?.[0].coverUrl).toBeUndefined();
+    expect(bad?.books?.[0].id).toBe('b1');
+  });
+
+  it('没有封面字段的老备份照样恢复（封面是后加的可选字段）', () => {
+    const parsed = parseReadingRoomBackup({ data: { books: [book()] } });
+    expect(parsed?.books?.[0].coverUrl).toBeUndefined();
+    expect(parsed?.books?.[0].id).toBe('b1');
+  });
+
   it('不是数组的表整个当空的，不影响别的表', () => {
     const parsed = parseReadingRoomBackup({
       data: { books: [book()], highlights: '坏了', messages: { a: 1 } },

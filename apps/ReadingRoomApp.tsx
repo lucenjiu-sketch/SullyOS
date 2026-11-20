@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
-import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal } from '@phosphor-icons/react';
+import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal, ImageSquare } from '@phosphor-icons/react';
 import { DB } from '../utils/db';
+import { processImage } from '../utils/file';
 import type { Emoji, EmojiCategory } from '../types';
 import { ReadingRoomStore } from '../features/readingRoom/store';
 import { parseReadingFile, READING_MAX_CHARS } from '../features/readingRoom/parse';
 import { progressPercent } from '../features/readingRoom/paginate';
-import { coverPalette, coverTitleLines } from '../features/readingRoom/layout';
+import { coverPalette, coverTitleLines, resolveCoverUrl } from '../features/readingRoom/layout';
 import { sortHighlightsByPosition } from '../features/readingRoom/highlight';
 import {
   applyMessageToWindow,
@@ -140,6 +141,10 @@ const ReadingRoomApp: React.FC = () => {
   ));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 换封面用的相册选择框。和导入 TXT 那个分开，accept 不一样。 */
+  const coverInputRef = useRef<HTMLInputElement>(null);
+  /** 正在给哪本书换封面。选完图片要用它定位，所以不能跟着面板一起关掉。 */
+  const coverTargetRef = useRef<ReadingBook | null>(null);
   /** 上次导入的原始字节，供「换个编码重读」复用，不必让用户再选一次文件。 */
   const lastBufferRef = useRef<{ bookId: string; fileName: string; buffer: ArrayBuffer } | null>(null);
   const longPressRef = useRef<{ timer: number | null; fired: boolean }>({ timer: null, fired: false });
@@ -320,6 +325,56 @@ const ReadingRoomApp: React.FC = () => {
       showError?.('改名没保存上', error?.message || String(error));
     }
   }, [refreshShelf, showError]);
+
+  /**
+   * 换封面：把 coverUrl 写进书记录。传 undefined 就是恢复默认渐变封面。
+   *
+   * 不做乐观更新——封面是一张图，等落库再刷新书架只差一瞬，
+   * 而「界面换了但其实没存上」在这里特别容易让人以为成功了。
+   */
+  const applyCover = useCallback(async (book: ReadingBook, coverUrl: string | undefined) => {
+    try {
+      await ReadingRoomStore.saveBook({ ...book, coverUrl, updatedAt: Date.now() });
+      await refreshShelf();
+      addToast(coverUrl ? '封面换好了' : '已恢复默认封面', 'success');
+    } catch (error: any) {
+      showError?.('封面没保存上', error?.message || String(error));
+    }
+  }, [addToast, refreshShelf, showError]);
+
+  /** 从相册选一张图当封面。压到 400px 宽再存，和项目里换头像同一条路。 */
+  const handlePickCover = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // 先清空 input：同一张图连选两次也要能触发 onChange。
+    event.target.value = '';
+    const book = coverTargetRef.current;
+    coverTargetRef.current = null;
+    if (!file || !book) return;
+    try {
+      /*
+       * 400px 宽足够：书架一行三本，单个封面在手机上也就 120px 左右。
+       * 压缩这一步不能省——原图动辄两三 MB，而封面是 data URL 整条进备份的。
+       */
+      const dataUrl = await processImage(file, { maxWidth: 400, quality: 0.85 });
+      await applyCover(book, dataUrl);
+    } catch (error: any) {
+      showError?.('这张图没能用作封面', error?.message || String(error));
+    }
+  }, [applyCover, showError]);
+
+  /** 粘一个图床链接当封面。只认 http(s)，其它协议挡在 resolveCoverUrl 里。 */
+  const handlePasteCover = useCallback(async (book: ReadingBook) => {
+    const input = window.prompt('粘贴图片链接（http 或 https 开头）', book.coverUrl?.startsWith('http') ? book.coverUrl : '');
+    if (input === null) return;
+    const trimmed = input.trim();
+    if (!trimmed) return;
+    if (!resolveCoverUrl(trimmed)) {
+      addToast('这个链接用不了，要以 http:// 或 https:// 开头', 'error');
+      return;
+    }
+    setActionBook(null);
+    await applyCover(book, trimmed);
+  }, [addToast, applyCover]);
 
   /** 翻页时就落库，不等退出——手机上随时可能被系统回收。 */
   const persistProgress = useCallback((bookId: string, offset: number) => {
@@ -801,6 +856,7 @@ const ReadingRoomApp: React.FC = () => {
       </div>
 
       <input ref={fileInputRef} type="file" accept=".txt,text/plain" className="hidden" onChange={handlePickFile} />
+      <input ref={coverInputRef} type="file" accept="image/*" className="hidden" onChange={event => { void handlePickCover(event); }} />
 
       {tab === 'settings' ? (
         <ReadingRoomSettings
@@ -824,6 +880,7 @@ const ReadingRoomApp: React.FC = () => {
               const offset = progressByBook[book.id] || 0;
               const percent = progressPercent(book, offset);
               const palette = coverPalette(book.id);
+              const cover = resolveCoverUrl(book.coverUrl);
               return (
                 <div key={book.id} className="flex flex-col">
                   <button
@@ -836,14 +893,34 @@ const ReadingRoomApp: React.FC = () => {
                     className="relative aspect-[3/4] w-full overflow-hidden rounded-[3px] text-left shadow-[2px_3px_8px_rgba(0,0,0,0.18)] transition-transform active:scale-[0.97]"
                     style={{ background: `linear-gradient(145deg, ${palette.from}, ${palette.to})` }}
                   >
+                    {/*
+                      自定义封面铺在渐变色上面。
+                      用 img 而不是 backgroundImage：img 有 onError，
+                      图床链接哪天挂了可以把它摘掉、露出下面的渐变封面，
+                      不会留一个破图框（久知道这条退路，图挂了只会看到颜色变回去）。
+                    */}
+                    {cover && (
+                      <img
+                        src={cover}
+                        alt=""
+                        className="absolute inset-0 h-full w-full object-cover"
+                        onError={event => { event.currentTarget.style.display = 'none'; }}
+                      />
+                    )}
                     {/* 书脊：靠左一条更深的窄边，让纯色块看起来像一本书。 */}
                     <span className="absolute inset-y-0 left-0 w-[6px] bg-black/15" />
-                    <span
-                      className="absolute inset-x-0 top-0 px-2 pb-2 pt-3 text-[11px] font-semibold leading-snug"
-                      style={{ color: palette.ink, wordBreak: 'break-word' }}
-                    >
-                      {coverTitleLines(book.title)}
-                    </span>
+                    {/*
+                      有自定义封面时不再压书名——图上多半自带书名，
+                      再叠一层会糊成一团。书名在封面下面那行照样显示。
+                    */}
+                    {!cover && (
+                      <span
+                        className="absolute inset-x-0 top-0 px-2 pb-2 pt-3 text-[11px] font-semibold leading-snug"
+                        style={{ color: palette.ink, wordBreak: 'break-word' }}
+                      >
+                        {coverTitleLines(book.title)}
+                      </span>
+                    )}
                     {percent > 0 && (
                       <span className="absolute bottom-1 right-1 rounded-sm bg-black/35 px-1 py-[1px] text-[9px] tabular-nums text-white/95">
                         {percent === 100 ? '读完' : `${percent}%`}
@@ -929,12 +1006,45 @@ const ReadingRoomApp: React.FC = () => {
                 {ENCODING_LABELS[actionBook.encoding]}
               </p>
             </div>
-            <button
+<button
               onClick={() => handleRename(actionBook)}
               className="flex w-full items-center gap-2 px-4 py-3.5 text-left text-sm active:bg-stone-100"
             >
               <PencilSimple size={16} weight="bold" className="text-stone-500" /> 改书名
             </button>
+
+            {/* ——— 封面 ——— */}
+            <div className="flex items-center gap-2 border-t border-stone-200 px-4 pb-1 pt-3 text-[11px] text-stone-400">
+              <ImageSquare size={14} weight="bold" /> 封面
+            </div>
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
+              <button
+                onClick={() => {
+                  // 先记下是哪本书，再打开相册——面板会被系统的选图界面盖掉。
+                  coverTargetRef.current = actionBook;
+                  setActionBook(null);
+                  coverInputRef.current?.click();
+                }}
+                className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+              >
+                从相册选
+              </button>
+              <button
+                onClick={() => { void handlePasteCover(actionBook); }}
+                className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+              >
+                粘图片链接
+              </button>
+              {resolveCoverUrl(actionBook.coverUrl) && (
+                <button
+                  onClick={() => { setActionBook(null); void applyCover(actionBook, undefined); }}
+                  className="rounded-lg bg-stone-100 px-2.5 py-1.5 text-xs text-stone-600 transition active:scale-95"
+                >
+                  恢复默认
+                </button>
+              )}
+            </div>
+
             <div className="flex items-center gap-2 border-t border-stone-200 px-4 pb-1 pt-3 text-[11px] text-stone-400">
               <TextAa size={14} weight="bold" /> 文字乱码时换个编码重读
             </div>

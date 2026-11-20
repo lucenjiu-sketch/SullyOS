@@ -30,6 +30,17 @@ export interface ReadingBook {
   chapters: ReadingChapter[];
   /** 章节是不是真从正文里认出来的；false 表示整本当一章兜底。 */
   chaptersDetected: boolean;
+  /**
+   * 自定义封面。没有这个字段就用 `coverPalette(book.id)` 算出来的渐变色。
+   *
+   * 两种来源，都存在这一个字段里：
+   * - 相册上传：`processImage` 压到 400px 宽之后的 data URL（`data:image/...`）
+   * - 图床链接：用户粘的 http(s) 地址，原样存
+   *
+   * **data URL 会整条进备份**（书的正文本来就进，见方案 A），一张约 30–60KB。
+   * 图床链接只占几十字节，但图挂了封面会退回渐变色——这一点久知道。
+   */
+  coverUrl?: string;
   createdAt: number;
   updatedAt: number;
 }

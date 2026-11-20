@@ -8,6 +8,7 @@ import type {
   ReadingRoomBackupData,
   ReadingSelection,
 } from '../features/readingRoom/types';
+import { resolveCoverUrl } from '../features/readingRoom/layout';
 
 /**
  * 共读室 · 备份的导出包装和导入校验。
@@ -131,6 +132,9 @@ export function parseReadingRoomBackup(value: unknown): ReadingRoomBackupData | 
       encoding: (str(row.encoding) || 'utf-8') as ReadingBook['encoding'],
       chapters,
       chaptersDetected: row.chaptersDetected === true,
+      // 封面地址过一遍协议白名单：这个值会进 CSS url()，
+      // 不认识的协议（javascript: 之类）直接丢掉，那本书退回默认渐变封面。
+      coverUrl: resolveCoverUrl(str(row.coverUrl)) ?? undefined,
       createdAt: num(row.createdAt) ?? Date.now(),
       updatedAt: num(row.updatedAt) ?? Date.now(),
     } as ReadingBook;
