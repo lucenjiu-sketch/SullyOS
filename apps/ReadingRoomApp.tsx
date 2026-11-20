@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useOS } from '../context/OSContext';
-import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal, ImageSquare } from '@phosphor-icons/react';
+import { ArrowLeft, Books, Plus, Trash, PencilSimple, TextAa, BookOpen, SlidersHorizontal, ImageSquare, Check } from '@phosphor-icons/react';
 import { DB } from '../utils/db';
 import { processImage } from '../utils/file';
 import type { Emoji, EmojiCategory } from '../types';
@@ -27,6 +27,16 @@ import {
 import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
 import { resolveReadingThemeMode, type ReadingThemeMode } from '../features/readingRoom/theme';
+import {
+  describeDeleteConfirm,
+  EMPTY_SHELF_SELECTION,
+  isAllSelected,
+  reconcileShelfSelection,
+  selectedBooks,
+  toggleSelectAll,
+  toggleShelfSelection,
+  type ShelfSelection,
+} from '../features/readingRoom/shelf';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
   readingRoomId,
@@ -58,9 +68,9 @@ const FONT_SIZE_KEY = 'sullyos_reading_font_size';
 const FLIP_MODE_KEY = 'sullyos_reading_flip_mode';
 /** 日间 / 夜间。手动切、跨书记住，不跟系统深色模式（久定的）。 */
 const THEME_MODE_KEY = 'sullyos_reading_theme_mode';
-
 /** 共读室里的两个页面。阅读页不在这套里，它由 `openBook` 单独接管整屏。 */
 type ReadingRoomTab = 'shelf' | 'settings';
+
 
 const ENCODING_LABELS: Record<ReadingEncoding, string> = {
   'utf-8': 'UTF-8',
@@ -139,6 +149,11 @@ const ReadingRoomApp: React.FC = () => {
   const [themeMode, setThemeMode] = useState<ReadingThemeMode>(() => (
     resolveReadingThemeMode(localStorage.getItem(THEME_MODE_KEY))
   ));
+  /** 书架管理模式（勾选 + 批量删）。退出时清掉勾选。 */
+  const [managing, setManaging] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<ShelfSelection>(EMPTY_SHELF_SELECTION);
+  /** 正在删这一批。按着按钮不放会重复触发，用它挡掉。 */
+  const [deletingBatch, setDeletingBatch] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   /** 换封面用的相册选择框。和导入 TXT 那个分开，accept 不一样。 */
@@ -375,6 +390,52 @@ const ReadingRoomApp: React.FC = () => {
     setActionBook(null);
     await applyCover(book, trimmed);
   }, [addToast, applyCover]);
+
+  /*
+   * 书架变了就把勾选对一遍（换封面会刷新书架、恢复备份会整批换掉）。
+   * `reconcileShelfSelection` 没变化时返回同一个集合，所以这个 effect
+   * 不会自己把自己再触发一次。
+   */
+  useEffect(() => {
+    setSelectedIds(previous => reconcileShelfSelection(previous, books));
+  }, [books]);
+
+  /** 退出管理模式。勾选一并清掉——下次进来重新选，不留上次的残留。 */
+  const exitManaging = useCallback(() => {
+    setManaging(false);
+    setSelectedIds(EMPTY_SHELF_SELECTION);
+  }, []);
+
+  /**
+   * 批量删除。
+   *
+   * 两件刻意的事：
+   * - 确认框把书名列出来（`describeDeleteConfirm`）。勾错了只看数字看不出来，
+   *   而删完没有退路。
+   * - 整批走 `deleteBooks` 一个事务，不是循环单删——避免「删到一半失败，
+   *   前几本已经没了」这种她无法判断的状态。
+   */
+  const handleDeleteSelected = useCallback(async () => {
+    const targets = selectedBooks(selectedIds, books);
+    if (targets.length === 0 || deletingBatch) return;
+    if (!window.confirm(describeDeleteConfirm(targets))) return;
+    setDeletingBatch(true);
+    try {
+      await ReadingRoomStore.deleteBooks(targets.map(book => book.id));
+      // 正在读的那本被删了就退回书架，否则会停在一本已经不存在的书上。
+      if (openBook && targets.some(book => book.id === openBook.id)) {
+        setOpenBook(null);
+        setContent('');
+      }
+      await refreshShelf();
+      exitManaging();
+      addToast(`已删掉 ${targets.length} 本`, 'success');
+    } catch (error: any) {
+      showError?.('这批书没能删掉', error?.message || String(error));
+    } finally {
+      setDeletingBatch(false);
+    }
+  }, [addToast, books, deletingBatch, exitManaging, openBook, refreshShelf, selectedIds, showError]);
 
   /** 翻页时就落库，不等退出——手机上随时可能被系统回收。 */
   const persistProgress = useCallback((bookId: string, offset: number) => {
@@ -849,9 +910,24 @@ const ReadingRoomApp: React.FC = () => {
             <ArrowLeft size={20} weight="bold" className="text-stone-600" />
           </button>
           <h1 className="text-[17px] font-bold">{tab === 'settings' ? '共读设置' : '共读室'}</h1>
-          <span className="ml-auto text-[11px] text-stone-400">
-            {tab === 'shelf' && books.length > 0 ? `${books.length} 本` : ''}
-          </span>
+          {/*
+            管理按钮只在书架页出现，而且书架为空时不显示——
+            没有书可管，摆一个点了没反应的按钮只会让人疑惑。
+          */}
+          {tab === 'shelf' && books.length > 0 ? (
+            <button
+              onClick={() => (managing ? exitManaging() : setManaging(true))}
+              className={`ml-auto rounded-lg px-2.5 py-1.5 text-xs transition active:scale-95 ${
+                managing ? 'bg-stone-700 text-stone-50' : 'bg-stone-200/80 text-stone-600'
+              }`}
+            >
+              {managing ? '完成' : '管理'}
+            </button>
+          ) : (
+            <span className="ml-auto text-[11px] text-stone-400">
+              {tab === 'shelf' && books.length > 0 ? `${books.length} 本` : ''}
+            </span>
+          )}
         </div>
       </div>
 
@@ -881,15 +957,30 @@ const ReadingRoomApp: React.FC = () => {
               const percent = progressPercent(book, offset);
               const palette = coverPalette(book.id);
               const cover = resolveCoverUrl(book.coverUrl);
+              const checked = selectedIds.has(book.id);
               return (
                 <div key={book.id} className="flex flex-col">
                   <button
-                    onPointerDown={() => startLongPress(book)}
-                    onPointerUp={cancelLongPress}
-                    onPointerLeave={cancelLongPress}
-                    onPointerCancel={cancelLongPress}
-                    onClick={() => { if (!longPressRef.current.fired) void handleOpenBook(book); }}
-                    onContextMenu={event => { event.preventDefault(); setActionBook(book); }}
+                    /*
+                      管理模式下不挂长按（长按菜单里有删除，和批量删会打架），
+                      点一下就是勾选/取消。正常模式照旧：点开书、长按出菜单。
+                    */
+                    onPointerDown={managing ? undefined : () => startLongPress(book)}
+                    onPointerUp={managing ? undefined : cancelLongPress}
+                    onPointerLeave={managing ? undefined : cancelLongPress}
+                    onPointerCancel={managing ? undefined : cancelLongPress}
+                    onClick={() => {
+                      if (managing) {
+                        setSelectedIds(previous => toggleShelfSelection(previous, book.id));
+                        return;
+                      }
+                      if (!longPressRef.current.fired) void handleOpenBook(book);
+                    }}
+                    onContextMenu={event => {
+                      event.preventDefault();
+                      if (!managing) setActionBook(book);
+                    }}
+                    aria-pressed={managing ? checked : undefined}
                     className="relative aspect-[3/4] w-full overflow-hidden rounded-[3px] text-left shadow-[2px_3px_8px_rgba(0,0,0,0.18)] transition-transform active:scale-[0.97]"
                     style={{ background: `linear-gradient(145deg, ${palette.from}, ${palette.to})` }}
                   >
@@ -926,13 +1017,33 @@ const ReadingRoomApp: React.FC = () => {
                         {percent === 100 ? '读完' : `${percent}%`}
                       </span>
                     )}
+                    {/*
+                      管理模式的勾选圈。选中时整张封面压一层暗罩，
+                      让「选了哪几本」在一眼之内看得出来，而不是去数小圆圈。
+                    */}
+                    {managing && (
+                      <>
+                        {checked && <span className="absolute inset-0 bg-black/35" />}
+                        <span
+                          className={`absolute left-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full border-2 ${
+                            checked ? 'border-white bg-orange-600' : 'border-white/90 bg-black/25'
+                          }`}
+                        >
+                          {checked && <Check size={12} weight="bold" className="text-white" />}
+                        </span>
+                      </>
+                    )}
                   </button>
                   <p className="mt-1.5 line-clamp-2 text-[11px] leading-snug text-stone-600">{book.title}</p>
                 </div>
               );
             })}
 
-            {/* 最后一格：虚线空框 + 加号，点它上传 TXT。 */}
+            {/*
+              最后一格：虚线空框 + 加号，点它上传 TXT。
+              管理模式下藏掉——那一格不是书，摆在勾选网格里只会被误点。
+            */}
+            {!managing && (
             <div className="flex flex-col">
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -946,6 +1057,7 @@ const ReadingRoomApp: React.FC = () => {
               </button>
               <p className="mt-1.5 text-[11px] text-stone-400">上传 TXT</p>
             </div>
+            )}
           </div>
         )}
 
@@ -961,11 +1073,34 @@ const ReadingRoomApp: React.FC = () => {
       {/*
         底栏：书架 / 设置。
         **只在这两页出现，阅读页没有它**——阅读页整屏接管，多一条带子会挤掉正文行数。
+
+        管理模式下换成「全选 / 已选 N 本 / 删除」那条操作栏：
+        两条带子叠着会把书架挤掉一行，而管理模式下也不该去切设置页。
       */}
       <div
         className="shrink-0 border-t border-stone-200/80 bg-[#f7f4ee]"
         style={{ paddingBottom: 'var(--safe-bottom)' }}
       >
+        {managing && tab === 'shelf' ? (
+          <div className="flex items-center gap-2 px-3 py-2.5">
+            <button
+              onClick={() => setSelectedIds(previous => toggleSelectAll(previous, books))}
+              className="rounded-lg bg-stone-200/80 px-3 py-2 text-xs text-stone-700 transition active:scale-95"
+            >
+              {isAllSelected(selectedIds, books) ? '取消全选' : '全选'}
+            </button>
+            <span className="text-[11px] tabular-nums text-stone-500">
+              已选 {selectedIds.size} 本
+            </span>
+            <button
+              onClick={() => { void handleDeleteSelected(); }}
+              disabled={selectedIds.size === 0 || deletingBatch}
+              className="ml-auto rounded-lg bg-red-600 px-3.5 py-2 text-xs font-semibold text-red-50 transition active:scale-95 disabled:bg-stone-200 disabled:text-stone-400"
+            >
+              {deletingBatch ? '正在删…' : '删除'}
+            </button>
+          </div>
+        ) : (
         <div className="flex">
           {([
             ['shelf', '书架', BookOpen],
@@ -985,6 +1120,7 @@ const ReadingRoomApp: React.FC = () => {
             );
           })}
         </div>
+        )}
       </div>
 
       {/* ——— 长按书封的操作面板 ——— */}

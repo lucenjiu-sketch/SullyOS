@@ -181,4 +181,75 @@ describe('共读室 store · 删窗口', () => {
     // 书没了，但当时的书名还记在引用里，翻历史仍然看得出在说哪本。
     expect(rows[0].reference?.bookTitle).toBe('待删的书');
   });
+
+  /*
+   * 批量删除走一个事务，口径必须和单本 deleteBook 完全一致：
+   * 连带删正文 / 进度 / 那些书的划线，**不动没选中的书，也不动讨论消息**。
+   * 这是个不可撤销的操作，多删一本或少删一样东西都没有退路。
+   */
+  it('批量删书：选中的连正文和划线一起删，没选中的一个字不动', async () => {
+    const goneA = uniqueId('b');
+    const goneB = uniqueId('b');
+    const keep = uniqueId('b');
+    await ReadingRoomStore.saveBook(book(goneA, '删掉一'), '正文一');
+    await ReadingRoomStore.saveBook(book(goneB, '删掉二'), '正文二');
+    await ReadingRoomStore.saveBook(book(keep, '留下的'), '正文三');
+    await ReadingRoomStore.saveProgress({ bookId: goneA, offset: 50, updatedAt: 1 });
+    await ReadingRoomStore.saveProgress({ bookId: keep, offset: 60, updatedAt: 1 });
+    for (const [bookId, text] of [[goneA, '甲'], [goneB, '乙'], [keep, '丙']] as const) {
+      await ReadingRoomStore.saveHighlight({
+        id: uniqueId('h'),
+        bookId,
+        startOffset: 0,
+        endOffset: 1,
+        text,
+        color: 'rgba(255, 203, 92, 0.48)',
+        createdAt: 1,
+        updatedAt: 1,
+      });
+    }
+
+    await ReadingRoomStore.deleteBooks([goneA, goneB]);
+
+    expect(await ReadingRoomStore.getBook(goneA)).toBeNull();
+    expect(await ReadingRoomStore.getBook(goneB)).toBeNull();
+    expect(await ReadingRoomStore.getContent(goneA)).toBeNull();
+    expect(await ReadingRoomStore.getContent(goneB)).toBeNull();
+    expect(await ReadingRoomStore.getProgress(goneA)).toBeNull();
+    expect(await ReadingRoomStore.listHighlights(goneA)).toEqual([]);
+    expect(await ReadingRoomStore.listHighlights(goneB)).toEqual([]);
+
+    // 没选中的那本完好无损。
+    expect((await ReadingRoomStore.getBook(keep))?.title).toBe('留下的');
+    expect(await ReadingRoomStore.getContent(keep)).toBe('正文三');
+    expect((await ReadingRoomStore.getProgress(keep))?.offset).toBe(60);
+    expect(await ReadingRoomStore.listHighlights(keep)).toHaveLength(1);
+  });
+
+  it('批量删空数组什么都不做，也不报错', async () => {
+    const bookId = uniqueId('b');
+    await ReadingRoomStore.saveBook(book(bookId, '没人动我'), '正文');
+    await ReadingRoomStore.deleteBooks([]);
+    expect((await ReadingRoomStore.getBook(bookId))?.title).toBe('没人动我');
+  });
+
+  it('批量删不碰讨论消息（和单本删一个口径）', async () => {
+    const bookId = uniqueId('b');
+    const window = createDiscussionWindow(uniqueId('c'), [], 1);
+    await ReadingRoomStore.saveBook(book(bookId, '批量待删'), '正文');
+    await ReadingRoomStore.saveWindow(window);
+    await ReadingRoomStore.saveMessage(createDiscussionMessage({
+      windowId: window.id,
+      role: 'user',
+      content: '聊过这本',
+      reference: { bookId, bookTitle: '批量待删', chapterTitle: '第一章', quote: '正文' },
+      now: 1,
+    }));
+
+    await ReadingRoomStore.deleteBooks([bookId]);
+
+    const rows = await ReadingRoomStore.listMessages(window.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].reference?.bookTitle).toBe('批量待删');
+  });
 });
