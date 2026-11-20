@@ -18,6 +18,7 @@ import { parseCollaborationRichOutput, resolveCollaborationEmoji } from '../coll
 import TokenImg from '../../components/os/TokenImg';
 import type { Emoji, EmojiCategory } from '../../types';
 import type { ReadingDiscussionMessage, ReadingMessageReference } from './types';
+import type { ReadingTheme } from './theme';
 
 /**
  * 共读室 · 讨论面板。
@@ -59,6 +60,8 @@ export interface ReadingDiscussionPanelProps {
   /** 角色名，显示在标题上。没选角色时面板不该被打开。 */
   charName: string;
   windowName: string;
+  /** 当前主题那一套颜色。由阅读页算好传进来，面板不自己读 localStorage。 */
+  theme: ReadingTheme;
   messages: ReadingDiscussionMessage[];
   /**
    * 输入框上方那块引用。
@@ -110,18 +113,24 @@ export interface ReadingDiscussionPanelProps {
 const QuoteCard: React.FC<{
   reference: ReadingMessageReference;
   tone: 'user' | 'assistant';
-}> = ({ reference, tone }) => (
+  theme: ReadingTheme;
+}> = ({ reference, tone, theme }) => (
   <div
-    className={`mb-1.5 rounded-lg border-l-[3px] px-2 py-1.5 ${
-      tone === 'user'
-        ? 'border-amber-300/80 bg-black/10'
-        : 'border-amber-400/70 bg-amber-50/70'
-    }`}
+    className="mb-1.5 rounded-lg border-l-[3px] px-2 py-1.5"
+    style={tone === 'user'
+      ? { borderColor: theme.quoteInUserBorder, backgroundColor: 'rgba(0, 0, 0, 0.1)' }
+      : { borderColor: theme.quoteInCharBorder, backgroundColor: theme.quoteInCharBg }}
   >
-    <p className={`mb-0.5 text-[9px] ${tone === 'user' ? 'text-amber-100/90' : 'text-stone-500'}`}>
+    <p
+      className="mb-0.5 text-[9px]"
+      style={{ color: tone === 'user' ? 'rgba(254, 243, 199, 0.9)' : theme.sheetMutedInk }}
+    >
       《{reference.bookTitle}》· {reference.chapterTitle}
     </p>
-    <p className={`line-clamp-3 text-[11px] leading-relaxed ${tone === 'user' ? 'text-amber-50/95' : 'text-stone-600'}`}>
+    <p
+      className="line-clamp-3 text-[11px] leading-relaxed"
+      style={{ color: tone === 'user' ? 'rgba(255, 251, 235, 0.95)' : theme.sheetInk }}
+    >
       {highlightSummary(reference.quote, 120)}
     </p>
   </div>
@@ -229,23 +238,33 @@ const EmojiCard: React.FC<{ name: string; emoji?: Emoji }> = ({ name, emoji }) =
 );
 
 /** 思考链折叠块。默认收起——它是心象，不是说出口的话。 */
-const ThinkingBlock: React.FC<{ chain: string }> = ({ chain }) => {
+const ThinkingBlock: React.FC<{ chain: string; theme: ReadingTheme }> = ({ chain, theme }) => {
   const [expanded, setExpanded] = useState(false);
   const text = chain.trim();
   if (!text) return null;
   return (
-    <div className="mb-1.5 overflow-hidden rounded-lg border border-stone-200 bg-stone-50/90">
+    <div
+      className="mb-1.5 overflow-hidden rounded-lg border"
+      style={{ borderColor: theme.bubbleRing, backgroundColor: theme.reasoningBg }}
+    >
       <button
         onClick={() => setExpanded(value => !value)}
         aria-expanded={expanded}
-        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left active:bg-stone-100"
+        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left"
       >
         <span className="text-[11px]">💭</span>
-        <span className="flex-1 text-[9px] font-semibold tracking-wider text-stone-500">心象</span>
-        <CaretDown size={11} className={`shrink-0 text-stone-400 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+        <span className="flex-1 text-[9px] font-semibold tracking-wider" style={{ color: theme.sheetMutedInk }}>心象</span>
+        <CaretDown
+          size={11}
+          className={`shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`}
+          style={{ color: theme.sheetFaintInk }}
+        />
       </button>
       {expanded && (
-        <div className="max-h-48 overflow-y-auto border-t border-stone-200/70 px-2 py-1.5 text-[10px] leading-relaxed whitespace-pre-wrap text-stone-600">
+        <div
+          className="max-h-48 overflow-y-auto border-t px-2 py-1.5 text-[10px] leading-relaxed whitespace-pre-wrap"
+          style={{ borderColor: theme.dividerSoft, color: theme.sheetInk }}
+        >
           {text}
         </div>
       )}
@@ -257,6 +276,7 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
   open,
   charName,
   windowName,
+  theme,
   messages,
   pendingQuote,
   sending,
@@ -389,12 +409,13 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
 
   return (
     <div
-      className="absolute inset-y-0 right-0 z-40 flex flex-col bg-[#fbf6ec] shadow-[-8px_0_30px_rgba(0,0,0,0.18)] transition-[transform,width] duration-200 ease-out"
+      className="absolute inset-y-0 right-0 z-40 flex flex-col shadow-[-8px_0_30px_rgba(0,0,0,0.18)] transition-[transform,width] duration-200 ease-out"
       style={{
         width: full ? '100%' : HALF_WIDTH,
         transform: open ? 'translateX(0)' : 'translateX(105%)',
         pointerEvents: open ? 'auto' : 'none',
         paddingTop: 'var(--safe-top)',
+        backgroundColor: theme.sheetBg,
       }}
       onTouchStart={stopTouch}
       onTouchMove={stopTouch}
@@ -402,23 +423,25 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
       onClick={event => event.stopPropagation()}
     >
       {/* 标题栏：谁、哪个窗口、半屏/全屏、关闭。 */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-stone-200 px-3 py-2.5">
+      <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2.5" style={{ borderColor: theme.divider }}>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[12px] font-semibold text-stone-800">{charName}</span>
-          <span className="block truncate text-[10px] text-stone-400">
+          <span className="block truncate text-[12px] font-semibold" style={{ color: theme.sheetInk }}>{charName}</span>
+          <span className="block truncate text-[10px]" style={{ color: theme.sheetFaintInk }}>
             {sending ? '正在回话…' : windowName}
           </span>
         </span>
         <button
           onClick={() => setFull(previous => !previous)}
-          className="shrink-0 rounded-lg bg-stone-200/80 p-1.5 transition active:scale-90"
+          className="shrink-0 rounded-lg p-1.5 transition active:scale-90"
+          style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
           aria-label={full ? '收回半屏' : '展开全屏'}
         >
           {full ? <ArrowsInSimple size={14} weight="bold" /> : <ArrowsOutSimple size={14} weight="bold" />}
         </button>
         <button
           onClick={onClose}
-          className="shrink-0 rounded-lg bg-stone-200/80 p-1.5 transition active:scale-90"
+          className="shrink-0 rounded-lg p-1.5 transition active:scale-90"
+          style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
           aria-label="关闭讨论"
         >
           <X size={14} weight="bold" />
@@ -428,7 +451,7 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
       {/* 聊天记录。独立滚动区域。 */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto no-scrollbar px-3 py-3">
         {messages.length === 0 && !sending ? (
-          <p className="px-1 py-6 text-[11px] leading-relaxed text-stone-400">
+          <p className="px-1 py-6 text-[11px] leading-relaxed" style={{ color: theme.sheetFaintInk }}>
             还没有讨论。在正文里长按划线，选「问{charName}」，
             划的那段会出现在下面的输入框上方。
           </p>
@@ -450,16 +473,22 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
                     onTouchMove={handleBubbleTouchMove}
                     onTouchEnd={handleBubbleTouchEnd}
                     onTouchCancel={handleBubbleTouchEnd}
-                    className={`max-w-[88%] select-none rounded-2xl px-3 py-2 transition ${
-                      message.role === 'user'
-                        ? 'bg-stone-700 text-stone-50'
-                        : 'bg-white text-stone-700 ring-1 ring-stone-200'
-                    } ${actionMessage?.id === message.id ? 'ring-2 ring-orange-400' : ''}`}
+                    className="max-w-[88%] select-none rounded-2xl px-3 py-2 transition"
+                    style={{
+                      ...(message.role === 'user'
+                        ? { backgroundColor: theme.primaryBg, color: theme.primaryInk }
+                        : { backgroundColor: theme.bubbleBg, color: theme.bubbleInk }),
+                      boxShadow: actionMessage?.id === message.id
+                        ? `0 0 0 2px ${theme.focusRing}`
+                        : message.role === 'user'
+                          ? undefined
+                          : `0 0 0 1px ${theme.bubbleRing}`,
+                    }}
                   >
                     {message.reference && (
-                      <QuoteCard reference={message.reference} tone={message.role} />
+                      <QuoteCard reference={message.reference} tone={message.role} theme={theme} />
                     )}
-                    {message.thinkingChain && <ThinkingBlock chain={message.thinkingChain} />}
+                    {message.thinkingChain && <ThinkingBlock chain={message.thinkingChain} theme={theme} />}
                     {message.role === 'assistant' ? (
                       <>
                         {rich!.text && <MarkdownView content={rich!.text} />}
@@ -488,21 +517,28 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
             */}
             {sending && (
               <div className="flex justify-start">
-                <div className="max-w-[88%] rounded-2xl bg-white px-3 py-2 text-stone-700 ring-1 ring-stone-200">
+                <div
+                  className="max-w-[88%] rounded-2xl px-3 py-2"
+                  style={{
+                    backgroundColor: theme.bubbleBg,
+                    color: theme.bubbleInk,
+                    boxShadow: `0 0 0 1px ${theme.bubbleRing}`,
+                  }}
+                >
                   {streamingText
                     ? (() => {
                       const rich = parseCollaborationRichOutput(streamingText);
                       return rich.text
                         ? <MarkdownView content={rich.text} />
-                        : <span className="text-[11px] text-stone-400">（表情包）</span>;
+                        : <span className="text-[11px]" style={{ color: theme.sheetFaintInk }}>（表情包）</span>;
                     })()
                     : (
                       <span className="flex items-center gap-1 py-0.5">
                         {[0, 1, 2].map(index => (
                           <span
                             key={index}
-                            className="h-1.5 w-1.5 animate-pulse rounded-full bg-stone-400"
-                            style={{ animationDelay: `${index * 160}ms` }}
+                            className="h-1.5 w-1.5 animate-pulse rounded-full"
+                            style={{ animationDelay: `${index * 160}ms`, backgroundColor: theme.typingInk }}
                           />
                         ))}
                       </span>
@@ -520,45 +556,53 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
         不加这一条键盘弹起来会把输入框压到屏幕外面。
       */}
       <div
-        className="shrink-0 border-t border-stone-200 px-3 pt-2.5"
-        style={{ paddingBottom: 'calc(var(--safe-bottom) + var(--keyboard-inset, 0px) + 10px)' }}
+        className="shrink-0 border-t px-3 pt-2.5"
+        style={{ paddingBottom: 'calc(var(--safe-bottom) + var(--keyboard-inset, 0px) + 10px)', borderColor: theme.divider }}
       >
         {/* 失败提示。用户那条消息还在上面，没有被删掉。 */}
         {errorText && (
-          <div className="mb-2 flex items-start gap-1.5 rounded-xl bg-red-50 px-2.5 py-2 ring-1 ring-red-200">
-            <WarningCircle size={13} weight="fill" className="mt-0.5 shrink-0 text-red-500" />
-            <span className="min-w-0 flex-1 text-[10px] leading-relaxed text-red-700">
+          <div
+            className="mb-2 flex items-start gap-1.5 rounded-xl px-2.5 py-2"
+            style={{ backgroundColor: theme.errorBg, boxShadow: `0 0 0 1px ${theme.errorRing}` }}
+          >
+            <WarningCircle size={13} weight="fill" className="mt-0.5 shrink-0" style={{ color: theme.errorInk }} />
+            <span className="min-w-0 flex-1 text-[10px] leading-relaxed" style={{ color: theme.errorInk }}>
               {errorText}
-              <span className="mt-0.5 block text-red-500/80">你刚才那条已经存下来了，没有丢。</span>
+              <span className="mt-0.5 block" style={{ color: theme.errorFaintInk }}>你刚才那条已经存下来了，没有丢。</span>
             </span>
             <button
               onClick={onDismissError}
-              className="shrink-0 rounded-md bg-red-100 p-1 transition active:scale-90"
+              className="shrink-0 rounded-md p-1 transition active:scale-90"
+              style={{ backgroundColor: theme.errorRing }}
               aria-label="收起这条提示"
             >
-              <X size={11} weight="bold" className="text-red-600" />
+              <X size={11} weight="bold" style={{ color: theme.errorInk }} />
             </button>
           </div>
         )}
 
         {/* 待发送的引用，在输入框**上方**。久定的顺序：先引用，再写感想。 */}
         {pendingQuote && (
-          <div className="mb-2 flex items-start gap-2 rounded-xl bg-amber-50 px-2.5 py-2 ring-1 ring-amber-200/80">
-            <Quotes size={13} weight="fill" className="mt-0.5 shrink-0 text-amber-600" />
+          <div
+            className="mb-2 flex items-start gap-2 rounded-xl px-2.5 py-2"
+            style={{ backgroundColor: theme.quoteBg, boxShadow: `0 0 0 1px ${theme.quoteRing}` }}
+          >
+            <Quotes size={13} weight="fill" className="mt-0.5 shrink-0" style={{ color: theme.quoteIconInk }} />
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[9px] text-stone-500">
+              <span className="block truncate text-[9px]" style={{ color: theme.sheetMutedInk }}>
                 《{pendingQuote.bookTitle}》· {pendingQuote.chapterTitle}
               </span>
-              <span className="mt-0.5 block line-clamp-3 text-[11px] leading-relaxed text-stone-700">
+              <span className="mt-0.5 block line-clamp-3 text-[11px] leading-relaxed" style={{ color: theme.sheetInk }}>
                 {highlightSummary(pendingQuote.quote, 140)}
               </span>
             </span>
             <button
               onClick={onClearQuote}
-              className="shrink-0 rounded-md bg-amber-200/70 p-1 transition active:scale-90"
+              className="shrink-0 rounded-md p-1 transition active:scale-90"
+              style={{ backgroundColor: theme.quoteCloseBg }}
               aria-label="去掉这段引用"
             >
-              <X size={11} weight="bold" className="text-amber-800" />
+              <X size={11} weight="bold" style={{ color: theme.quoteCloseInk }} />
             </button>
           </div>
         )}
@@ -569,12 +613,18 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
             onChange={event => setDraft(event.target.value)}
             rows={2}
             placeholder={pendingQuote ? '写点什么，或者直接发这段引用' : `和${charName}说点什么`}
-            className="max-h-28 min-h-[44px] flex-1 resize-none rounded-xl bg-white px-2.5 py-2 text-[12px] leading-relaxed text-stone-800 outline-none ring-1 ring-stone-200 focus:ring-2 focus:ring-orange-400"
+            className="max-h-28 min-h-[44px] flex-1 resize-none rounded-xl px-2.5 py-2 text-[12px] leading-relaxed outline-none"
+            style={{
+              backgroundColor: theme.inputBg,
+              color: theme.inputInk,
+              boxShadow: `0 0 0 1px ${theme.inputRing}`,
+            }}
           />
           {sending ? (
             <button
               onClick={onStop}
-              className="mb-0.5 shrink-0 rounded-xl bg-red-100 p-2.5 text-red-700 transition active:scale-90"
+              className="mb-0.5 shrink-0 rounded-xl p-2.5 transition active:scale-90"
+              style={{ backgroundColor: theme.dangerBg, color: theme.dangerInk }}
               aria-label="停止生成"
             >
               <Stop size={15} weight="fill" />
@@ -583,7 +633,8 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
             <button
               onClick={handleSend}
               disabled={!canSend}
-              className="mb-0.5 shrink-0 rounded-xl bg-stone-700 p-2.5 text-stone-50 transition active:scale-90 disabled:opacity-35"
+              className="mb-0.5 shrink-0 rounded-xl p-2.5 transition active:scale-90 disabled:opacity-35"
+              style={{ backgroundColor: theme.primaryBg, color: theme.primaryInk }}
               aria-label="发送"
             >
               <PaperPlaneRight size={15} weight="fill" />
@@ -600,14 +651,14 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
         <div className="absolute inset-0 z-50" onClick={() => setActionMessage(null)}>
           <div className="absolute inset-0 bg-black/30" />
           <div
-            className="absolute bottom-0 left-0 right-0 rounded-t-2xl bg-[#fbf6ec] px-3 pt-3 shadow-[0_-8px_30px_rgba(0,0,0,0.2)]"
+            className="absolute bottom-0 left-0 right-0 rounded-t-2xl px-3 pt-3 shadow-[0_-8px_30px_rgba(0,0,0,0.2)]"
             onClick={event => event.stopPropagation()}
-            style={{ paddingBottom: 'calc(var(--safe-bottom) + 12px)' }}
+            style={{ paddingBottom: 'calc(var(--safe-bottom) + 12px)', backgroundColor: theme.sheetBg }}
           >
-            <p className="mb-1 text-[10px] text-stone-500">
+            <p className="mb-1 text-[10px]" style={{ color: theme.sheetMutedInk }}>
               {actionMessage.role === 'user' ? '你说的这条' : `${charName}说的这条`}
             </p>
-            <p className="mb-3 line-clamp-2 text-[11px] leading-relaxed text-stone-600">
+            <p className="mb-3 line-clamp-2 text-[11px] leading-relaxed" style={{ color: theme.sheetInk }}>
               {actionMessage.content.replace(/\s+/g, ' ').trim()
                 || (actionMessage.reference ? `［引用］${actionMessage.reference.quote}` : '（空消息）')}
             </p>
@@ -615,7 +666,8 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
             {actionMessage.role === 'user' && (
               <button
                 onClick={() => { onEditMessage(actionMessage); setActionMessage(null); }}
-                className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl bg-stone-700 py-2.5 text-[13px] text-stone-50 transition active:scale-95"
+                className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-xl py-2.5 text-[13px] transition active:scale-95"
+                style={{ backgroundColor: theme.primaryBg, color: theme.primaryInk }}
               >
                 <PencilSimple size={15} weight="bold" /> 收回来改
               </button>
@@ -624,20 +676,22 @@ const ReadingDiscussionPanel: React.FC<ReadingDiscussionPanelProps> = ({
             <div className="flex gap-2">
               <button
                 onClick={() => { onDeleteMessage(actionMessage.id); setActionMessage(null); }}
-                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-red-100 py-2.5 text-[13px] text-red-700 transition active:scale-95"
+                className="flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2.5 text-[13px] transition active:scale-95"
+                style={{ backgroundColor: theme.dangerBg, color: theme.dangerInk }}
               >
                 <Trash size={15} weight="bold" />
                 {actionMessage.role === 'assistant' && actionMessage.thinkingChain ? '删掉（连心象）' : '删掉这条'}
               </button>
               <button
                 onClick={() => setActionMessage(null)}
-                className="rounded-xl bg-stone-200/80 px-4 py-2.5 text-[13px] transition active:scale-95"
+                className="rounded-xl px-4 py-2.5 text-[13px] transition active:scale-95"
+                style={{ backgroundColor: theme.chipBg, color: theme.chipInk }}
               >
                 取消
               </button>
             </div>
 
-            <p className="mt-2 px-0.5 text-[9px] leading-relaxed text-stone-400">
+            <p className="mt-2 px-0.5 text-[9px] leading-relaxed" style={{ color: theme.sheetFaintInk }}>
               删掉之后，下一轮发给{charName}的历史里也不会再有这条。
             </p>
           </div>

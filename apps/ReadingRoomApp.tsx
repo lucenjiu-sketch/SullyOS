@@ -25,6 +25,7 @@ import {
 } from '../features/readingRoom/archive';
 import { resolveTurnExcerpt } from '../features/readingRoom/requestContext';
 import ReadingView, { READING_FONT_SIZES, type ReadingFlipMode } from '../features/readingRoom/ReadingView';
+import { resolveReadingThemeMode, type ReadingThemeMode } from '../features/readingRoom/theme';
 import ReadingRoomSettings from '../features/readingRoom/ReadingRoomSettings';
 import {
   readingRoomId,
@@ -54,6 +55,8 @@ import { trackEvent } from '../utils/analytics';
 
 const FONT_SIZE_KEY = 'sullyos_reading_font_size';
 const FLIP_MODE_KEY = 'sullyos_reading_flip_mode';
+/** 日间 / 夜间。手动切、跨书记住，不跟系统深色模式（久定的）。 */
+const THEME_MODE_KEY = 'sullyos_reading_theme_mode';
 
 /** 共读室里的两个页面。阅读页不在这套里，它由 `openBook` 单独接管整屏。 */
 type ReadingRoomTab = 'shelf' | 'settings';
@@ -132,6 +135,9 @@ const ReadingRoomApp: React.FC = () => {
   const [flipMode, setFlipMode] = useState<ReadingFlipMode>(() => (
     localStorage.getItem(FLIP_MODE_KEY) === 'vertical' ? 'vertical' : 'horizontal'
   ));
+  const [themeMode, setThemeMode] = useState<ReadingThemeMode>(() => (
+    resolveReadingThemeMode(localStorage.getItem(THEME_MODE_KEY))
+  ));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   /** 上次导入的原始字节，供「换个编码重读」复用，不必让用户再选一次文件。 */
@@ -185,6 +191,7 @@ const ReadingRoomApp: React.FC = () => {
 
   useEffect(() => { localStorage.setItem(FONT_SIZE_KEY, String(fontSize)); }, [fontSize]);
   useEffect(() => { localStorage.setItem(FLIP_MODE_KEY, flipMode); }, [flipMode]);
+  useEffect(() => { localStorage.setItem(THEME_MODE_KEY, themeMode); }, [themeMode]);
   useEffect(() => () => {
     if (longPressRef.current.timer !== null) window.clearTimeout(longPressRef.current.timer);
   }, []);
@@ -738,6 +745,7 @@ const ReadingRoomApp: React.FC = () => {
         initialOffset={initialOffset}
         fontSize={fontSize}
         flipMode={flipMode}
+        themeMode={themeMode}
         highlights={highlights}
         discussionCharName={discussionChar?.name}
         discussionWindowName={discussionWindow?.name}
@@ -747,6 +755,7 @@ const ReadingRoomApp: React.FC = () => {
         discussionError={discussionError}
         onChangeFontSize={setFontSize}
         onChangeFlipMode={setFlipMode}
+        onChangeThemeMode={setThemeMode}
         onOffsetChange={offset => persistProgress(openBook.id, offset)}
         onCreateHighlight={range => { void handleCreateHighlight(range); }}
         onDeleteHighlight={id => { void handleDeleteHighlight(id); }}
