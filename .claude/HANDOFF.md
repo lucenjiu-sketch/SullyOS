@@ -250,6 +250,126 @@ git config --add remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 
 ---
 
+## ✅ 上游同步已完成（2026-11-24）
+
+**PR #11 已合并，master 到 `e69708bd`。** 上游 `1806a67e`，**214 个提交 1030 个文件**。
+冲突只有 **10 个文件**，全部落在她的改动点上 —— 历史断层修好之后不再重算旧账，
+这次的冲突数量才是正常水位（上次 62 个里有 50 个是旧账）。
+
+分支 `sync/upstream-20261124` 停在 `5ed75e73`，**她说不用删，留着。**
+
+### 这次顺手砍掉了一个改动点：心象「发送项目自带引导」开关
+
+**上游自己做了同一件事，我们那个被删了。** 别再加回来。
+
+上游把心象提示词重构成了统一入口（`getThinkingChainSettings` +
+`buildThinkingChainPrompt`），并且新增了「追加 / 替换默认提示词」两档模式
+加「提示词作用范围」（所有角色共用 / 仅当前角色）。
+**「替换」模式的效果 ≈ 我们那个开关关掉**，只差一行「用户追加的心象规则」标题。
+
+是**久自己看出来的**（她看了提示词，发现总结模型只能看见「角色/用户」、
+分不清谁是谁，顺着就问了「这两个是不是一样的」）。她决定删掉自造的那个。
+问过她有没有角色设过这个字段 —— 没有，上游有这功能前她就没用过，所以**没写迁移**。
+
+删完这三个文件相对上游**零差异**，不再需要照顾：
+`utils/thinkingChainPrompt.ts` / `utils/chatRequestPayload.ts` /
+`components/chat/ThinkingChainSettingsModal.tsx`
+顺带删掉了 `utils/thinkingChainPromptToggle.test.ts`（整个文件只测这一个开关），
+`promptToggleBackupCompat.test.ts` 收回到只管六个 rp 开关。
+
+**所以现在是六个开关，不是七个。** `thinkingChainPrompt` 那一个没了。
+
+### 手工解的 10 个冲突
+
+| 文件 | 怎么解 |
+|---|---|
+| `types.ts` | 1 组，两边字段都留（她的 rp* 和上游的 PromptMode/Scope 不互斥） |
+| `utils/characterCard.ts` | 取上游，加回六个 rp 字段进 `CARD_STRIPPED_FIELDS` |
+| `utils/memoryPalace/pipeline.ts` | 取上游，加回 `reading_room` 进 `interactiveRecall`（上游这行新加了 `proactiveRecall`） |
+| `context/OSContext.tsx` | 2 组：import 两边都留（上游重写了 backup，`assembleV2Backup` 仍存在）；断流日志取上游整块、补回 `status`/`durationMs` |
+| `apps/Chat.tsx` | 1 组，**纯取上游**。上游换了面板接口（`value`/`onChange` → `character`/`onChangeCharacter`） |
+| `components/chat/ThinkingChainSettingsModal.tsx` | 纯取上游（上游重写，瘦身到 129 行，配色和风格搬去「个性装扮 → 心象」） |
+| `apps/CallApp.tsx` / `features/collaboration/context.ts` / `utils/activeMsgClient.ts` / `utils/chatOutputStylePrompt.ts` | 纯取上游 —— 它们本来是为那个被删的开关改的，开关没了就不用加回去 |
+
+### ⚠️ 这次抓到一个运行时错误，测试救了命
+
+`features/readingRoom/requestContext.ts` 的 `buildReadingRoomThinkingPrompt`
+原先**手写判断**、并且用旧的两参数签名调 `buildThinkingChainPrompt`。
+上游把签名改成三参数（第三个是 settings 对象）之后，这里直接
+`TypeError: Cannot read properties of undefined (reading 'enabled')` ——
+**共读室跟角色说话会炸**。`readingRoomRequest.test.ts` 抓到 3 条。
+
+已改成走 `getThinkingChainSettings` 同一入口。
+**教训：那个文件不在关键词 grep 清单里**（它有 `thinkingChainPromptEnabled`，
+所以其实在清单里 —— 真正的问题是我取上游原版时只顾了冲突文件，
+没顾「调用了被改签名函数的非冲突文件」）。
+**下次上游动了公共函数签名，要 grep 全部调用方，不只看冲突列表。**
+
+### 验证记录
+
+- `NODE_OPTIONS="--max-old-space-size=3072" npx vite build` 通过
+  `Static cache: 29 shell files (5.3 MiB), 1353 versioned resources`
+- 共读室全套 **252 passed**
+- `utils/memoryPalace` **432 passed**
+- 开关 + 抓包 + 协同 **128 passed**
+- 备份那批 **349 passed / 1 failed**
+
+**已知失败 2 条，都已用 worktree 在 `148ac51b` 上对照确认合并前同样失败：**
+- `utils/rpPromptToggles.test.ts` 的 `[[RECALL:` 断言（旧账，见下面 2026-10-22 那节）
+- `utils/backupArchive.test.ts` 的 5 秒超时（这台机器跑 7.5 秒）
+
+### 她验过什么
+
+真机用分支预览链接测的：心象面板（确认开关已消失、她的自定义提示词还在、
+「替换」还选着）、六个 rp 开关、线上聊天状态、本次发送统计、
+共读室聊天与写进记忆、正常聊天与电话。
+
+### 依赖
+
+`pnpm install --frozen-lockfile` 正常装完（新增 `fflate` / `postcss`），
+没报发布时间策略错误。
+
+---
+
+## 🐛 共读室归档总结人称反了（2026-11-24 修，她线上还没验）
+
+**久真机发现：总结里的「我」是她，角色成了第三方。**
+原话：「总结的内容的『我』都是用户说的内容诶，就是人称反了」。
+
+**不是同步带来的，是第三期写的时候就埋着。** 她之前漏测了这一条。
+
+根因在 `features/readingRoom/archive.ts` 的 `buildReadingArchiveTranscript`：
+说话人只写「用户」「角色」两个通用词，而提示词说「用${characterName}的第一人称写」，
+模型得自己猜「我」指哪边。**共读室每条引用要写三行**（「用户正在读 /
+用户划的原文 / 用户当时的想法」），「用户」密度远高于「角色」，
+中文里又更像第一人称主角，就被当成了「我」。
+提示词里还有一条「不要出现『用户』这类词」，和记录本身自相矛盾，更难判断。
+
+改了两处：
+- 转写函数加 `characterName` / `userName` 参数，署名与引用三行**全用真名**
+  （「陆沫久正在读《…》」「陆珂：…」）。名字留空时退回通用词兜脏数据。
+  调用方 `apps/ReadingRoomApp.tsx` 传 `char.name` 和 `userProfile.name`。
+- 提示词补两句：「署名X的是你自己说的话，署名Y的是对方说的话」
+  「『我』只能指X，绝不能用『我』去指Y」。
+
+测试补了 5 条钉死这件事（`utils/readingRoomArchive.test.ts`，33 passed）。
+
+**跟她讲过的两件事：**
+1. 这是提示词层面的修法，**不保证 100%**。线索给足、矛盾去掉了，
+   但最终是模型在判断。她线上验完要是还反，下一步把记录格式改更硬
+   （每行前面直接标 `[我]` / `[对方]`）。
+2. **已经存进去的那几条写错人称的总结不会自动改。**
+   她说自己去记忆宫殿找，不用帮。
+
+### 协同那边有同样的毛病，她没让动
+
+`features/collaboration/engine.ts:183` 的 `collaborationMemoryTranscript`
+也是写「用户」/「角色」。只是协同的记录里「用户」出现得少，没这么明显。
+**那是上游文件，动它就多一个改动点，她也没在那边遇到问题，所以没动。**
+她要是哪天说协同总结人称也反，照共读室这个套路改就行。
+
+---
+
 ## 这是什么
 
 SullyOS：纯前端网页，部署在 Vercel 上。
@@ -270,6 +390,11 @@ SullyOS：纯前端网页，部署在 Vercel 上。
 字段可选，缺失即视为开启，旧数据导入行为不变。
 已合并进 master（PR #1，master 到 611efb4），线上生效。
 （2026-10-27 又加了第七个 rpOnlineState，见下面。）
+
+⚠️ **2026-11-24：`thinkingChainPrompt` 那个开关已经删掉了**（上游做了同样的
+功能，见上面 2026-11-24 那节）。**现在是六个：rpStyle / rpEmotion /
+rpListening / rpSelf / rpAntiFiller / rpOnlineState。**
+下面各节里凡是写「七个开关」的，都按六个读。
 
 2026-10-12，跟上游同步了一次：33 个提交 299 个文件合进来，
 开关全部保留。master 到 `b9eeb9d6`（PR #3）。细节见下面那一节。
@@ -623,25 +748,35 @@ Vercel 那边自己按 lock 装，不受这个影响。
 
 **她改过的文件清单（冲突只会落在这些上）**
 
-⚠️ **2026-11-11 更正：之前的清单漏了两个文件，差点丢掉一个开关。**
-权威清单用这条命令现查，别照抄笔记（笔记会过期）：
+⚠️ **2026-11-24 更新：关键词变了。** 旧命令里的 `thinkingChainPromptEnabled`
+已经随那个开关一起删掉了（见上面 2026-11-24 那节），照旧命令查会多出噪音。
+权威清单用这条现查，别照抄笔记（笔记会过期）：
 
 ```bash
-cd ~/push && git grep -l -E 'resolveRpPromptToggles|rpPromptToggles|thinkingChainPromptEnabled|rpOnlineStateEnabled|buildApiResponseCapture' origin/master -- '*.ts' '*.tsx' | sed 's/^origin\/master://'
+cd ~/push && git grep -l -E 'resolveRpPromptToggles|rpPromptToggles|rpOnlineStateEnabled|buildApiResponseCapture' master -- '*.ts' '*.tsx' | sed 's|^master:||'
 ```
 
-2026-11-11 实查结果（14 个，加粗的是原来漏记的）：
-`utils/rpPromptToggles.ts` / `characterResponsePrinciples.ts` / `characterCard.ts` /
-`chatOutputStylePrompt.ts` / `chatPrompts.ts` / `chatRequestPayload.ts` /
-**`utils/context.ts`**（「表达底线」antiFiller 真正生效的地方，第 722 行那个 `if`
-套了 `resolveRpPromptToggles(char).antiFiller`，还要记得补 import）/
-**`utils/activeMsgClient.ts`**（第 869 行传 `thinkingChainPromptEnabled`）/
-`apps/Chat.tsx` / `apps/CallApp.tsx` / `components/chat/ChatModals.tsx` /
-`features/collaboration/context.ts` / `types.ts` / `utils/apiCallLog.ts`
-抓包另外还有：`context/OSContext.tsx` / `components/settings/ApiCallLogModal.tsx`
-（这两个文件里没有上面那些关键词，grep 查不到，要单独记着）
-构建水印另外还有：`vite.config.ts`（2026-11-16 加的 `WORKERS_CI_BRANCH` /
-`WORKERS_CI_COMMIT_SHA`，同样没有共同关键词、grep 查不到，见上面第四个改动点）
+2026-11-24 实查结果（12 个）：
+`utils/rpPromptToggles.ts` / `rpPromptToggles.test.ts` /
+`utils/characterResponsePrinciples.ts` / `utils/characterCard.ts` /
+`utils/chatPrompts.ts` / `utils/context.ts`（「表达底线」antiFiller 真正生效的
+地方，那个 `if` 套了 `resolveRpPromptToggles(char).antiFiller`，还要记得补 import）/
+`apps/Chat.tsx` / `components/chat/ChatModals.tsx` / `types.ts` /
+`utils/apiCallLog.ts` / `utils/apiResponseCapture.test.ts` /
+`utils/promptToggleBackupCompat.test.ts`
+
+**grep 查不到、必须单独记着的（三类，共四个文件）：**
+- 抓包：`context/OSContext.tsx` / `components/settings/ApiCallLogModal.tsx`
+- 构建水印：`vite.config.ts`（`WORKERS_CI_BRANCH` / `WORKERS_CI_COMMIT_SHA` 两行）
+- 共读室整套：`apps/ReadingRoomApp.tsx` / `features/readingRoom/*` /
+  `utils/readingRoom*`（上游完全没有这些文件，所以不会冲突，
+  但**上游改公共函数签名时会连带炸这里** —— 见 2026-11-24 那个 TypeError）
+
+⚠️ **冲突清单之外还要查一件事：上游有没有改公共函数的签名。**
+2026-11-24 踩到：`buildThinkingChainPrompt` 从两参数变三参数，
+共读室那个调用方**不在冲突列表里**（它那段没和上游撞），
+所以 merge 悄悄通过、构建也过，但运行时直接抛错。
+**办法：解完冲突后 grep 一遍被改过的公共函数的所有调用方，别只看冲突文件。**
 
 **⚠️ 判断「这是她的改动」不能只看 `git diff origin/master upstream/master`。**
 2026-11-11 踩到：历史断层（见下）会让**上游自己的新代码**显示成「她删掉的」。
@@ -730,19 +865,21 @@ master 到 `b9eeb9d6`，PR #3。上游 33 个提交 299 个文件，冲突 3 个
 
 ### 开关现在是怎么实现的（主分支这套是好的，别重构）
 
-七个开关：rpStyle / rpEmotion / rpListening / rpSelf / rpAntiFiller /
-rpOnlineState（2026-10-27 加） / thinkingChainPrompt
+**六个开关**（2026-11-24 起）：rpStyle / rpEmotion / rpListening / rpSelf /
+rpAntiFiller / rpOnlineState（2026-10-27 加）
 字段可选，缺失即视为开启，旧数据导入行为不变。
+
+~~thinkingChainPrompt~~ —— **2026-11-24 删了**，上游的「追加/替换」替代它。
+所以下面那三行（CallApp / collaboration / chatOutputStylePrompt）**只为那个
+开关存在的部分已经不在了**，它们现在跟上游一致。
 
 - `utils/rpPromptToggles.ts` —— 读开关（`char.rpXxxEnabled !== false`）
 - `utils/characterResponsePrinciples.ts` —— 文案分函数放，外面 `toggles.x ? fn() : ''`
 - `utils/characterCard.ts` —— 这些字段进 `CARD_STRIPPED_FIELDS`，不随角色卡分享
   （久确认过：导出角色卡时按默认全开就行）
 - `apps/Chat.tsx` / `components/chat/ChatModals.tsx` —— UI 接线
-- `apps/CallApp.tsx` —— 语音通话那一处判断
-- `features/collaboration/context.ts` —— 协同窗口那一处判断
-- `utils/chatOutputStylePrompt.ts` —— 聊天与定时主动消息共用（2026-10-22 迁来）
 - `utils/chatPrompts.ts` —— onlineState 那一处（2026-10-27 加，只此一处）
+- `utils/context.ts` —— antiFiller 真正生效的那个 `if`
 
 加第 N 个开关要碰的地方，照 PR #7 走就行：
 `rpPromptToggles.ts`（字段 + resolve）/ 文案所在文件套三元 / `types.ts` /

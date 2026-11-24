@@ -1,14 +1,15 @@
 # 共读室（ReadingRoom）· 交接
 
 接手前先读 `.claude/HANDOFF.md`（那些规矩仍然适用，尤其第 1、2、3 条）。
-这份只记共读室这件事。**2026-11-20 更新（第八次，第四期已合进 master）。**
+这份只记共读室这件事。**2026-11-24 更新（第九次，记一次人称 bug 和一次上游同步）。**
 
 ## 当前状态：四期全部上线。这件事做完了
 
-- **第四期已合进 master**（PR #10），master 到 `148ac51b`。本地已同步，
-  `git ls-remote` 核对过两边一样。
+- **第四期已合进 master**（PR #10）。之后又经过一次上游同步 + 一个 bug 修复，
+  **master 现在到 `e69708bd`**（PR #11，2026-11-24）。
 - 分支 `feat/reading-room-p4` 还在，停在 `dd754fdf`。**没删**，她没说要删。
-  （更早的 `feat/reading-room` 也还在，停在 `8951d23b`。）
+  （更早的 `feat/reading-room` 也还在，停在 `8951d23b`。
+  2026-11-24 的 `sync/upstream-20261124` 停在 `5ed75e73`，她明确说不用删。）
 - 第三期及之前是 PR #9，master 曾到 `38225370`。
 - 久在 Vercel 用「分支专属预览链接」测，不用 Create Deployment（她说直接就有）。
 
@@ -19,6 +20,60 @@
 「下一步做好了先让我验，没问题了再写进笔记里。」
 做完先给她验，别先更新交接单。**（第四期照这个走的：四笔提交推分支 →
 她真机逐条验 → 说「没问题了，合吧」→ 开 PR 合 master → 才写这份笔记。）
+
+---
+
+## ⚠️ 2026-11-24：两件事（人称 bug + 上游同步连带修复）
+
+### 1. 归档总结的人称反了 —— 已修，她线上还没验
+
+**久真机发现：总结里的「我」是她，角色成了第三方。**
+原话：「总结的内容的『我』都是用户说的内容诶，就是人称反了」。
+
+**是第三期写的时候就埋着的，不是同步带来的。** 她之前漏测了这一条。
+
+根因在 `features/readingRoom/archive.ts` 的 `buildReadingArchiveTranscript`：
+说话人只写「用户」「角色」两个通用词，而提示词说「用${characterName}的第一人称写」，
+模型只能自己猜「我」指哪边。**共读室每条引用要写三行**（「用户正在读 /
+用户划的原文 / 用户当时的想法」），「用户」密度远高于「角色」，
+中文里又更像第一人称主角，就被当成了「我」。
+提示词里还有一条「不要出现『用户』这类词」，和记录本身自相矛盾，更难判断。
+
+修法（两处）：
+- 转写函数加 `characterName` / `userName` 参数，署名与引用三行**全用真名**。
+  名字留空时退回「用户/角色」兜脏数据。
+  调用方 `apps/ReadingRoomApp.tsx:561` 传 `char.name` / `userProfile.name`。
+- 提示词补两句：「署名X的是你自己说的话，署名Y的是对方说的话」
+  「『我』只能指X，绝不能用『我』去指Y」。
+
+测试补了 5 条（`readingRoomArchive.test.ts` 现在 33 passed）。
+
+**这是提示词层面的修法，不保证 100%** —— 已经跟她说过。她线上验完要是还反，
+下一步把记录格式改更硬（每行前面直接标 `[我]` / `[对方]`）。
+
+**已经存进去的写错人称的总结不会自动改。** 她说自己去记忆宫殿找，不用帮。
+
+**协同那边有同样的毛病**（`features/collaboration/engine.ts:183`
+的 `collaborationMemoryTranscript`），但那是上游文件、她也没在那边遇到问题，
+**这次没动**。她要是哪天说协同总结人称也反，照这个套路改。
+
+### 2. 上游同步连带炸了共读室的心象组装 —— 已修
+
+上游（`1806a67e`）把 `buildThinkingChainPrompt` 从**两参数改成三参数**
+（第三个是 settings 对象），而 `features/readingRoom/requestContext.ts` 的
+`buildReadingRoomThinkingPrompt` 当时**手写判断 + 用旧签名调用**，结果
+`TypeError: Cannot read properties of undefined (reading 'enabled')` ——
+**跟角色说话直接炸**。`readingRoomRequest.test.ts` 抓到 3 条，才发现。
+
+已改成走 `getThinkingChainSettings(char, user)` 这个统一入口，
+和聊天、通话、协同同口径，顺带白拿了上游新的「提示词作用范围」。
+
+**那个文件不在冲突列表里**（它那段没和上游撞），所以 merge 悄悄通过、
+构建也过。**教训写进 HANDOFF 了：上游动公共函数签名时，要 grep 全部调用方。**
+
+⚠️ **顺带：久自己做的「发送项目自带引导」开关已经删掉了**
+（上游做了「追加/替换」，效果重复）。所以 `requestContext.ts` 里
+**别再手写心象判断**，也别再找 `thinkingChainPromptEnabled` 这个字段。
 
 ---
 
@@ -794,16 +849,16 @@ npx vitest run utils/readingRoom.test.ts utils/readingRoomHighlight.test.ts \
   utils/readingRoomDiscussion.test.ts utils/readingRoomStore.test.ts \
   utils/readingRoomRequest.test.ts utils/readingRoomArchive.test.ts \
   utils/readingRoomBackup.test.ts utils/readingRoomBackupStore.test.ts \
-  utils/readingRoomTheme.test.ts utils/readingRoomShelf.test.ts    # 252 passed
-npx vitest run utils/memoryPalace                                            # 402 passed
+  utils/readingRoomTheme.test.ts utils/readingRoomShelf.test.ts    # 2026-11-24：252 passed（不含 BackupStore）
+npx vitest run utils/memoryPalace                                            # 432 passed
 npx vitest run utils/safeAreaApps.test.ts utils/blurPolicy.test.ts \
   utils/appPreload.test.ts utils/appErrorBoundary.test.ts                    # 28 passed
 # 动了 OSContext / types.ts，备份那一整套也要跑：
 npx vitest run utils/backup utils/promptToggleBackupCompat.test.ts \
   utils/storyTheaterBackup.test.ts utils/userSpaceBackup.test.ts \
-  utils/apiResponseCapture.test.ts utils/apiCallLog.test.ts   # 165 passed / 1 failed
+  utils/apiResponseCapture.test.ts utils/apiCallLog.test.ts   # 2026-11-24：349 passed / 1 failed
 NODE_OPTIONS="--max-old-space-size=3072" timeout 900 npx vite build          # 必跑
-# 成功标志是最后那行 Static cache: 23 shell files / 1325 versioned resources
+# 2026-11-24 的成功标志：Static cache: 29 shell files (5.3 MiB) / 1353 versioned resources
 ```
 
 **`npx tsc --noEmit` 在这个环境 OOM 跑不完**（HANDOFF 也记了），
