@@ -1,22 +1,193 @@
 # 共读室（ReadingRoom）· 交接
 
 接手前先读 `.claude/HANDOFF.md`（那些规矩仍然适用，尤其第 1、2、3 条）。
-这份只记共读室这件事。**2026-11-12 更新（第七次，已合进 master）。**
+这份只记共读室这件事。**2026-11-20 更新（第八次，第四期已合进 master）。**
 
-## 当前状态：共读室已经上线到正式版。这件事做完了
+## 当前状态：四期全部上线。这件事做完了
 
-- **已合进 master**（PR #9），master 到 `38225370`。本地 master 已同步。
-- 分支 `feat/reading-room` 还在，停在 `8951d23b`。**没删**，她没说要删。
-- 合并前的最后一个提交 `8951d23b`（备份导出失败时明确提示）。
-  上两个是 `673b7c81`（接入备份导出与恢复）和 `d70b90a7`（第三期）。
+- **第四期已合进 master**（PR #10），master 到 `148ac51b`。本地已同步，
+  `git ls-remote` 核对过两边一样。
+- 分支 `feat/reading-room-p4` 还在，停在 `dd754fdf`。**没删**，她没说要删。
+  （更早的 `feat/reading-room` 也还在，停在 `8951d23b`。）
+- 第三期及之前是 PR #9，master 曾到 `38225370`。
 - 久在 Vercel 用「分支专属预览链接」测，不用 Create Deployment（她说直接就有）。
 
-**下一步没有既定任务。** 她没有提第四期。
-真要往下做的话先问她想做什么，别自己挑一个开工（HANDOFF 第 1 条）。
+**下一步没有既定任务。** 第四期是她拿 GPT 写的需求文档提的，四条全做完了。
+真要往下做先问她想做什么，别自己挑一个开工（HANDOFF 第 1 条）。
 
 **久要求的节奏（她明确说过两次）：
 「下一步做好了先让我验，没问题了再写进笔记里。」
-做完先给她验，别先更新交接单。**
+做完先给她验，别先更新交接单。**（第四期照这个走的：四笔提交推分支 →
+她真机逐条验 → 说「没问题了，合吧」→ 开 PR 合 master → 才写这份笔记。）
+
+---
+
+## 第四期做了什么（2026-11-20，PR #10，已验收）
+
+她的原话起因：「共读室界面有个很长的黑框框，介绍备份的问题，这个有点影响美观」，
+加上一份 GPT 写的需求文档（四条）。**四笔提交，一个需求一笔**，
+这样哪条出问题能单独退回去。
+
+### 1. `6680da5b` 删掉书架顶部提示条 + 划线选色改色
+
+那条深色提示条（`ReadingRoomApp.tsx` 里 `bg-stone-700` 那块）删了。
+它说的两件事——备份要手动导出、长按书封能改名——设置页底部已经有一份，
+信息没丢。顺手删了变成未使用的 `WarningCircle` import。
+
+划线颜色**数据层本来就有**：`ReadingHighlight.color` 字段、
+`READING_HIGHLIGHT_COLORS` 四色色板、渲染读 `highlight.color`，
+全都是第二期就写好的，之前只是 `confirmEnd` 里写死了 `DEFAULT_HIGHLIGHT_COLOR`。
+所以这一条只补了界面：
+
+- `renderColorRow(current, onPick)` 一个函数，三处共用：
+  创建划线的小条、长按已有划线的面板、划线列表里每一条
+- 选过的色留到下一条（`draftColor` state）——连着划几条通常是同一个用途
+- 改色走 `onRecolorHighlight` → App 的 `handleRecolorHighlight`，
+  乐观更新 + 失败回滚，和 `handleCreateHighlight` 一个套路
+
+**新加的 `resolveHighlightColor`（`highlight.ts`）别删。** 备份校验层对 color
+是 `str(row.color) || ''`（容错、不丢整条），所以库里真的可能有空串；
+空串塞进 `backgroundColor` **不报错、只是没有底色**，用户以为自己没划上。
+渲染三处都过这个归一化。有测试。
+
+### 2. `f731d273` 字号下探到 13px + 日间/夜间主题
+
+字号：`READING_FONT_SIZES` 从 `[16,18,20,22,24,26]` 改成
+`[13,14,15,16,17,18,20,22,24,26]`。**小字 1px 一档、20 以上 2px**，
+理由是 13–18 每级观感差别明显，20 以上再细分只是档位变多。
+有测试钉死这个步长规律，防止以后有人「顺手统一步长」。
+
+**改这个数组只能加不能删**：`ReadingRoomApp` 读 localStorage 时校验存的值
+在不在数组里，不在就退回 20。删掉某一档会让正用着那一档的人被重置。
+
+A- / A+ 的点按方式保留（久要求的），没做拖动滑块——滑块在那个弹层里
+只有一行高，手指盖住就看不到当前值。菜单里按她给的截图重排成
+「A- / 数字 / A+」一体的分段条。
+
+**日夜主题：新建 `features/readingRoom/theme.ts`，两套配色各 54 个键。**
+
+⚠️ **为什么是 JS 对象而不是 CSS 变量 + Tailwind 任意值 —— 别重构掉。**
+这项目的 Tailwind 是 **CDN 运行时版**（`index.html` 引的
+`vendor/tailwind-3.4.17.js`），而且**全仓零处**用过 `bg-[var(--x)]`。
+运行时版能不能解析那种写法没有先例可循，赌错了的表现是颜色直接不生效、
+且只有真机看得见。写成普通字符串按主题取最稳，顺带能单测。
+
+阅读页和讨论面板里写死的 80 多处颜色全部改成从主题取。
+**日间那套一个值都没动**，是从原来的 class 逐个翻过来的
+（有测试钉死 `pageBg` / `bodyInk` / `sheetBg` 三个值）。
+
+手动切换，存 `sullyos_reading_theme_mode`，跨书记住。
+**不跟系统深色模式** —— 久定的，她的理由是白天开夜间读书也合理。
+
+### 3. `f1fa436b` 书封自定义
+
+`ReadingBook` 加可选 `coverUrl`，没有就走原来 `coverPalette(book.id)` 的渐变。
+入口在长按书封那个面板里：从相册选 / 粘图片链接 / 恢复默认。
+
+- 相册走项目现成的 `processImage(file, { maxWidth: 400, quality: 0.85 })`，
+  和换头像同一条路。**压缩不能省**：原图动辄两三 MB，而封面是 data URL
+  整条进备份的（书的正文本来就进，方案 A）。
+- 图床链接原样存，几十字节。
+
+**`resolveCoverUrl`（`layout.ts`）是协议白名单，渲染和备份导入校验共用。**
+只认 `data:image/` / `https://` / `http://`，挡掉 `javascript:` 这类伪协议——
+备份是纯文本、可以被编辑，而这个值直接进 `<img src>`。
+坏协议**只摘掉封面、不丢整本书**（那本退回渐变封面）。
+
+用 `<img>` 而不是 `backgroundImage`：img 有 `onError`，图床链接哪天挂了
+能把它摘掉、露出下面的渐变封面，不留破图框。
+
+有自定义封面时**封面上不再压书名**（图上多半自带，叠一层会糊），
+书名在封面下面那行照样显示。
+
+### 4. `dd754fdf` 书架管理模式 + 批量删
+
+右上角「管理」→ 封面出勾选圈、底栏换成「全选 / 已选 N 本 / 删除」。
+管理模式下的几处刻意处理（别「优化」掉）：
+
+- **书封不挂长按**：长按菜单里本来就有删除，和批量删会打架
+- **「上传 TXT」那格藏掉**：它不是书，摆在勾选网格里只会被误点
+- **空书架不显示「管理」按钮**：点了没反应的按钮只会让人疑惑
+- 选中的封面压一层暗罩，一眼看出选了哪几本，不用去数小圆圈
+
+**批量删走 `store.deleteBooks`，整批一个事务，不是循环单删。**
+循环会出现「删到第三本失败，前两本已经没了」，而她只看到一句报错、
+根本不知道删掉了几本。连带删的东西和单本 `deleteBook` 完全一致
+（正文 / 进度 / 那些书的划线），**讨论消息同样不动**（窗口不属于书）。
+
+**确认框必须列书名**（`describeDeleteConfirm`，超过五本折叠但数量照说）。
+只说「删除 3 本书？」的话勾错了也看不出来，而这步之后没有退路。
+文案里写明「已经写进记忆的讨论不受影响」——不写她会以为记忆也没了。
+
+勾选逻辑在新建的 `features/readingRoom/shelf.ts`，纯函数、不碰 DOM 和库。
+书架变了跑一次 `reconcileShelfSelection` 对账：换封面会刷新书架、
+恢复备份会整批换掉，留着不存在的 id 会让「已选 N 本」和屏幕上的勾不一致，
+删除时还会去删不存在的书。
+
+### 这期跟她讲过的脆点（动手前说的，不是事后补）
+
+1. **图床链接可能失效**：表现是封面悄悄变回渐变色，**没有提示**。
+2. **相册上传的图进备份**：一张约 30–60KB，书多了备份会明显涨。
+   她选了接受（她本来就打算读完一本就删一本）。
+3. **夜间模式漏掉的地方不报错**，只在真机点开那个弹窗时显出一块白，
+   构建和测试都抓不到。她逐个界面验过了（目录、划线列表、讨论面板、
+   长按划线的面板、长按消息的菜单）。
+4. **批量删不可撤销**，确认框列书名是唯一的防线。
+
+### 这期刻意没做的
+
+- 封面没做裁剪 / 换比例，就是 `object-cover` 铺满。她没提这个需求。
+- 字号没做拖动滑块（理由见上面）。
+- 日夜没做跟随系统（她明确说手动切）。
+- 没加第五种划线颜色（问过她，「够了」）。
+
+### 新增 / 动过的文件
+
+```
+features/readingRoom/theme.ts     新建，日夜两套配色（54 键）+ resolve 函数
+features/readingRoom/shelf.ts     新建，书架管理模式的纯逻辑
+features/readingRoom/highlight.ts +READING_HIGHLIGHT_COLOR_NAMES / resolveHighlightColor
+features/readingRoom/layout.ts    +resolveCoverUrl（封面协议白名单）
+features/readingRoom/types.ts     ReadingBook +coverUrl?
+features/readingRoom/store.ts     +deleteBooks（整批一个事务），DB 版本仍是 v4
+features/readingRoom/ReadingView.tsx          字号档位 / 主题接线 / 色点排
+features/readingRoom/ReadingDiscussionPanel.tsx  主题接线（QuoteCard、ThinkingBlock 也要收 theme）
+apps/ReadingRoomApp.tsx           删提示条 / 封面 / 管理模式 / 改色落库
+utils/readingRoomBackup.ts        books 多筛一个 coverUrl
+utils/readingRoomTheme.test.ts    新建，10 条
+utils/readingRoomShelf.test.ts    新建，18 条
+```
+
+**数据库没升版本。** `coverUrl` 只是给书对象加一个可选字段，没有新表，
+所以不用提醒她「彻底关掉页面重开」那条（见下面脆点第 7 条）。
+
+### 验证记录
+
+```bash
+# 共读室全套（现在十个文件）
+npx vitest run utils/readingRoom.test.ts utils/readingRoomHighlight.test.ts \
+  utils/readingRoomDiscussion.test.ts utils/readingRoomStore.test.ts \
+  utils/readingRoomRequest.test.ts utils/readingRoomArchive.test.ts \
+  utils/readingRoomBackup.test.ts utils/readingRoomBackupStore.test.ts \
+  utils/readingRoomTheme.test.ts utils/readingRoomShelf.test.ts   # 252 passed
+npx vitest run utils/memoryPalace utils/safeAreaApps.test.ts utils/blurPolicy.test.ts \
+  utils/appPreload.test.ts utils/appErrorBoundary.test.ts          # 430 passed
+npx vitest run utils/backup utils/promptToggleBackupCompat.test.ts \
+  utils/storyTheaterBackup.test.ts utils/userSpaceBackup.test.ts \
+  utils/apiResponseCapture.test.ts utils/apiCallLog.test.ts   # 165 passed / 1 failed
+NODE_OPTIONS="--max-old-space-size=3072" timeout 900 npx vite build
+# ✓ Static cache: 23 shell files (4.9 MiB), 1325 versioned resources
+```
+
+共读室 **212 → 252 个用例**。备份那批那 1 个失败是 `backupArchive.test.ts`
+超时（断言 5 秒、这台机器 7.5 秒），**改之前就是红的，别去修**。
+
+### 她验过什么（已完成，不用再叫她测）
+
+书架：提示条没了、换封面（相册 + 链接 + 恢复默认）、管理模式勾选 /
+全选 / 批量删 / 确认框。
+阅读设置：字号到 13、日夜切换、**夜间模式下逐个点开所有弹层看白块**。
+划线：选色、改色、列表里改色、退出重进颜色还在。
 
 ### 2026-11-12 这次（GPT 代码审查的三条，只改了一条）
 
@@ -409,6 +580,8 @@ features/readingRoom/layout.ts       段落切分 + 段间距 + 书封配色（�
 features/readingRoom/highlight.ts    划线纯逻辑：区间/与页求交/切片/微调/上下文
 features/readingRoom/caret.ts        触摸点 → 全文偏移（唯一碰浏览器排版的地方）
 features/readingRoom/discussion.ts   窗口和消息的纯逻辑：分栏/命名/改名/预览/失效修复/归档标记
+features/readingRoom/shelf.ts        书架管理模式的纯逻辑：勾选/全选/对账/删除确认文案（第四期）
+features/readingRoom/theme.ts        日间/夜间两套配色 + 归一化（第四期，**别改成 CSS 变量**）
 features/readingRoom/requestContext.ts  一轮请求的上下文组装（召回 + 人设 + 共读说明）
 features/readingRoom/engine.ts       发请求（API 解析 + 流式 + 回复解析）
 features/readingRoom/archive.ts      归档总结：转写 + 第一人称提示词 + 调副 LLM + 日期壳
@@ -419,17 +592,19 @@ features/readingRoom/ReadingRoomSettings.tsx     设置页（选角色 + 选窗�
 features/readingRoom/ReadingArchiveReview.tsx    写进记忆前的预览页（独立组件）
 apps/ReadingRoomApp.tsx              书架 + 底栏 + 调度 + 划线/选择/讨论的读写 + 调副 LLM 和写记忆
 utils/readingRoomBackup.ts           备份的导出包装 + 导入校验（纯函数）
-utils/readingRoom.test.ts            36 个用例
-utils/readingRoomHighlight.test.ts   33 个用例（划线那套）
+utils/readingRoom.test.ts            40 个用例（含封面协议白名单）
+utils/readingRoomHighlight.test.ts   36 个用例（划线那套，含颜色归一化）
 utils/readingRoomDiscussion.test.ts  52 个用例（窗口、改名、消息、预览、选择）
-utils/readingRoomStore.test.ts       8 个用例（真读写 IndexedDB：v4 升级/隔离/级联删）
+utils/readingRoomStore.test.ts       11 个用例（真读写 IndexedDB：v4 升级/隔离/级联删/批量删）
 utils/readingRoomRequest.test.ts     27 个用例（说明里的变量、心象开关、前后文边界）
 utils/readingRoomArchive.test.ts     28 个用例（转写、提示词、配置判断、日期壳、归档标记）
-utils/readingRoomBackup.test.ts      23 个用例（原版兼容、坏数据筛除）
+utils/readingRoomBackup.test.ts      25 个用例（原版兼容、坏数据筛除、封面往返）
 utils/readingRoomBackupStore.test.ts 5 个用例（真读写 IndexedDB：往返、覆盖语义）
+utils/readingRoomTheme.test.ts       10 个用例（两套主题键对齐、字号档位规律）
+utils/readingRoomShelf.test.ts       18 个用例（勾选、全选、对账、删除确认文案）
 ```
 
-合计 **212 个用例**。
+合计 **252 个用例**。
 
 ### 动过的上游文件（合上游时留意）
 
@@ -518,7 +693,17 @@ utils/readingRoomBackupStore.test.ts 5 个用例（真读写 IndexedDB：往返�
     她说要删自己去记忆宫殿。
 14. **删书会连带删掉那本书的所有划线**（正文、进度也一起）。
     讨论消息和已写进去的记忆不受影响。她打算读完就删书来省备份体积，
-    **提醒她先写进记忆再删**。
+    **提醒她先写进记忆再删**。批量删同一个口径。
+15. **图床链接当封面可能失效**（第四期）：图挂了封面悄悄变回渐变色，
+    **没有提示**。`<img onError>` 把它摘掉就是这个行为，刻意的。
+16. **相册上传的封面进备份**（第四期）：压到 400px 宽、一张约 30–60KB，
+    base64 塞在 JSON 里。书多了备份会明显涨。她接受（本来就打算读完删书）。
+17. **夜间模式漏掉的地方不报错**（第四期）：某块颜色拿到 `undefined`，
+    只是那块没变色，构建和测试都抓不到。`readingRoomTheme.test.ts` 守着
+    「两套主题键完全一致 + 每个值非空」这一层，但**新加 UI 时用没用主题
+    那个对象，只有真机能看出来**。改共读室界面后记得切夜间点一遍。
+18. **批量删不可撤销**（第四期）：确认框列书名是唯一的防线。
+    `describeDeleteConfirm` 别改成只报数量。
 
 ## 验收清单
 
@@ -608,7 +793,8 @@ cd ~/push
 npx vitest run utils/readingRoom.test.ts utils/readingRoomHighlight.test.ts \
   utils/readingRoomDiscussion.test.ts utils/readingRoomStore.test.ts \
   utils/readingRoomRequest.test.ts utils/readingRoomArchive.test.ts \
-  utils/readingRoomBackup.test.ts utils/readingRoomBackupStore.test.ts    # 212 passed
+  utils/readingRoomBackup.test.ts utils/readingRoomBackupStore.test.ts \
+  utils/readingRoomTheme.test.ts utils/readingRoomShelf.test.ts    # 252 passed
 npx vitest run utils/memoryPalace                                            # 402 passed
 npx vitest run utils/safeAreaApps.test.ts utils/blurPolicy.test.ts \
   utils/appPreload.test.ts utils/appErrorBoundary.test.ts                    # 28 passed
