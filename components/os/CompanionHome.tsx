@@ -140,6 +140,7 @@ import {
   saveCompanionTouchPreset,
 } from '../../utils/companionPresets';
 import { deleteCompanionVoiceBlob } from '../../utils/companionVoiceAssets';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 
 // ── 时段氛围：陪伴桌面按虚拟时间换天色（晨曦 / 白日 / 黄昏 / 夜晚）──
 interface DayPeriod {
@@ -483,6 +484,7 @@ const CompanionHome: React.FC = () => {
   const [touchRegionEditingZone, setTouchRegionEditingZone] = useState<AvatarTouchZone>('face');
   const [cropDraft, setCropDraft] = useState<AvatarStageCrop>(() => character?.videoAvatar?.companionCrop || DEFAULT_STAGE_CROP);
   const [frameStyle, setFrameStyle] = useState<CompanionFrameStyleId>(loadCompanionFrameStyle);
+  const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
   const editingRef = useRef(false);
   editingRef.current = editing;
   const busyRef = useRef(false);
@@ -1254,9 +1256,18 @@ const CompanionHome: React.FC = () => {
     setFrameStyle(nextStyle);
     saveCompanionFrameStyle(nextStyle);
   };
-  const applyCompanionBackground = async (value?: string) => {
+  const applyCompanionBackground = async (value?: string, skipConfirm = false) => {
     if (!character) return;
     const previous = character.companionBackground;
+    if (!skipConfirm && previous && isBlobRef(previous) && previous !== value) {
+      const ok = await requestConfirm({
+        title: value ? '替换自定义舞台背景？' : '移除自定义舞台背景？',
+        message: '当前的本地背景图片将被删除，且无法恢复。',
+        confirmText: value ? '确认替换' : '确认移除',
+        variant: 'danger',
+      });
+      if (!ok) return;
+    }
     updateCharacter(character.id, { companionBackground: value });
     // 背景令牌只被这个字段引用，替换/清除后旧 Blob 直接删掉，不留孤儿
     if (previous && isBlobRef(previous) && previous !== value) await deleteBlobRef(previous);
@@ -1277,7 +1288,7 @@ const CompanionHome: React.FC = () => {
           addToast('图片超过 20 MB，请压缩后再用作背景', 'error');
           return;
         }
-        await applyCompanionBackground(await putImageBlob(file));
+        await applyCompanionBackground(await putImageBlob(file), true);
         addToast('桌面背景已更新', 'success');
       } catch (error: any) {
         addToast(error?.message || '背景导入失败', 'error');
@@ -1408,10 +1419,17 @@ const CompanionHome: React.FC = () => {
     addToast(`已切换触摸预设「${preset.name}」`, 'success');
   };
 
-  const deleteStartupPreset = () => {
+  const deleteStartupPreset = async () => {
     if (!character || !selectedStartupPresetId || settingsGenerating) return;
     const preset = character.companionTouchSettings?.startupPresets?.find(item => item.id === selectedStartupPresetId);
-    if (!preset || !window.confirm(`删除开场预设「${preset.name}」？`)) return;
+    if (!preset) return;
+    const ok = await requestConfirm({
+      title: `删除开场预设「${preset.name}」？`,
+      message: '将删除这条已保存的开场预设，当前编辑器里的草稿内容仍会保留。',
+      confirmText: '确认删除',
+      variant: 'danger',
+    });
+    if (!ok) return;
     const before = companionTouchSettingsBase();
     const after = removeCompanionStartupPreset(before, selectedStartupPresetId);
     updateCharacter(character.id, { companionTouchSettings: after });
@@ -1421,10 +1439,17 @@ const CompanionHome: React.FC = () => {
     addToast('开场预设已删除；当前草稿仍保留', 'success');
   };
 
-  const deleteTouchPreset = () => {
+  const deleteTouchPreset = async () => {
     if (!character || !selectedTouchPresetId || settingsGenerating) return;
     const preset = character.companionTouchSettings?.touchPresets?.find(item => item.id === selectedTouchPresetId);
-    if (!preset || !window.confirm(`删除触摸预设「${preset.name}」？`)) return;
+    if (!preset) return;
+    const ok = await requestConfirm({
+      title: `删除触摸预设「${preset.name}」？`,
+      message: '将删除这条已保存的触摸预设，当前反馈配置仍会保留。',
+      confirmText: '确认删除',
+      variant: 'danger',
+    });
+    if (!ok) return;
     const before = companionTouchSettingsBase();
     const after = removeCompanionTouchPreset(before, selectedTouchPresetId);
     updateCharacter(character.id, { companionTouchSettings: after });
@@ -2722,7 +2747,7 @@ const CompanionHome: React.FC = () => {
           data-testid="companion-touch-settings"
         >
           <section
-            className="max-h-[88vh] w-full overflow-y-auto rounded-t-[2rem] border-t border-white/20 px-4 pb-5 pt-3 text-white shadow-[0_-24px_60px_rgba(0,0,0,.5)] backdrop-blur-2xl"
+            className="max-h-[88vh] w-full overflow-y-auto rounded-t-[2rem] border-t border-white/20 px-4 pb-5 pt-3 text-white [color-scheme:dark] shadow-[0_-24px_60px_rgba(0,0,0,.5)] backdrop-blur-2xl"
             style={{ background: `linear-gradient(165deg, ${palette.panelTop}f7, ${palette.panelBottom}fc)`, animation: 'companion-drawer-up 260ms ease-out both', paddingBottom: 'max(1.25rem, calc(var(--safe-bottom, 0px) + 1rem))' }}
             onClick={event => event.stopPropagation()}
           >
@@ -2805,7 +2830,7 @@ const CompanionHome: React.FC = () => {
                   onChange={event => selectStartupPreset(event.target.value)}
                   data-testid="companion-startup-preset-select"
                   aria-label="选择开场预设"
-                  className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+                  className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none disabled:opacity-45"
                 >
                   <option value="">{startupPresets.length ? `选择已保存预设（${startupPresets.length}）` : '还没有开场预设'}</option>
                   {startupPresets.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
@@ -2851,7 +2876,7 @@ const CompanionHome: React.FC = () => {
                   setStartupVoiceLanguage(event.target.value);
                   trackEvent('设置桌面陪伴语音语种', { 用途: '开机', 语种: voiceLanguageAnalyticsValue(event.target.value) });
                 }}
-                className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+                className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none disabled:opacity-45"
               >
                 {VOICE_LANGUAGE_OPTIONS.map(option => (
                   <option key={option.value} value={option.value}>{option.value ? option.label : '中文原文（不翻译）'}</option>
@@ -3019,7 +3044,7 @@ const CompanionHome: React.FC = () => {
                       value={startupEditorPerformance.emotion}
                       disabled={settingsGenerating}
                       onChange={event => patchStartupPerformance({ emotion: event.target.value as AvatarPerformanceDirection['emotion'] })}
-                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 outline-none"
+                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none"
                     >
                       {AVATAR_EMOTIONS.map(emotion => <option key={emotion} value={emotion}>{STARTUP_EMOTION_LABELS[emotion]}</option>)}
                     </select>
@@ -3030,7 +3055,7 @@ const CompanionHome: React.FC = () => {
                       value={startupEditorPerformance.gesture}
                       disabled={settingsGenerating}
                       onChange={event => patchStartupPerformance({ gesture: event.target.value as AvatarPerformanceDirection['gesture'] })}
-                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 outline-none"
+                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none"
                     >
                       {AVATAR_GESTURES.map(gesture => <option key={gesture} value={gesture}>{STARTUP_GESTURE_LABELS[gesture]}</option>)}
                     </select>
@@ -3077,7 +3102,7 @@ const CompanionHome: React.FC = () => {
                         modelAction: event.target.value || undefined,
                         modelActions: event.target.value ? [event.target.value] : [],
                       })}
-                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 outline-none"
+                      className="mt-1 w-full border border-white/12 bg-[#151021] px-2 py-2 text-[9px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none"
                     >
                       <option value="">不指定</option>
                       {modelActions.map(action => <option key={action.id} value={action.id}>{action.name}</option>)}
@@ -3173,7 +3198,7 @@ const CompanionHome: React.FC = () => {
                 onChange={event => selectTouchPreset(event.target.value)}
                 data-testid="companion-touch-preset-select"
                 aria-label="选择触摸预设"
-                className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+                className="min-w-0 border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none disabled:opacity-45"
               >
                 <option value="">{touchPresets.length ? `选择已保存预设（${touchPresets.length}）` : '还没有触摸预设'}</option>
                 {touchPresets.map(preset => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
@@ -3230,7 +3255,7 @@ const CompanionHome: React.FC = () => {
                 setTouchVoiceLanguage(event.target.value);
                 trackEvent('设置桌面陪伴语音语种', { 用途: '触摸', 语种: voiceLanguageAnalyticsValue(event.target.value) });
               }}
-              className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 outline-none disabled:opacity-45"
+              className="mt-1 w-full border border-white/12 bg-[#151021] px-3 py-2 text-[10px] text-white/82 [color-scheme:dark] [&>option]:bg-[#151021] [&>option]:text-white outline-none disabled:opacity-45"
             >
               {VOICE_LANGUAGE_OPTIONS.map(option => (
                 <option key={option.value} value={option.value}>{option.value ? option.label : '中文原文（不翻译）'}</option>
@@ -3882,6 +3907,7 @@ const CompanionHome: React.FC = () => {
         </>
       )}
       </div>
+      {confirmDialog}
     </div>
   );
 };

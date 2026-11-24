@@ -1,3 +1,4 @@
+import RecalledSoundNotice from './os/RecalledSoundNotice';
 import FirstUseGuide from './FirstUseGuide';
 import DeploymentNotice from './os/DeploymentNotice';
 import { useDeploymentNotice } from '../hooks/useDeploymentNotice';
@@ -9,8 +10,10 @@ import { shouldShowAnniversaryGift, markAnniversaryGiftSeen } from '../utils/ann
 
 
 
-import React, { useState, useEffect, useMemo, useRef, Suspense } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, Suspense } from 'react';
 import { IMPORT_IN_PROGRESS_KEY, useOS } from '../context/OSContext';
+import { importPhaseLabel, type ImportProgressMarker } from '../utils/backupImportPolicy';
+import { RestoreDamagedAssetsStartupNotice } from './BackupMissingAssetsNotice';
 import StatusBar from './os/StatusBar';
 import { SARModuleMonitor } from './sar/SARModuleMonitor';
 import Launcher from '../apps/Launcher';
@@ -112,6 +115,7 @@ import { Like520Controller, shouldShowLike520Popup } from './Like520Event';
 import { QixiLaunchPopup } from './QixiLaunchPopup';
 import { shouldShowQixiLaunchPopup } from '../utils/qixiLaunchPopup';
 import { UpdateNotificationController, shouldShowUpdateNotification } from './UpdateNotificationEvent';
+import CanaryChangelog, { CANARY_CHANGELOG_ON_BOOT } from './CanaryChangelog';
 import { BackupReminderController } from './BackupReminderEvent';
 import { shouldShowBackupReminder, markBackupReminderShown, daysSinceLastBackup } from '../utils/backupReminder';
 import { formatBytes } from '../utils/format';
@@ -132,7 +136,8 @@ import DreamSimIndicator from './os/DreamSimIndicator';
 import ErrorDialog from './os/ErrorDialog';
 import BootSequence from './os/BootSequence';
 import { setAppPayloadWarmer, shouldUseIdleAppPreload } from './os/appPreload';
-import { isBrowserBackGuardState, makeBrowserBackGuardState } from '../utils/browserBackGuard';
+import { errorDetails } from '../utils/errorSelfCheck';
+import { isBrowserBackGuardState, listenForAppBrowserBack } from '../utils/browserBackGuard';
 
 /*
 // Internal Error Boundary Component
@@ -173,7 +178,7 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode, onCloseApp
     };
 
     private handleCopy = async () => {
-        const errText = this.state.error?.stack || this.state.error?.message || 'Unknown Error';
+        const errText = errorDetails(this.state.error);
 
         try {
             if (navigator.clipboard?.writeText) {
@@ -243,21 +248,7 @@ class AppErrorBoundary extends Component<{ children: React.ReactNode, onCloseApp
 
 const DISCLAIMER_KEY = 'sullyos_disclaimer_accepted';
 
-type ImportRecoveryMarker = {
-  startedAt?: number;
-  updatedAt?: number;
-  phase?: string;
-  source?: string;
-  sourceSize?: number;
-  current?: string;
-  currentFile?: string;
-  currentFileSize?: number;
-  assetDone?: number;
-  assetTotal?: number;
-  itemDone?: number;
-  itemTotal?: number;
-  error?: string;
-};
+type ImportRecoveryMarker = ImportProgressMarker;
 
 const getPendingImportMarker = (): ImportRecoveryMarker | null => {
   try {
@@ -268,16 +259,7 @@ const getPendingImportMarker = (): ImportRecoveryMarker | null => {
   }
 };
 
-const getImportPhaseLabel = (phase?: string) => {
-  switch (phase) {
-    case 'parsing': return '解析备份文件';
-    case 'assets': return '恢复备份素材';
-    case 'database': return '写入数据库';
-    case 'settings': return '恢复系统设置';
-    case 'error': return '导入报错';
-    default: return '导入流程';
-  }
-};
+const getImportPhaseLabel = importPhaseLabel;
 
 
 
@@ -371,7 +353,7 @@ const ImportRecoveryPopup: React.FC<{
             </div>
           )}
           <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3 text-[12px] text-amber-700 leading-relaxed">
-            <div>中断阶段：{phaseLabel}</div>
+            <div>中断阶段：{phaseLabel}{marker.stage ? ` · ${marker.stage}` : ''}</div>
             {marker.current && <div>当前部分：{marker.current}</div>}
             {hasItemProgress && <div>条目进度：{marker.itemDone || 0}/{marker.itemTotal}</div>}
             {hasAssetProgress && <div>素材进度：{marker.assetDone || 0}/{marker.assetTotal}</div>}
@@ -760,6 +742,17 @@ const PhoneShell: React.FC = () => {
     }
   }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, isDataLoaded, isLocked]);
 
+  // canary 更新日志：排在启动提醒的最后，正式版里永远是空的（docs/canary-channel.md「更新日志」）。
+  const [showCanaryChangelog, setShowCanaryChangelog] = useState(false);
+  const canaryChangelogAsked = useRef(false);
+  useEffect(() => {
+    if (canaryChangelogAsked.current || CANARY_CHANGELOG_ON_BOOT.length === 0) return;
+    if (anniversaryHasPriority || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder) return;
+    if (!isDataLoaded || isLocked) return;
+    canaryChangelogAsked.current = true;
+    setShowCanaryChangelog(true);
+  }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, showBackupReminder, isDataLoaded, isLocked]);
+
   const dismissBackupReminder = () => {
     markBackupReminderShown();
     setShowBackupReminder(false);
@@ -799,32 +792,9 @@ const PhoneShell: React.FC = () => {
       };
     }
 
-    const armGuard = () => {
-      try {
-        window.history.pushState(
-          makeBrowserBackGuardState(window.history.state),
-          '',
-          window.location.href,
-        );
-        return true;
-      } catch {
-        return false;
-      }
-    };
-
-    if (!guardIsCurrent && !armGuard()) return;
-
-    const onPopState = (event: PopStateEvent) => {
-      // A nested panel was above the SullyOS guard and handled this back itself.
-      if (isBrowserBackGuardState(event.state)) return;
-
-      // Re-arm before navigating inside the OS so another quick swipe is safe too.
-      armGuard();
+    return listenForAppBrowserBack(window, () => {
       if (!deploymentNotice.blocked) handleBack();
-    };
-
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    });
   }, [activeApp, handleBack, deploymentNotice.blocked]);
 
   // Capacitor Native Handling
@@ -847,31 +817,28 @@ const PhoneShell: React.FC = () => {
     };
     initNative();
 
-    // Handle Android Hardware Back Button
-    const setupBackButton = async () => {
-        if (Capacitor.isNativePlatform()) {
-            try {
-                await CapApp.removeAllListeners();
-                CapApp.addListener('backButton', ({ canGoBack }) => {
-                    if (deploymentNotice.blocked) return;
-                    if (isLocked) {
-                        CapApp.exitApp();
-                    } else {
-                        handleBack(); // Delegate to OSContext logic
-                    }
-                });
-            } catch (e) { console.log('Back button listener setup failed'); }
-        }
-    };
+  }, [deploymentNotice.blocked]);
 
-    setupBackButton();
-
+  // Keep one native listener through in-app navigation and provider re-renders.
+  const nativeBack = useRef({isLocked, blocked: deploymentNotice.blocked, handleBack});
+  useLayoutEffect(() => {
+    nativeBack.current = {isLocked, blocked: deploymentNotice.blocked, handleBack};
+  }, [isLocked, deploymentNotice.blocked, handleBack]);
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    let disposed = false;
+    const registration = CapApp.addListener('backButton', () => {
+      const {isLocked, blocked, handleBack} = nativeBack.current;
+      if (disposed || blocked) return;
+      if (isLocked) void CapApp.exitApp();
+      else handleBack();
+    });
+    void registration.catch(() => console.log('Back button listener setup failed'));
     return () => {
-        if (Capacitor.isNativePlatform()) {
-            CapApp.removeAllListeners().catch(() => {});
-        }
+      disposed = true;
+      void registration.then(listener => listener.remove()).catch(() => {});
     };
-  }, [activeApp, isLocked, closeApp, handleBack, deploymentNotice.blocked]);
+  }, []);
 
   // Force scroll to top when app changes to prevent "push up" glitches on iOS
   useEffect(() => {
@@ -1195,10 +1162,12 @@ const PhoneShell: React.FC = () => {
        </div>
 
        {/* Global error dialog (长报错走它, 替代单行 toast) */}
+       <RecalledSoundNotice />
        <ErrorDialog
          isOpen={!!errorDialog}
          title={errorDialog?.title ?? ''}
          details={errorDialog?.details ?? ''}
+         advice={errorDialog?.advice}
          onClose={dismissError}
        />
 
@@ -1225,6 +1194,9 @@ const PhoneShell: React.FC = () => {
          />
        )}
 
+       {/* 上次恢复跳过了备份包里已损坏的素材：重启后在这里提示一次 */}
+       <RestoreDamagedAssetsStartupNotice blocked={startupNoticesBlocked || showImportRecoveryPrompt} />
+
        {/* 见面 · 剧情首映：解锁后一次性出现 */}
        {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && showUpdateNotification && (
          <UpdateNotificationController onClose={() => setShowUpdateNotification(false)} />
@@ -1244,12 +1216,12 @@ const PhoneShell: React.FC = () => {
 
        <FeedbackInvitation
          ready={isDataLoaded && !isLocked && (bootDone || !bootAnimationEnabled)}
-         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder}
+         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder || showCanaryChangelog}
        />
 
        <BeautyRepoInvitation
          ready={isDataLoaded && !isLocked && (bootDone || !bootAnimationEnabled)}
-         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder}
+         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder || showCanaryChangelog}
        />
        {/* 「该备份啦」提醒（local-first 数据只在本机，隔 N 天没导出弹一次） */}
        {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && !showLike520Popup && showBackupReminder && (
@@ -1257,6 +1229,9 @@ const PhoneShell: React.FC = () => {
            onDismiss={dismissBackupReminder}
            onGoBackup={goBackupFromReminder}
          />
+       )}
+       {showCanaryChangelog && (
+         <CanaryChangelog days={CANARY_CHANGELOG_ON_BOOT} onClose={() => setShowCanaryChangelog(false)} />
        )}
     </div>
   );

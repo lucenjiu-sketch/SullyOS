@@ -19,7 +19,9 @@
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 
 import { CloudBackupConfig, CloudBackupFile } from '../types';
+import { DownloadedBackup, receiveBackupDownload, verifyBackupPart } from './backupDownload';
 import { getProxyWorkerUrl } from './proxyWorker';
+import { formatTraceBytes, startStepTrace } from './taskTrace';
 
 const API_HOST = 'https://api.github.com';
 const UPLOAD_HOST = 'https://uploads.github.com';
@@ -94,7 +96,7 @@ const isNative = (): boolean => {
 //
 // 用 FileReader.readAsDataURL 走流式编码，比 btoa(String.fromCharCode(...))
 // 抗大文件——后者一次性展开 80MB Uint8Array 当 apply 参数会爆栈。
-const blobToBase64 = (blob: Blob): Promise<string> =>
+export const blobToBase64 = (blob: Blob): Promise<string> =>
     new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => {
@@ -131,7 +133,15 @@ export const describeGithubUploadTransportFailure = (
         try { workerHost = new URL(workerHost).host; } catch { /* keep the configured URL */ }
         return `${prefix}。当前走应用内 Cloudflare 中转（${workerHost}），说明这台设备到中转、`
             + '中转到 GitHub、或大文件传输中的某一段未打通。能打开 github.com、Token 测试通过或开着梯子，'
-            + '都不能证明这条上传线路可用；请到「自定义网络代理 (Worker)」检查或更换 Worker，也可关闭中转改试直连。';
+            + '都不能证明这条上传线路可用。中转能不能连上取决于本机网络：没开梯子的话，请先开梯子再试；'
+            + '开着仍然失败，请到「自定义网络代理 (Worker)」检查或更换 Worker'
+            + (isNative() ? '，也可关闭中转改试直连。' : '。');
+    }
+    // uploads.github.com 不回应浏览器的 CORS 预检，网页直连上传必然失败；原生壳走系统网络栈，直连失败才是线路问题
+    if (!isNative()) {
+        return `${prefix}。网页里不能直连 GitHub 的附件上传域名 uploads.github.com：它不允许网页访问，`
+            + '能打开 github.com、api.github.com 测试通过或开着梯子都一样。请到「GitHub 备份 → 高级选项」'
+            + '开启“应用内 Cloudflare 中转”后重试。';
     }
     return `${prefix}。当前正在直连 GitHub 附件域名 uploads.github.com；它与 github.com、api.github.com 是不同线路。`
         + '能打开 GitHub、Token 测试通过或开着梯子，都不代表附件域名已被代理接管；请到「GitHub 备份 → 高级选项」'
@@ -686,8 +696,11 @@ export const uploadBackup = async (
 
     let releaseId = 0;
     let tag = '';
+    // 中断留痕（utils/taskTrace.ts）：只有上传途中页面没了才留下来，正常结束、报错结束都在 finally 删掉。
+    const trace = startStepTrace('cloudUpload', { 云端: 'GitHub', 备份大小: formatTraceBytes(blob.size) });
     try {
         onProgress?.(2);
+        trace.step('创建备份草稿');
         const ts = Date.now();
         tag = `${TRANSACTIONAL_TAG_PREFIX}${ts}`;
         const releaseName = `${RELEASE_NAME_PREFIX}${new Date(ts).toISOString()}`;
@@ -711,6 +724,7 @@ export const uploadBackup = async (
 
         onProgress?.(5);
         const totalParts = Math.max(1, Math.ceil(blob.size / MAX_PART_SIZE));
+        trace.note({ 分片数: totalParts });
         const baseName = filename.replace(/\.zip$/i, '');
         const padWidth = String(totalParts).length;
         const span = 86 / Math.max(1, totalParts);
@@ -725,8 +739,11 @@ export const uploadBackup = async (
                 : `${baseName}.part${String(i + 1).padStart(padWidth, '0')}of${String(totalParts).padStart(padWidth, '0')}.zip`;
 
             const base = 5 + i * span;
+            const partStep = `上传第 ${i + 1} / ${totalParts} 片`;
+            trace.step(partStep, start, blob.size, 'B');
             const result = await uploadAssetWithRetry(config, releaseId, partBlob, partName, (frac) => {
                 onProgress?.(Math.min(91, Math.floor(base + frac * span)));
+                trace.step(partStep, start + Math.floor(frac * (end - start)), blob.size, 'B');
             });
             if (!result.ok || !result.asset) {
                 throw new Error(`第 ${i + 1}/${totalParts} 片失败：${result.message}`);
@@ -750,6 +767,7 @@ export const uploadBackup = async (
         };
         const manifestBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
         const manifestName = `${baseName}${MANIFEST_SUFFIX}`;
+        trace.step('写入完成标记');
         const manifestResult = await uploadAssetWithRetry(
             config,
             releaseId,
@@ -762,6 +780,7 @@ export const uploadBackup = async (
             throw new Error(`写入完成标记失败：${manifestResult.message}`);
         }
 
+        trace.step('发布备份');
         const publish = await ghRequest(
             config,
             `${API_HOST}/repos/${owner}/${repo}/releases/${releaseId}`,
@@ -793,6 +812,8 @@ export const uploadBackup = async (
             };
         }
         return { ok: false, message: `上传失败：${reason}` };
+    } finally {
+        trace.clear();
     }
 };
 
@@ -916,6 +937,7 @@ export const listBackups = async (config: CloudBackupConfig): Promise<CloudBacku
                     status: isComplete ? 'ready' : 'incomplete',
                     statusMessage: isComplete ? undefined : `上传未完成：${incompleteReasons.join('；') || '附件状态异常'}`,
                     partSizes: group.parts.map(part => Math.max(0, Number(part.asset.size) || 0)),
+                    partDigests: group.parts.map(part => (typeof part.asset.digest === 'string' ? part.asset.digest : undefined)),
                 });
             }
         }
@@ -933,15 +955,17 @@ export const listBackups = async (config: CloudBackupConfig): Promise<CloudBacku
  * web; CapacitorHttp follows redirects by default.
  *
  * For multi-part backups, href is 'releaseId:id1,id2,id3,...'. We download
- * each part sequentially and concatenate into a single Blob — bytes line up
+ * each part sequentially and append it to one download file — bytes line up
  * directly because uploadBackup used Blob.slice() with no envelope/header.
  */
 const downloadAssetPart = async (
     config: CloudBackupConfig,
     assetId: number,
     expectedSize: number | undefined,
+    expectedDigest: string | undefined,
+    label: string,
     onPartProgress?: (loadedBytes: number) => void,
-): Promise<ArrayBuffer> => {
+): Promise<Uint8Array<ArrayBuffer>> => {
     const token = config.githubToken!;
     const owner = config.githubOwner!;
     const repo = repoName(config);
@@ -967,17 +991,23 @@ const downloadAssetPart = async (
                 throw lastError;
             }
 
-            const buffer = await response.arrayBuffer(onPartProgress);
-            if (expectedSize && buffer.byteLength !== expectedSize) {
-                lastError = new Error(`GitHub 备份分片大小不符（应为 ${expectedSize} 字节，实际 ${buffer.byteLength} 字节）。`);
+            const bytes = new Uint8Array(await response.arrayBuffer(onPartProgress));
+            try {
+                await verifyBackupPart(bytes, {
+                    label,
+                    size: expectedSize || undefined,
+                    digest: expectedDigest,
+                });
+            } catch (mismatch: any) {
+                lastError = mismatch;
                 if (attempt < MAX_ASSET_ATTEMPTS - 1) {
                     await delay(750 * (attempt + 1));
                     continue;
                 }
                 throw lastError;
             }
-            if (buffer.byteLength === 0) throw new Error('GitHub 返回了 0 字节备份附件。');
-            return buffer;
+            if (bytes.byteLength === 0) throw new Error('GitHub 返回了 0 字节备份附件。');
+            return bytes;
         } catch (error: any) {
             lastError = error instanceof Error ? error : new Error(String(error || '下载失败'));
             if (attempt >= MAX_ASSET_ATTEMPTS - 1) break;
@@ -992,7 +1022,7 @@ export const downloadBackup = async (
     config: CloudBackupConfig,
     file: CloudBackupFile,
     onProgress?: (percent: number) => void,
-): Promise<Blob | null> => {
+): Promise<DownloadedBackup | null> => {
     const token = config.githubToken;
     const owner = config.githubOwner;
     const repo = repoName(config);
@@ -1009,28 +1039,34 @@ export const downloadBackup = async (
         throw new Error('这个备份缺少有效的 GitHub 附件标识，请刷新备份列表后重试。');
     }
 
+    const trace = startStepTrace('cloudDownload', { 云端: 'GitHub', 备份大小: formatTraceBytes(Number(file.size) || 0), 分片数: assetIds.length });
     try {
         onProgress?.(2);
-        const buffers: ArrayBuffer[] = [];
         let downloadedBytes = 0;
         const totalBytes = Math.max(0, Number(file.size) || 0);
         const span = 96 / assetIds.length;
-        for (let i = 0; i < assetIds.length; i++) {
-            const completedBeforePart = downloadedBytes;
-            const buf = await downloadAssetPart(config, assetIds[i], file.partSizes?.[i], (partLoadedBytes) => {
-                if (totalBytes > 0) {
-                    const byteFraction = Math.min(1, (completedBeforePart + partLoadedBytes) / totalBytes);
-                    onProgress?.(Math.min(98, Math.max(2, Math.floor(2 + byteFraction * 96))));
-                }
-            });
-            buffers.push(buf);
-            downloadedBytes += buf.byteLength;
-            onProgress?.(totalBytes > 0
-                ? Math.min(99, Math.floor(2 + Math.min(1, downloadedBytes / totalBytes) * 96))
-                : Math.min(99, Math.floor(2 + (i + 1) * span)));
-        }
+        const backup = await receiveBackupDownload(async sink => {
+            for (let i = 0; i < assetIds.length; i++) {
+                const completedBeforePart = downloadedBytes;
+                const label = `GitHub 备份第 ${i + 1}/${assetIds.length} 片`;
+                const partStep = `下载第 ${i + 1} / ${assetIds.length} 片`;
+                trace.step(partStep, downloadedBytes, totalBytes || undefined, 'B');
+                const bytes = await downloadAssetPart(config, assetIds[i], file.partSizes?.[i], file.partDigests?.[i], label, (partLoadedBytes) => {
+                    trace.step(partStep, completedBeforePart + partLoadedBytes, totalBytes || undefined, 'B');
+                    if (totalBytes > 0) {
+                        const byteFraction = Math.min(1, (completedBeforePart + partLoadedBytes) / totalBytes);
+                        onProgress?.(Math.min(98, Math.max(2, Math.floor(2 + byteFraction * 96))));
+                    }
+                });
+                await sink.write(bytes);
+                downloadedBytes += bytes.byteLength;
+                onProgress?.(totalBytes > 0
+                    ? Math.min(99, Math.floor(2 + Math.min(1, downloadedBytes / totalBytes) * 96))
+                    : Math.min(99, Math.floor(2 + (i + 1) * span)));
+            }
+        }, totalBytes || undefined, trace);
         onProgress?.(100);
-        return new Blob(buffers, { type: 'application/zip' });
+        return backup;
     } catch (error: any) {
         if (
             !shouldUseGithubProxy(config)
@@ -1038,12 +1074,26 @@ export const downloadBackup = async (
             && (error instanceof TypeError || /failed to fetch/i.test(String(error?.message || '')))
         ) {
             throw new Error(
-                '浏览器直连 GitHub 的备份附件被网络或跨域限制拦截。'
-                + '请到「云端备份 → GitHub → 高级选项」手动开启 Cloudflare 中转后重试；应用不会自动开启。',
+                // 附件下载会被重定向到 release-assets.githubusercontent.com，那边不带 CORS 头，网页直连必然读不到
+                '网页里不能直接下载 GitHub 的备份附件：GitHub 存放附件的服务器不允许网页读取，开着梯子也一样。'
+                + '请到「云端备份 → GitHub → 高级选项」手动开启应用内 Cloudflare 中转后重试；应用不会自动开启。',
+            );
+        }
+        // 中转只解决「网页不能直连」，本机到中转这一段照样可能不通
+        if (
+            shouldUseGithubProxy(config)
+            && (error instanceof TypeError || /failed to fetch/i.test(String(error?.message || '')))
+        ) {
+            throw new Error(
+                '经应用内 Cloudflare 中转下载 GitHub 备份失败：这台设备没连上中转，或者传输中途断了。'
+                + '中转能不能连上取决于本机网络：没开梯子的话，请先开梯子再试；'
+                + '开着仍然失败，请到「自定义网络代理 (Worker)」检查或更换 Worker。',
             );
         }
         if (error instanceof Error) throw error;
         throw new Error(`GitHub 附件下载失败：${String(error || '未知错误')}`);
+    } finally {
+        trace.clear();
     }
 };
 

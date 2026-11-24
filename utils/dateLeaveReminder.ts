@@ -11,6 +11,8 @@ import { DB } from './db';
 import { ActiveMsgClient } from './activeMsgClient';
 import { applyScheduledTask } from './amsg2Tasks';
 import { buildDateLeaveInstruction } from './amsgFireSchedule';
+import { ActiveMsgStore } from './activeMsgStore';
+import { isAmsg2GloballyEnabled, isAmsgGlobalDisabledError } from './amsgGlobalGate';
 import { isAwayCloudRoute, runLocalProactiveTurn } from './awayMessage';
 
 export const DATE_LEAVE_DEFAULT_MINUTES = 5;
@@ -154,8 +156,14 @@ export const disarmDateLeaveReminder = (deps: Pick<DateLeaveDeps, 'char' | 'upda
     const uuid = cloudTaskOf(char);
     knownCloudTasks.delete(char.id);
     if (!uuid) return;
+    const cfg = await ActiveMsgStore.getGlobalConfig().catch(() => null);
+    if (!isAmsg2GloballyEnabled(cfg)) return;
     // 取消失败不重试：走开后开过口的，worker 到点看到私聊盖掉了见面租约会自己作废。
-    try { await ActiveMsgClient.cancelTask(uuid); } catch (error) { console.warn('[DateLeave] 取消云端任务失败', error); }
+    try {
+      await ActiveMsgClient.cancelTask(uuid);
+    } catch (error) {
+      if (!isAmsgGlobalDisabledError(error)) console.warn('[DateLeave] 取消云端任务失败', error);
+    }
     deps.updateCharacter(char.id, prev => prev.activeMsg2Config ? {
       activeMsg2Config: {
         ...prev.activeMsg2Config,
@@ -173,13 +181,13 @@ const spokeSince = async (charId: string, since: number): Promise<boolean> =>
 const fireLocal = async (deps: DateLeaveDeps, leftAt: number) => {
   const { char, userProfile } = deps;
   if (!userProfile || document.visibilityState !== 'visible' || await spokeSince(char.id, leftAt)) return;
-  const userName = userProfile.name || '对方';
   await runLocalProactiveTurn(char, {
     apiConfig: deps.apiConfig,
     userProfile,
     groups: deps.groups,
     realtimeConfig: deps.realtimeConfig,
-    hint: `[系统提示（非${userName}发言）: ${buildDateLeaveInstruction()}\n只写你发出去的消息本身，不要写时间、序号或旁白。]`,
+    // 与云端任务同一份纯指令，模板里已有「只写消息本身」的同义规则。
+    hint: buildDateLeaveInstruction(),
     purpose: '见面离开提醒',
     meta: { dateLeaveReminder: true },
     place: text => [{ text: text.trim(), at: Date.now() }],

@@ -31,6 +31,7 @@
 import { APIConfig, CharacterProfile, GroupProfile, RealtimeConfig, UserProfile } from '../types';
 import { ActiveMsgClient, isLlmCredentialsReady, owesInstantChatReply } from './activeMsgClient';
 import { ActiveMsgStore } from './activeMsgStore';
+import { isAmsg2GloballyEnabled, isAmsg2WorkerActive, isAmsgGlobalDisabledError } from './amsgGlobalGate';
 import { stampStateUpdatedAt } from './amsgStateClock';
 import { hasActiveAiTask } from './amsg2Tasks';
 import { AmsgChatPresence, CHAT_PRESENCE_HEARTBEAT_MS } from './amsgChatPresence';
@@ -204,8 +205,8 @@ export const markAmsgStateDirty = (
  */
 export const invalidateCharCloudState = async (charId: string): Promise<void> => {
   try {
-    const workerUrl = (await ActiveMsgStore.getGlobalConfig()).workerUrl?.trim();
-    if (!workerUrl) return;
+    const globalConfig = await ActiveMsgStore.getGlobalConfig();
+    if (!isAmsg2WorkerActive(globalConfig)) return;
     await ActiveMsgClient.clearCharClientState(charId);
   } catch (error) {
     console.warn(`${HEADER} 作废云端角色上下文失败（本地删除不受影响）`, charId, error);
@@ -288,6 +289,12 @@ export const flushAmsgState = async (reason: string): Promise<void> => {
       prunePersistedMarks(all);
       return;
     }
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关关闭期间不发请求也不排退避；charId 底账保留在 localStorage，重新开启后补传。
+      dirty.clear();
+      deferredIds.clear();
+      return;
+    }
 
     const currentBatch = batch.filter(isCurrentSnapshot);
     if (!currentBatch.length) return;
@@ -367,7 +374,7 @@ export const resumePendingAmsgStateSync = (scope: {
     queueToolConfigSnapshot(scope.realtimeConfig, saved?.updatedAt ?? stampStateUpdatedAt(), saved?.conflict === true);
   }
   // 每次启动对齐主 API，覆盖下线前留下的副 API；失败仍沿用欠账与退避重试。
-  if (scope.apiConfig) syncAmsgLlmCredentials(scope.apiConfig);
+  if (scope.apiConfig) syncAmsgLlmCredentials(scope.apiConfig, { onlyIfChanged: true });
 
   const pending = readPendingCharIds();
   if (pending.length === 0) return;
@@ -489,6 +496,12 @@ const runToolConfigSync = async (reason: string): Promise<void> => {
       writeToolConfigMark(false);
       return;
     }
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关暂停期间保留 localStorage 待传标记，清掉内存队列与重试，待重新开启后对齐。
+      hasPendingToolConfig = false;
+      pendingToolConfig = undefined;
+      return;
+    }
     await ActiveMsgClient.syncToolConfig(snapshot, { updatedAt: version });
     if (pendingToolConfigVersion === version) {
       hasPendingToolConfig = false;
@@ -567,6 +580,8 @@ export const AMSG2_PENDING_CRED_SYNC_LS_KEY = 'amsg2_pending_llm_creds';
 /** 待重传用的那份聊天配置。凭据本体不落 localStorage，底账只记「欠着一次」。 */
 let pendingCredApiConfig: APIConfig | undefined;
 let hasPendingCredSync = false;
+/** 这次同步要不要绕过指纹底账。用户亲手保存时为 true，见 syncAmsgLlmCredentials。 */
+let pendingCredForce = false;
 let credSyncing = false;
 let credRetryCount = 0;
 let credRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -619,9 +634,12 @@ const isOwnerRetired = (error: unknown): boolean =>
  * 本机代次对不上），整批都会被拒；这时按角色拆开重传，让其余角色的新凭据照常落地。
  * 返回被拒的角色 ID。
  */
-export const putCredentialRowsSkippingRetired = async (rows: LlmCredentialRow[]): Promise<string[]> => {
+export const putCredentialRowsSkippingRetired = async (
+  rows: LlmCredentialRow[],
+  options: { force?: boolean } = {},
+): Promise<string[]> => {
   try {
-    await ActiveMsgClient.putLlmCredentials(rows);
+    await ActiveMsgClient.putLlmCredentials(rows, options);
     return [];
   } catch (error) {
     if (!isOwnerRetired(error)) throw error;
@@ -634,7 +652,7 @@ export const putCredentialRowsSkippingRetired = async (rows: LlmCredentialRow[])
   const retired: string[] = [];
   for (const [charId, group] of byChar) {
     try {
-      await ActiveMsgClient.putLlmCredentials(group);
+      await ActiveMsgClient.putLlmCredentials(group, options);
     } catch (error) {
       if (!isOwnerRetired(error)) throw error;
       retired.push(charId);
@@ -648,19 +666,29 @@ const runLlmCredentialSync = async (reason: string): Promise<void> => {
   credSyncing = true;
   // 记下这次算的是哪一份：上传期间用户又改了配置的话，清账不能把新的那份一起清掉。
   const snapshot = pendingCredApiConfig;
+  const force = pendingCredForce;
   try {
     const globalConfig = await ActiveMsgStore.getGlobalConfig();
     // 没配 Worker / 没有 API 快照时没有同步目标，清掉底账。
     if (!globalConfig.workerUrl?.trim() || !snapshot) {
       hasPendingCredSync = false;
+      pendingCredForce = false;
       pendingCredApiConfig = undefined;
       writeCredSyncMark(false);
+      return;
+    }
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关暂停期间保留 localStorage 欠账标记，恢复开启时统一重传最新凭据。
+      hasPendingCredSync = false;
+      pendingCredForce = false;
+      pendingCredApiConfig = undefined;
       return;
     }
     if (await isLlmCredentialsReady()) {
       const characters = await allSpaceCharacters();
       const rows = await buildCredentialRowsToResync(snapshot, characters);
-      const retired = pickChangedCredRows(rows).length > 0 ? await putCredentialRowsSkippingRetired(rows) : [];
+      const shouldPut = rows.length > 0 && (force || pickChangedCredRows(rows).length > 0);
+      const retired = shouldPut ? await putCredentialRowsSkippingRetired(rows, { force }) : [];
       if (retired.length > 0) {
         // 重试也过不去，不留欠账；点名告诉用户是哪个角色、怎么处理。
         const names = retired.map((id) => `${characters.find((char) => char.id === id)?.name ?? '未知角色'}（${id}）`).join('、');
@@ -674,6 +702,7 @@ const runLlmCredentialSync = async (reason: string): Promise<void> => {
     if (refresh.failed > 0) throw new Error(`${refresh.failed} 个任务的 API 凭据尚未同步`);
     if (pendingCredApiConfig === snapshot) {
       hasPendingCredSync = false;
+      pendingCredForce = false;
       pendingCredApiConfig = undefined;
       writeCredSyncMark(false);
     }
@@ -706,9 +735,18 @@ const runLlmCredentialSync = async (reason: string): Promise<void> => {
  *
  * 立即传一次，失败退避重试，并在 localStorage 留底账等启动 / 下次冲刷补传。
  * 老 worker 没有凭据表，仍通过 refreshApiCredentialsForPendingTasks 逐条补刷。
+ *
+ * 默认绕过指纹底账直接覆盖云端：底账只记「本机传过什么」，云端那行可能被别的入口改过
+ * （Safari 与主屏 App 存储分开、换过 Worker），信底账会让云端一直用旧模型。用户亲手保存
+ * 时多一次请求换云端对齐。只有启动补传这类自动路径传 onlyIfChanged，免得每次打开都发。
  */
-export const syncAmsgLlmCredentials = (apiConfig: APIConfig): void => {
+export const syncAmsgLlmCredentials = (
+  apiConfig: APIConfig,
+  options: { onlyIfChanged?: boolean } = {},
+): void => {
   pendingCredApiConfig = apiConfig;
+  // 排队中已有一次强制同步时，后到的自动补传不能把它降级。
+  pendingCredForce = pendingCredForce || !options.onlyIfChanged;
   hasPendingCredSync = true;
   credRetryCount = 0;
   if (credRetryTimer != null) { clearTimeout(credRetryTimer); credRetryTimer = null; }
@@ -857,7 +895,9 @@ export type AmsgResetCloudWipe =
 export const wipeAmsgCloudDataForReset = async (): Promise<AmsgResetCloudWipe> => {
   let workerUrl = '';
   try {
-    workerUrl = (await ActiveMsgStore.getGlobalConfig()).workerUrl?.trim() || '';
+    const config = await ActiveMsgStore.getGlobalConfig();
+    if (!isAmsg2WorkerActive(config)) return { status: 'skipped' };
+    workerUrl = config.workerUrl?.trim() || '';
   } catch {
     // 连本地配置都读不到，等于无从判断有没有云端；按没有处理，别为它拦下重置。
     return { status: 'skipped' };
@@ -887,6 +927,10 @@ const writeChatPresence = (charId: string, lastUserMessageAt: number | null, sce
   };
   // 写入失败只 warn：心跳故障不能打断正常聊天，下一次 interval 继续尝试；远端 45s TTL 兜底。
   ActiveMsgClient.syncChatPresence(charId, presence).catch((error) => {
+    if (isAmsgGlobalDisabledError(error)) {
+      stopAmsgChatPresence(charId, scene);
+      return;
+    }
     console.warn(`${HEADER} 活跃会话租约写入失败（45s TTL 自然失效）`, error);
   });
 };
@@ -926,4 +970,33 @@ export const stopAmsgChatPresence = (charId: string, scene?: 'date') => {
     clearInterval(lease.timer);
     chatPresenceLeases.delete(charId);
   }
+};
+
+/**
+ * 全局总开关关闭时立即停下本模块全部心跳与重试定时器，清空内存待传队列；
+ * localStorage 上的待传标记予以保留，重新开启后由 resumePendingAmsgStateSync 统一对齐。
+ */
+export const pauseAmsgStateSync = (): void => {
+  for (const lease of chatPresenceLeases.values()) {
+    clearInterval(lease.timer);
+  }
+  chatPresenceLeases.clear();
+
+  if (flushDebounceTimer != null) { clearTimeout(flushDebounceTimer); flushDebounceTimer = null; }
+  if (retryTimer != null) { clearTimeout(retryTimer); retryTimer = null; }
+  if (toolConfigRetryTimer != null) { clearTimeout(toolConfigRetryTimer); toolConfigRetryTimer = null; }
+  if (credRetryTimer != null) { clearTimeout(credRetryTimer); credRetryTimer = null; }
+
+  dirty.clear();
+  reflushRequested = false;
+  retryCount = 0;
+
+  hasPendingToolConfig = false;
+  pendingToolConfig = undefined;
+  toolConfigRetryCount = 0;
+
+  hasPendingCredSync = false;
+  pendingCredForce = false;
+  pendingCredApiConfig = undefined;
+  credRetryCount = 0;
 };

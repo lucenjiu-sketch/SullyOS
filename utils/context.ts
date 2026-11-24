@@ -1,4 +1,5 @@
 import { resolveCharacterUser } from './userPersona';
+import { BUILTIN_SULLY_ID, BUILTIN_SULLY_IDENTITY } from './sullyIdentity';
 import {getDailyScheduleForChar} from './dailySchedule';
 import {getLastInnerState} from './emotionState';
 import { readableContextMemories } from './contextMemories';
@@ -11,7 +12,10 @@ import {buildHomePetContext} from './homePetContext';
 import { buildHomeDefinitionContext } from './homeDefinitionContext';
 import { isScheduleFeatureOn } from './scheduleFeature';
 import { buildScheduleInjection as buildScheduleInjectionText } from './scheduleInjection';
-import { TIME_FRAMING_CONVERSATIONAL } from './timeFramingNote';
+import { TIME_AWARENESS_NOTE, TIME_FRAMING_CONVERSATIONAL } from './timeFramingNote';
+import { buildUserClockHint } from './amsgFirePack';
+
+const DEVICE_TZ = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 import { resolveCharTimeZone, nowInTimeZone, tzAwarenessNote, interactionGapNote } from './timezone';
 import {
     isWorldbookEntryActive,
@@ -40,6 +44,26 @@ const stripMemoryPalaceDateStamps = (text: string): string => text
     .replace(/（剩余 \d+ 天）/g, '');
 
 export interface EmotionContextOptions { surface?: 'chat' | 'home'; innerState?: string }
+
+/**
+ * 角色这一轮能不能知道用户正在放哪首歌。歌名块和音乐互动工具都按这一个判断走，
+ * 否则会出现「工具说对方在听这首、却不告诉是哪首」，模型只能编。
+ * 一起听算用户主动分享，开关关着也让角色知道。
+ */
+export function canCharSeeUserListening(
+    char: CharacterProfile,
+    userListening: { songName: string } | null | undefined,
+    isListeningTogether?: boolean,
+): boolean {
+    if (!userListening?.songName) return false;
+    return (char.musicProfile?.canReadUserMusic ?? true) || !!isListeningTogether;
+}
+
+function characterInstructions(char: CharacterProfile): string {
+    const persona = char.systemPrompt || '你是一个温柔、拟人化的AI伴侣。';
+    return char.id === BUILTIN_SULLY_ID ? persona + '\n\n' + BUILTIN_SULLY_IDENTITY : persona;
+}
+
 export const ContextBuilder = {
     /** 所有入口共用：只读取现有日程，不触发生成；按角色当地日期读取。 */
     buildCurrentScheduleContext: async (
@@ -100,7 +124,7 @@ export const ContextBuilder = {
 
         // 2. 核心指令（完整，不截断）
         context += `### 核心指令\n`;
-        context += `${char.systemPrompt || '你是一个温柔、拟人化的AI伴侣。'}\n\n`;
+        context += `${characterInstructions(char)}\n\n`;
 
         // 2b. 自我领悟词条（常驻自我认知，影响情绪评估）
         if (char.selfInsights && char.selfInsights.length > 0) {
@@ -200,6 +224,13 @@ export const ContextBuilder = {
              * 手册 / 小剧场这些生成器同样走 buildCoreContext，但那边并没有人在对话。
              */
             conversational?: boolean;
+            /** 「对方那边现在几点」那一行里对方的称呼；不传写「对方」。 */
+            userName?: string;
+            /**
+             * 带不带「对方那边现在几点」。只有隔着手机的线上交流（私聊、群聊）要它；见面是
+             * 两个人在同一个地方，各类生成器也没有「对方」在这个点说话，默认不带。
+             */
+            includeUserClock?: boolean;
         },
     ): string => {
         // skipTimeAwareness：见面纯架空时由调用方传入，彻底抑制时间注入（修「线下时间感知」关掉后仍漏时间）。
@@ -216,7 +247,7 @@ export const ContextBuilder = {
         const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`;
         const timeStr = `${h.toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
         let context = `### 当前时间 (Now)\n`;
-        context += `现在是 ${dateStr} ${dayNames[now.getDay()]} ${timeOfDay} ${timeStr}。请据此自然地拥有真实的时间观念（早晚作息、工作日/周末、距离上次互动多久等），不要凭空假设时间。\n`;
+        context += `现在是 ${dateStr} ${dayNames[now.getDay()]} ${timeOfDay} ${timeStr}。${TIME_AWARENESS_NOTE}\n`;
         // 报时后面那句语境框定（这句话本身和「为什么只在对话时给」都在
         // utils/timeFramingNote.ts）。即时对话走的是云端那条路，时间由 worker 到点补，
         // 那边引的是同一份常量——同一句话不抄两遍，免得两条路上的角色分寸不一样。
@@ -225,6 +256,11 @@ export const ContextBuilder = {
         }
         const tzNote = tzAwarenessNote(charTz);
         if (tzNote) context += `${tzNote.trim()}\n`;
+        // 对方那边几点：与即时对话云端时效块同一个函数，两个时区相同时不出。
+        const userClock = timeOptions?.includeUserClock ? buildUserClockHint(
+            Date.now(), { tzId: charTz ?? DEVICE_TZ() }, { tzId: DEVICE_TZ() }, timeOptions?.userName || '',
+        ).trim() : '';
+        if (userClock) context += `${userClock}\n`;
         // 距离上次联系多久（统一口径）：传了 lastInteractionTs 才注入。
         // 让查手机/人际关系等无内联消息流的路径，也像聊天一样知道「用户多久没联系我了」。
         const gapNote = interactionGapNote(timeOptions?.lastInteractionTs);
@@ -249,7 +285,7 @@ export const ContextBuilder = {
             /** 仅本次请求共用的读取结果；不缓存到下一轮，null 也不重复查询。 */
             scheduleSnapshot?: Promise<DailySchedule | null>;
             memoryPalaceContext?: string;
-            timeOptions?: { lastInteractionTs?: number; skipTimeAwareness?: boolean; conversational?: boolean };
+            timeOptions?: { lastInteractionTs?: number; skipTimeAwareness?: boolean; conversational?: boolean; userName?: string; includeUserClock?: boolean };
         },
     ): Promise<string> => {
         let context = ContextBuilder.buildTimeAwarenessBlock(char, options?.timeOptions);
@@ -358,7 +394,7 @@ export const ContextBuilder = {
 
     /**
      * 音乐氛围注入：
-     * 1) user 此刻真的在播放音乐 + char.canReadUserMusic 开 → 注入"对方正在听 X + 当前歌词窗口（前2当前后2）"
+     * 1) user 此刻真的在播放音乐 + canCharSeeUserListening 放行 → 注入"对方正在听 X + 当前歌词窗口（前2当前后2）"
      *    + 同曲歌单命中提示（该歌也在 char 某个歌单里）
      * 2) char 自己此刻在听（Schedule 听歌时段） → 注入"你此刻在听 Y"（不含歌词，char 知道自己听什么）
      *
@@ -398,8 +434,8 @@ export const ContextBuilder = {
         const lines: string[] = [];
 
         // —— 块 1: user 正在听什么 ——
-        const canRead = char.musicProfile?.canReadUserMusic ?? true;
-        if (canRead && userListening && userListening.songName) {
+        const seesUserListening = canCharSeeUserListening(char, userListening, isListeningTogether);
+        if (seesUserListening && userListening) {
             lines.push(`### 【此刻的对话氛围】`);
             if (isListeningTogether) {
                 lines.push(`你正在和 ${userName || '对方'} 一起听《${userListening.songName}》— ${userListening.artists}`);
@@ -464,7 +500,7 @@ export const ContextBuilder = {
         // 只在**有音乐上下文**（user 在听 OR char 自己在 schedule 里听）时注入。
         // 没音乐上下文时不往 prompt 里塞这段 — 避免普通聊天被无关信息污染、
         // 也避免 LLM 在没提示 add 语法的场合主动联想去操作歌单。
-        const hasMusicContext = !!(userListening && userListening.songName) || !!charListening?.songName;
+        const hasMusicContext = seesUserListening || !!charListening?.songName;
         const profile = char.musicProfile;
         if (hasMusicContext && profile && profile.playlists.length > 0) {
             lines.push(`### 【你的歌单】`);
@@ -552,6 +588,8 @@ const renderCoreContext = async (
             skipTimeAwareness?: boolean;
             /** 正有人在跟角色实时对话（私聊 / 见面）。见 buildTimeAwarenessBlock 同名字段。 */
             conversational?: boolean;
+            /** 带「对方那边现在几点」，只给线上聊天。见 buildTimeAwarenessBlock 同名字段。 */
+            includeUserClock?: boolean;
             /** Cloud requests fill this user's date-dependent line at generation time. */
             skipUserHoliday?: boolean;
             userHolidays?: UserHolidayConfig;
@@ -581,14 +619,14 @@ const renderCoreContext = async (
         // Change: Explicitly label description as User Note to avoid literal interpretation
         context += `- 用户备注/爱称 (User Note/Nickname): ${char.description || '无'}\n`;
         context += `  (注意: 这个备注是用户对你的称呼或印象，可能包含比喻。如果备注内容（如“快乐小狗”）与你的核心设定冲突，请以核心设定为准，不要真的扮演成动物，除非核心设定里写了你是动物。)\n`;
-        context += `- 核心性格/指令:\n${char.systemPrompt || '你是一个温柔、拟人化的AI伴侣。'}\n\n`;
+        context += `- 核心性格/指令:\n${characterInstructions(char)}\n\n`;
 
         // 1a. 真实时间感知 (Time Awareness) — 跟随 timeAwarenessEnabled 设置，默认开启。
         // 统一在 buildCoreContext 注入，让所有调用方（私聊/查手机/人际关系/通话/约会…）都知道"现在"。
         // deferVolatile 时不在这里输出（时间精确到分钟、每轮都变，会打断 prompt 前缀缓存），
         // 改由调用方经 buildVolatileCoreState 放到消息数组末尾。
         if (!layout?.deferVolatile) {
-            context += ContextBuilder.buildTimeAwarenessBlock(char, timeOptions);
+            context += ContextBuilder.buildTimeAwarenessBlock(char, { ...timeOptions, userName: user.name });
         }
 
         // 1b. 自我领悟词条 (Self Insights) — 消化过程中反刍产生的常驻自我认知

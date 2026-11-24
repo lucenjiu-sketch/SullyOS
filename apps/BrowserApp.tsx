@@ -309,8 +309,9 @@ Generate realistic results linking to hypothetical URLs.`;
                     ],
                     temperature: 0.6,
                     max_tokens: 4000
-                })
-            });
+                }),
+                __sullyMeta: { appId: 'browser', appName: '浏览器', purpose: '生成虚拟网页' },
+            } as RequestInit);
 
             if (!response.ok) throw new Error('Network Error');
             
@@ -531,6 +532,10 @@ Generate realistic results linking to hypothetical URLs.`;
                     <div>
                         <label className="text-xs font-bold text-slate-400 uppercase mb-2 block">Brave Search API Key</label>
                         <input 
+                            type="password"
+                            name="brave-search-api-key"
+                            autoComplete="new-password"
+                            spellCheck={false}
                             value={braveKey} 
                             onChange={e => setBraveKey(e.target.value)} 
                             placeholder="BSA-..." 

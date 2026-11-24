@@ -26,6 +26,7 @@ import { isBlobRef } from '../../utils/blobRef';
 import { useLocalDateKey } from '../../hooks/useLocalDateKey';
 import { resolveCharTimeZone } from '../../utils/timezone';
 import { trackEvent } from '../../utils/analytics';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 
 interface Props {
   charId: string;
@@ -58,8 +59,20 @@ const toPlaylistSong = (s: Song): CharPlaylistSong => ({
   albumPic: s.albumPic, duration: s.duration, fee: s.fee,
 });
 
+function MusicBio({ bio }: { bio?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!bio) return <p className="text-[10px] mt-0.5" style={{ color: C.muted }}>还没写音乐简介</p>;
+  return <button type="button" aria-label={expanded ? '收起音乐简介' : '展开音乐简介'} aria-expanded={expanded}
+    className="flex items-start gap-1 w-full py-1 text-left text-[11px]" style={{ color: C.muted }}
+    onClick={() => { if (!expanded) trackEvent('展开角色音乐简介'); setExpanded(!expanded); }}>
+    <span className={expanded ? 'min-w-0 whitespace-pre-wrap break-words' : 'min-w-0 truncate'}>{bio}</span>
+    <span aria-hidden="true" className="shrink-0">{expanded ? '▴' : '▾'}</span>
+  </button>;
+}
+
 const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
   const { characters, updateCharacter, userProfile, apiConfig, addToast } = useOS();
+  const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
   const {
     cfg, playSong,
     current, playing, togglePlay, nextSong, prevSong,
@@ -174,9 +187,12 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
   /** 清掉旧档案重新走一次 LLM —— 给旧版保底生成的"告五人"账号用。 */
   const doRegenerate = useCallback(async () => {
     if (!char || initializing) return;
-    const ok = typeof window !== 'undefined'
-      ? window.confirm(`清空 ${char.name} 现有的音乐人格，重新让 LLM 生成？\n（歌单里已填的歌也会丢）`)
-      : true;
+    const ok = await requestConfirm({
+      title: '重新生成音乐人格？',
+      message: `清空 ${char.name} 现有的音乐人格，重新让 LLM 生成？（歌单里已填的歌也会丢失）`,
+      confirmText: '重新生成',
+      variant: 'warning',
+    });
     if (!ok) return;
     setInitializing(true);
     try {
@@ -189,7 +205,7 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
     } finally {
       setInitializing(false);
     }
-  }, [char, initializing, userProfile, apiConfig, updateCharacter, addToast]);
+  }, [char, initializing, requestConfirm, userProfile, apiConfig, updateCharacter, addToast]);
 
   const togglePlaylist = (plId: string) => {
     setExpandedPl(prev => (prev === plId ? null : plId));
@@ -197,12 +213,15 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
   };
 
   /** 把当前选中的歌从歌单里一起删掉（弹一次确认） */
-  const deleteSelected = (pl: CharPlaylist) => {
+  const deleteSelected = async (pl: CharPlaylist) => {
     if (!char || !profile || selectedSongIds.size === 0) return;
     const n = selectedSongIds.size;
-    const ok = typeof window !== 'undefined'
-      ? window.confirm(`从《${pl.title}》移除选中的 ${n} 首歌？`)
-      : true;
+    const ok = await requestConfirm({
+      title: '移除选中歌曲？',
+      message: `确定从《${pl.title}》移除选中的 ${n} 首歌吗？`,
+      confirmText: '移除',
+      variant: 'danger',
+    });
     if (!ok) return;
     const nextPlaylists = removeSongsFromPlaylist(profile.playlists, pl.id, selectedSongIds, Date.now());
     updateCharacter(char.id, {
@@ -324,6 +343,7 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
         <div className="flex-1 flex items-center justify-center text-sm" style={{ color: C.muted }}>
           找不到这个角色。
         </div>
+        {confirmDialog}
       </div>
     );
   }
@@ -373,9 +393,7 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
                 style={{ color: C.text, fontFamily: `'Noto Serif', serif` }}>
                 {char.name}
               </div>
-              <div className="text-[10px] mt-0.5 truncate" style={{ color: C.muted }}>
-                {profile?.bio || '还没写音乐简介'}
-              </div>
+              <MusicBio key={char.id} bio={profile?.bio} />
               <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
                 {(profile?.genreTags || []).slice(0, 4).map(tag => (
                   <span key={tag} className="text-[9px] px-2 py-0.5 rounded-full"
@@ -679,7 +697,7 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
                 }}
                 className="w-3 h-3"
               />
-              允许 {char.name} 翻阅你的网易云数据（最近在听 / 歌单）
+              聊天时让 {char.name} 知道你正在听的歌
             </label>
             <div>
               <button
@@ -712,6 +730,7 @@ const CharVisitPage: React.FC<Props> = ({ charId, onBack, onOpenPlayer }) => {
           onNext={nextSong}
         />
       )}
+      {confirmDialog}
     </div>
   );
 };

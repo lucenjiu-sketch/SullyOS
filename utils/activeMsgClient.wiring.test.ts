@@ -38,6 +38,15 @@ describe('③ 凭据变更重传接线', () => {
       .toContain('commitApiConfig(configFromPreset(preset))');
   });
 
+  // 思考参数冻在任务行上：只改角色的「思考过程展示」开关时也要刷，不然下一次到点还按旧的发。
+  it('OSContext 保存角色：思考开关变了也走凭据与任务参数刷新', () => {
+    const src = read('../context/OSContext.tsx');
+    const block = sliceBetween(src, 'JSON.stringify(before?.dialogueApi)', 'syncAmsgLlmCredentials(');
+    expect(block).toContain('showThinkingChain');
+    // 情绪开关或情绪 API 变了：任务的 emotion 引用和那一行凭据要跟着刷。
+    expect(block).toContain('emotionConfig');
+  });
+
   it('ActiveMsg2SettingsModal.handleSubmit：面板保存后刷同角色其余 pending AI 任务', () => {
     const src = read('../components/chat/ActiveMsg2SettingsModal.tsx');
     const fn = sliceBetween(src, 'const handleSubmit', 'return (');
@@ -49,12 +58,13 @@ describe('③ 凭据变更重传接线', () => {
 });
 
 describe('③ 失败可见化接线（远端 lastError 上卡片）', () => {
-  it('面板对账改拉全量投影 listRemoteTasksForChar，并用 describeRemoteLastError 渲染', () => {
+  it('面板对账改拉全量投影 listRemoteTasksForChar 与云端定时触发状态，并用 describeRemoteLastError 渲染', () => {
     const src = read('../components/chat/ActiveMsg2SettingsModal.tsx');
     expect(src).toContain('ActiveMsgClient.listRemoteTasksForChar(');
+    expect(src).toContain('ActiveMsgClient.getCronTriggerState(');
     expect(src).toContain('describeRemoteLastError(');
-    // 进度文案吸收远端 status（failed 终态不再谎报「待处理」）。
-    expect(src).toMatch(/describeTaskProgress\(t, knownRemoteUuids, now, remoteInfo\?\.status\)/);
+    // 进度文案同时吸收远端 status 与云端后台任务暂停态（cloudCronPaused）。
+    expect(src).toMatch(/describeTaskProgress\(t, knownRemoteUuids, now, remoteInfo\?\.status, cloudCronPaused\)/);
   });
 });
 
@@ -92,9 +102,9 @@ describe('② 订阅刷新接线（SW 标记 ↔ 主线程消费）', () => {
 });
 
 describe('④ 多设备说明文案', () => {
-  it('全局设置弹窗的通知区块里说明「推送跟着排程时所在的设备走」', () => {
+  it('全局设置弹窗的通知区块里说明「换设备要重新开启，会覆盖原来的订阅」', () => {
     const src = read('../components/settings/ActiveMsgGlobalSettingsModal.tsx');
-    expect(src).toContain('排程时所在的设备');
-    expect(src).toContain('重新保存一次');
+    expect(src).toContain('换了设备或浏览器');
+    expect(src).toContain('会覆盖原来的订阅');
   });
 });

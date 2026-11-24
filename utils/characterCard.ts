@@ -19,7 +19,7 @@ import { CharacterProfile } from '../types';
 export const CARD_STRIPPED_FIELDS = [
   'userPersona',
   // 1) 凭据（含 apiKey，灾难级泄漏）
-  'dialogueApi',
+  'dialogueApi', 'stickerVision',
   'emotionConfig',
   'embeddingConfig',
   'proactiveConfig',         // 已下线的主动消息 1.0，旧数据里可能还带着副 API 凭据
@@ -40,10 +40,12 @@ export const CARD_STRIPPED_FIELDS = [
   'thinkingChainCustomColors',
   'thinkingChainCustomPrompt',
   'thinkingChainPromptEnabled', // 与上一行同类：是否发送内置思考引导，属本机偏好
+  'thinkingChainPromptMode',
+  'thinkingChainPromptScope',
   'thinkingChainCustomCss',
   'chatCollaborationEnabled', // 用户在本机选择的日常聊天注意力模式
   'chatShowRemark',          // 聊天顶栏显示备注还是名字，由接收方自己决定
-  // 角色扮演规范五开关：同属「用户在本机怎么想让这个角色被提示」的偏好。
+  // 角色扮演规范六开关：同属「用户在本机怎么想让这个角色被提示」的偏好。
   // 不随卡分享 → 接收方一律按默认全开（= 现状行为），不会拿到一张被悄悄关掉几块规范的卡。
   'rpStyleEnabled',
   'rpEmotionEnabled',
@@ -63,6 +65,7 @@ export const CARD_STRIPPED_FIELDS = [
   'dateExtraPresets',        // 用户私有补充预设随系统备份保存，不随角色卡分享
   'memoryPalaceWaterline', // 发卡人的使用节奏；接收方按自己的聊天习惯选择
   'hideMonthlyRecallPrompt', // ChatApp 的旧版记忆调阅提示偏好由接收方自己决定
+  'monthlyRecallEnabled', // 自主月度查阅与 API 消耗偏好由接收方决定
 
   // 4) 运行时状态残留
   'activeBuffs',

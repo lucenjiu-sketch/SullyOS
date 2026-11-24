@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from 'vitest';
+import { subscribePageForeground } from './pageForeground';
 import {
   AMSG2_TASKS_ADOPTED_EVENT,
   INBOX_FRESH_DELIVERY_WINDOW_MS,
@@ -971,6 +972,65 @@ describe('flushInboxToChat 落库时间戳（走真库）', () => {
       expect((await assistantMsgs(charId)).length).toBeGreaterThan(0);
     }, 20000);
 
+    // 定时类主动消息到点也由 worker 跑评估（T7），结论挂在最后一条，收侧走同一条链落 buff。
+    it('定时主动消息带回来的评估结论同样落 buff', async () => {
+      const charId = 'char-emotion-scheduled';
+      await DB.saveCharacter({ id: charId, name: '定时角色' } as any);
+      await ActiveMsgStore.saveInboxMessage(inboxMsg({
+        messageId: 'msg_task_3@1700000000000_hook_0',
+        charId,
+        charName: '定时角色',
+        messageType: 'auto',
+        // 带上任务 uuid：缺了它会被当成即时对话那一轮（getInstantChatPending 的 uuid 也是 undefined）。
+        taskUuid: 'scheduled-emotion-uuid',
+        metadata: {
+          charId,
+          amsgMode: 'auto',
+          amsgEmotionDone: true,
+          amsgEmotionUpdate: JSON.stringify({ changed: true, buffs: [{ label: '想念', emoji: '🌙', intensity: 2 }], injection: '你有点想他。', innerState: '' }),
+        },
+      }));
+      await flushInboxToChat('SW通知');
+      const updated = (await DB.getAllCharacters()).find((c) => c.id === charId)!;
+      expect(updated.activeBuffs?.map((b: any) => b.label)).toContain('想念');
+    }, 20000);
+
+    // 打包时带进模板的回执，定时消息真的落地了才算告知过（与本地私聊回复成功后销账同一口径）。
+    it('定时主动消息落地后把带过的回执标成已告知', async () => {
+      const charId = 'char-notice-scheduled';
+      await DB.saveCharacter({ id: charId, name: '回执角色' } as any);
+      await ActiveMsgStore.upsertExpiredNotices(charId, [
+        { id: 'n-1', charId, occurrenceMs: 1, mode: 'auto', recurrenceType: 'none', reason: 'min-gap', createdAt: Date.now() },
+        { id: 'n-2', charId, occurrenceMs: 2, mode: 'auto', recurrenceType: 'none', reason: 'min-gap', createdAt: Date.now() },
+      ] as any);
+      await ActiveMsgStore.saveInboxMessage(inboxMsg({
+        messageId: 'msg_task_5@1700000000000_hook_0',
+        charId, charName: '回执角色', messageType: 'auto', taskUuid: 'scheduled-task-uuid',
+        metadata: { charId, amsgMode: 'auto', amsgNoticeIds: ['n-1'] },
+      }));
+      await flushInboxToChat('SW通知');
+      const notices = await ActiveMsgStore.getExpiredNotices(charId);
+      expect(notices.find((r) => r.id === 'n-1')?.notifiedAt).toBeTruthy();
+      expect(notices.find((r) => r.id === 'n-2')?.notifiedAt).toBeFalsy();
+    }, 20000);
+
+    // 没带任务 uuid 的推送，不能因为「当前没有欠着的即时对话（uuid 也是 undefined）」就被当成即时对话那一轮。
+    it('没带 taskUuid 的推送不会被当成即时对话那一轮', async () => {
+      const charId = 'char-no-task-uuid';
+      await DB.saveCharacter({ id: charId, name: '无编号角色' } as any);
+      await ActiveMsgStore.upsertExpiredNotices(charId, [
+        { id: 'n-x', charId, occurrenceMs: 1, mode: 'auto', recurrenceType: 'none', reason: 'min-gap', createdAt: Date.now() },
+      ] as any);
+      await ActiveMsgStore.saveInboxMessage(inboxMsg({
+        messageId: 'msg_task_6@1700000000000_hook_0',
+        charId, charName: '无编号角色', messageType: 'auto',
+        metadata: { charId, amsgMode: 'auto', amsgNoticeIds: ['n-x'] },
+      }));
+      await flushInboxToChat('SW通知');
+      // 定时消息那一支才销账；被误判成即时对话就走不到这里。
+      expect((await ActiveMsgStore.getExpiredNotices(charId))[0]?.notifiedAt).toBeTruthy();
+    }, 20000);
+
     it('云端评估没跑出东西 → 照样熄灯，并把 worker 捎回来的原因原样给用户看', async () => {
       const charId = 'char-emotion-empty';
       await DB.saveCharacter({ id: charId, name: '空评估角色' } as any);
@@ -1920,6 +1980,31 @@ describe('即时对话的待收记录（走真库）', () => {
     },
   }];
 
+  it('刷新后没有 pending 仍能逐次记账，气泡已落库的重复推送也能补回用量', async () => {
+    const charId = 'char-instant-call-log';
+    const uuid = 'uuid-instant-call-log';
+    await DB.saveCharacter({ id: charId, name: '即时角色' } as any);
+    const message = { messageId: 'msg-instant-call-log', charId, charName: '即时角色', body: '查到了',
+      messageType: 'instant', taskUuid: uuid, receivedAt: Date.now(), sentAt: Date.now(),
+      metadata: { charId, amsgInstantChat: true, amsgModelCalls: [
+        { index: 1, completedAt: Date.now(), causes: [], ok: true, promptTokens: 1000, completionTokens: 30 },
+        { index: 2, completedAt: Date.now() + 1, causes: ['recall'], ok: true, promptTokens: 1100, completionTokens: 50 },
+      ] } } as any;
+    expect(getInstantChatPending(charId)).toBeNull();
+    await ActiveMsgStore.saveInboxMessage(message);
+    await flushInboxToChat('SW通知');
+    const rows = () => DB.getApiCallLog().then(entries => entries.filter(entry => entry.id.startsWith(`cloud-${uuid}`)));
+    expect(await rows()).toHaveLength(2);
+    // Simulate an older frontend having persisted the bubble without the new usage records.
+    await DB.updateApiCallLog(entries => entries.filter(entry => !entry.id.startsWith(`cloud-${uuid}`)));
+    await ActiveMsgStore.saveInboxMessage(message);
+    await flushInboxToChat('SW通知');
+    expect(await rows()).toHaveLength(2);
+    expect((await rows()).find(row => row.cloudCallIndex === 2)).toMatchObject({ purpose: '查记忆后回复', promptTokens: 1100 });
+    const messages = await DB.getMessagesByCharId(charId);
+    expect(messages.filter(row => row.role === 'assistant')).toHaveLength(1);
+  }, 20000);
+
   it('欠着的那一轮回复到了 → 待收记录销账（灯灭）', async () => {
     const charId = 'char-instant-clear';
     await DB.saveCharacter({ id: charId, name: '即时角色' } as any);
@@ -2766,6 +2851,27 @@ describe('上线补收不看有没有在等回复（走真库）', () => {
     expect(listInstantChatPendings()).toHaveLength(0);
     await expect(catchUpMissedPushes('foreground')).resolves.toBe('drained');
     expect(list).toHaveBeenCalledTimes(1);
+  }, 20000);
+
+  it('only focus/resume arrives: recovers the cloud reply without remounting and never inserts it twice', async () => {
+    const previousWindow = globalThis.window, previousDocument = globalThis.document;
+    Object.assign(globalThis, { window: new EventTarget(), document: Object.assign(new EventTarget(), { visibilityState: 'visible' }) });
+    const release = subscribePageForeground(handlePageBecameVisible);
+    const charId = 'char-resume-cloud', messageId = 'resume-cloud-reply';
+    try {
+      await DB.saveCharacter({ id: charId, name: '恢复测试' } as any);
+      await ActiveMsgStore.saveGlobalConfig({ workerUrl: WORKER_URL, pushMode: 'third-party' });
+      const entry = scheduledEntry(charId, messageId);
+      entry.push.messageType = 'instant';
+      vi.spyOn(ActiveMsgClient, 'listOutboxEntries').mockResolvedValue([entry] as any);
+      window.dispatchEvent(new Event('focus')); document.dispatchEvent(new Event('resume'));
+      await vi.waitFor(async () => expect((await DB.getRecentMessagesByCharId(charId, 10)).filter(m => String(m.content).includes('到点啦'))).toHaveLength(1), { timeout: 8000 });
+      window.dispatchEvent(new Event('pageshow'));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect((await DB.getRecentMessagesByCharId(charId, 10)).filter(m => String(m.content).includes('到点啦'))).toHaveLength(1);
+    } finally {
+      release(); Object.assign(globalThis, { window: previousWindow, document: previousDocument });
+    }
   }, 20000);
 
   it('推送丢掉的那条定时主动消息，从账本补回聊天流', async () => {

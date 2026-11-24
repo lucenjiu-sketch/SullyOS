@@ -12,6 +12,7 @@ import ConfirmDialog from '../os/ConfirmDialog';
 import { useOS } from '../../context/OSContext';
 import { safeResponseJson } from '../../utils/safeApi';
 import { DB } from '../../utils/db';
+import { injectMemoryPalace } from '../../utils/memoryPalace/pipeline';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../character/CharacterGroupFilter';
 import { getLocalDateKey } from '../../utils/localDate';
 import TokenImg from '../os/TokenImg';
@@ -239,11 +240,22 @@ const NovelWriter: React.FC<NovelWriterProps> = ({
             // Sampling is a writing-task default, not inferred from the user's personality.
             const temperature = 0.85;
 
+            // 召回结果只挂在本次请求的副本上：角色对象上不存召回，也不能读别处留下的旧值。
+            const recallChar = { ...char, memoryPalaceInjection: '', roomPlatesInjection: '' };
+            await injectMemoryPalace(recallChar, undefined, activeBook.title, userProfile.name);
+
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest({ char, user: userProfile }, [{ role: "user", content: prompt }])), temperature, max_tokens: 8000 })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest({ char: recallChar, user: userProfile }, [{ role: "user", content: prompt }])), temperature, max_tokens: 8000 }),
+                __sullyMeta: {
+                    appId: 'novel',
+                    appName: '一起写小说',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '小说共写生成',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);
@@ -297,7 +309,7 @@ const NovelWriter: React.FC<NovelWriterProps> = ({
         await runGeneration(selectedChar, userPrompt, currentSegments);
     };
 
-    const handleReroll = async () => {
+    const handleReroll = () => {
         if (!targetCharId) return;
         const selectedChar = characters.find(c => c.id === targetCharId);
         if (!selectedChar) return;
@@ -309,10 +321,19 @@ const NovelWriter: React.FC<NovelWriterProps> = ({
             if (last.authorId !== 'user') { newSegments.pop(); deletedCount++; } else { break; }
         }
         if (deletedCount === 0) { addToast('没有可重随的 AI 内容', 'info'); return; }
-        setSegments(newSegments);
-        updateNovel(activeBook.id, { segments: newSegments });
-        addToast('正在重随...', 'info');
-        await runGeneration(selectedChar, "", newSegments);
+        setConfirmDialog({
+            isOpen: true,
+            title: '重新生成最后一段？',
+            message: `将删除末尾的 ${deletedCount} 段 AI 内容，并让 ${selectedChar.name} 重新生成。`,
+            variant: 'warning',
+            onConfirm: () => {
+                setConfirmDialog(null);
+                setSegments(newSegments);
+                updateNovel(activeBook.id, { segments: newSegments });
+                addToast('正在重随...', 'info');
+                void runGeneration(selectedChar, "", newSegments);
+            }
+        });
     };
 
     const handleEditSegment = (seg: NovelSegment) => {
@@ -390,11 +411,18 @@ ${chapterText.substring(0, 200000)}
 6. **写作格式**：使用清晰的结构化格式（可以分段或使用标记），让后续章节的AI仅凭此总结就能无缝衔接创作。
 
 请直接输出总结内容，不需要JSON格式。`;
+            const summaryChar = targetChar || (collaborators.length === 1 ? collaborators[0] : undefined);
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }] })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }] }),
+                __sullyMeta: {
+                    appId: 'novel',
+                    appName: '一起写小说',
+                    ...(summaryChar ? { charId: summaryChar.id, charName: summaryChar.name } : {}),
+                    purpose: '小说章节总结',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);

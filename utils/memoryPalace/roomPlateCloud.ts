@@ -201,7 +201,7 @@ export const buildPlateCredRow = (charId: string, lightLLM: PlateLightLLM | null
 export type PlateCloudGate = 'submit' | 'local' | 'skip';
 
 /**
- * 这一轮该不该交云端：副 API 配齐 + 这台 worker 认识后台任务 + 没有另一份还在飞。
+ * 这一轮该不该交云端：副 API 配齐 + 这台 worker 认识后台任务 + 后台任务（cron）没暂停 + 没有另一份还在飞。
  *
  * 三道门的顺序是这个函数最容易改错的地方，两头都有坑：
  *
@@ -235,6 +235,15 @@ export const plateCloudGate = async (args: {
   const support = await ActiveMsgClient.probeBackgroundJobSupportDetailed();
   if (support === 'unsupported') {
     console.log(`${HEADER} 这台 Worker 的代码还不认识后台任务，这轮在本地整理`);
+    return 'local';
+  }
+
+  // 「后台任务」开关关着（Worker 的 cron 被摘掉）时，后台任务只靠 cron 捞，交上去会一直躺着，
+  // 恢复时晚到一小时以上的还会作废。这也是路断了，排在在飞那道门前面。只认明确答复：
+  // 问不到（网络、旧 Worker、没配 CF_API_TOKEN）不算关着，照常往下判。
+  const cron = await ActiveMsgClient.getCronTriggerState({ timeoutMs: 3_000 });
+  if (cron?.supported === true && cron.enabled === false) {
+    console.log(`${HEADER} 后台任务（定时触发）暂停着，交上去也不会跑，这轮在本地整理`);
     return 'local';
   }
 
@@ -301,16 +310,14 @@ export const submitPlateConsolidation = async (args: {
   markPlateJobInFlight(args.charId, jobId, args.snapshotAt);
 
   // 这一次调用记进「设置 → API 调用记录」：请求是云端发的，本地的 fetch 拦截器只认
-  // `/chat/completions`，够不着它。
-  // 用量补不上：结果信封里没有 usage（跟即时对话那条路不同，那边云端随末条推送捎回来），
-  // 所以落地时只把 pending 收掉，token 那两格空着。
+  // `/chat/completions`，够不着它。结果回程时带上供应商回报的 usage 一并补齐。
   recordCloudApiCall({
     id: cloudApiCallLogId(jobId),
     route: 'cloud-plate-consolidate',
     baseUrl: args.lightLLM?.baseUrl || '',
     model: args.lightLLM?.model || '',
     messages: buildPlateJobMessages(jobInput),
-    meta: { appName: '记忆宫殿', purpose: '门牌整理', charId: args.charId, charName: args.charName },
+    meta: { appId: 'memorypalace', appName: '记忆宫殿', purpose: '门牌整理', charId: args.charId, charName: args.charName },
   });
 
   let uuid: string;
@@ -439,7 +446,12 @@ export const applyPlateConsolidateResult = async (
    * 收一遍。所以三条出口各说各的实话，落库失败那条干脆不收——账没销，下次上线重放，
    * 那时候再照实收。
    */
-  const settle = (ok: boolean) => settleCloudApiCall({ id: cloudApiCallLogId(result.jobId), ok });
+  const settle = (ok: boolean) => settleCloudApiCall({
+    id: cloudApiCallLogId(result.jobId),
+    ok,
+    ...(result.usage?.promptTokens !== undefined ? { promptTokens: result.usage.promptTokens } : {}),
+    ...(result.usage?.completionTokens !== undefined ? { completionTokens: result.usage.completionTokens } : {}),
+  });
 
   // 这份已经落过地了（销账失败被重放、或者推送和补收两条腿各送了一遍）。再合并一次的
   // 代价不是「白做一遍」而是**门牌被改坏**：合并对每条保留下来的条目 sourceCount + 1，

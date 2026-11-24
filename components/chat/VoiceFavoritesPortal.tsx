@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import {
     CaretLeft,
     CaretRight,
+    DownloadSimple,
     ChatCircleDots,
     Image,
     MagnifyingGlass,
@@ -31,6 +32,9 @@ import {
 } from '../../utils/voiceFavorites';
 import { normalizeChatSearchText, searchableChatMessageText } from '../../utils/chatMessageSearch';
 import TokenImg from '../os/TokenImg';
+import { shareOrDownloadBlob } from '../../utils/shareExport';
+import { trackEvent } from '../../utils/analytics';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 
 const PAGE_SIZE = 10;
 type FavoriteTab = 'chat' | 'voice' | 'image';
@@ -72,6 +76,7 @@ const messageTypeLabel = (type?: string): string => ({
 }[type || ''] || '聊天消息');
 
 const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMessage, inline=false }) => {
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: !inline });
     const [tab, setTab] = useState<FavoriteTab>('chat');
     const [contentItems, setContentItems] = useState<ContentFavorite[]>([]);
     const [voiceItems, setVoiceItems] = useState<VoiceFavorite[]>([]);
@@ -85,6 +90,8 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
     const [resolving, setResolving] = useState(false);
     const [playingId, setPlayingId] = useState<string | null>(null);
     const [audioError, setAudioError] = useState<string | null>(null);
+    const [exportingVoice, setExportingVoice] = useState<string | null>(null);
+    const exportInFlight = useRef(false);
     const [previewImage, setPreviewImage] = useState<string | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const objectUrlRef = useRef<string | null>(null);
@@ -240,13 +247,21 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         }
     };
 
+    const confirmUnfavorite = () => requestConfirm({
+        title: '取消收藏这条内容？',
+        message: '取消后如果原消息已删除或来自通话/见面，收藏里保留的快照与音频将无法找回。',
+        confirmText: '取消收藏',
+    });
+
     const removeVoice = async (item: VoiceFavorite) => {
+        if (!(await confirmUnfavorite())) return;
         if (playingId === item.id) stopPlayback();
         await removeVoiceFavoriteById(item.id);
         setVoiceItems(previous => previous.filter(candidate => candidate.id !== item.id));
     };
 
     const removeContent = async (item: ContentFavorite) => {
+        if (!(await confirmUnfavorite())) return;
         await removeContentFavoriteById(item.id);
         setContentItems(previous => previous.filter(candidate => candidate.id !== item.id));
         setResolvedItems(previous => {
@@ -326,6 +341,25 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         );
     });
 
+    const downloadVoice = async (item: VoiceFavorite) => {
+        if (exportInFlight.current) return;
+        exportInFlight.current = true;
+        setExportingVoice(item.id);
+        setAudioError(null);
+        try {
+            const blob = await getVoiceFavoriteBlob(item.id);
+            if (!blob?.size) throw new Error('这条收藏的音频文件缺失，请回到来源重新收藏。');
+            const mime = blob.type.split(';')[0].toLowerCase();
+            const ext = ({ 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/x-wav': 'wav',
+                'audio/wave': 'wav', 'audio/ogg': 'ogg', 'audio/webm': 'webm', 'audio/wav': 'wav', 'audio/aac': 'aac', 'audio/flac': 'flac' } as Record<string, string>)[mime] ?? 'audio';
+            const name = item.charName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 64) || '角色';
+            const result = await shareOrDownloadBlob({ blob, fileName: `${name}_收藏语音_${item.sourceTimestamp}.${ext}`,
+                nativeChunked: true, preferDownloadOnWeb: true });
+            if (result !== 'cancelled') trackEvent('下载收藏音频');
+        } catch (cause) { setAudioError(cause instanceof Error ? cause.message : '音频保存失败，请重试。'); }
+        finally { exportInFlight.current = false; setExportingVoice(null); }
+    };
+
     const renderVoice = () => (visibleItems as VoiceFavorite[]).map(item => {
         const secondary = item.translation || item.spokenText;
         const showSecondary = !!secondary && secondary.trim() !== item.originalText.trim();
@@ -343,6 +377,9 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
                     </div>
                     <p className="mt-2 text-[14px] leading-6 text-slate-800 whitespace-pre-wrap break-words">{item.originalText || item.spokenText || '（无文字）'}</p>
                     {showSecondary && <p className="mt-1 text-[12px] leading-5 text-slate-500 whitespace-pre-wrap break-words"><span className="mr-1.5 text-[10px] font-bold text-amber-700">{item.translation ? '翻译' : '语音'}</span>{secondary}</p>}
+                    <button type="button" disabled={!!exportingVoice} className="mt-1 inline-flex items-center gap-1.5 py-2 text-xs text-slate-600" onClick={() => void downloadVoice(item)}>
+                        <DownloadSimple size={15} />{exportingVoice === item.id ? '正在准备音频…' : '下载音频'}
+                    </button>
                 </div>
                 <button type="button" onClick={() => void removeVoice(item)} className="self-start shrink-0 w-9 h-9 grid place-items-center rounded-full text-slate-400 active:bg-rose-50 active:text-rose-500" aria-label="取消收藏">
                     <Trash size={16} />
@@ -508,7 +545,12 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         </div>
     );
 
-    return inline?portal:createPortal(portal, document.body);
+    return (
+        <>
+            {inline ? portal : createPortal(portal, document.body)}
+            {confirmDialog}
+        </>
+    );
 };
 
 export default FavoritesPortal;

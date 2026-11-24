@@ -18,6 +18,8 @@
 import type { ActiveMsg2TaskRecord } from '../types';
 import { renderFireSceneBlock, type AmsgFireScene } from './amsgFireScene';
 import { DEFAULT_MAX_UNANSWERED_SENDS } from './amsgLimits';
+import type { AwayAnchorInfo } from './awayMessagePrompt';
+import type { WorldbookRoll } from './worldbook';
 
 // 连发上限的默认值与解析搬进了 amsgLimits（和其余几项上限住在一起），这里转出去给老调用方。
 export { DEFAULT_MAX_UNANSWERED_SENDS, resolveMaxUnansweredSends } from './amsgLimits';
@@ -38,6 +40,55 @@ export const AMSG_FIRE_PACK_KEY = 'fire_pack';
  * 靠 basePackAt 对不上号自动作废，下一次 fire 直接覆盖成新的一份。
  */
 export const AMSG_SELF_LOG_KEY = 'self_log';
+
+/**
+ * 已经随某次定时 fire 发出去的「没发出去」回执 id（按角色一行，{ v: 1, ids }）。
+ *
+ * 回执烤在按角色共用的模板里，客户端落地时才销账、重新打包后才不带；客户端一直不在线的话，
+ * 下一次到点照样会再提一遍。worker 自己记住发过哪几条，渲染时把整块都发过的回执去掉。
+ */
+export const AMSG_SENT_NOTICES_KEY = 'sent_notices';
+
+/** 模板近史里没有识图描述的图片写成这样（照本地私聊那句明说别猜）；救援导回本地时还原成「[图片]」。 */
+export const TEMPLATE_IMAGE_PLACEHOLDER = '[图片]（配图描述暂不可用，请不要猜测。）';
+/** 记账封顶，旧的先丢（回执本身 48 小时就过期）。 */
+const SENT_NOTICES_MAX = 100;
+
+const NOTICES_CLOSE = '{{/AMSG_NOTICES}}';
+// 分组（整块、各段）可以嵌套，渲染时由内向外处理；单条回执的标记不嵌套。
+const NOTICES_BLOCK_RE = /\{\{AMSG_NOTICES:([^}]*)\}\}((?:(?!\{\{AMSG_NOTICES:)[\s\S])*?)\{\{\/AMSG_NOTICES\}\}/;
+const NOTICE_LINE_RE = /\{\{AMSG_NOTICE:([^}]*)\}\}([\s\S]*?)\{\{\/AMSG_NOTICE\}\}/g;
+
+/** 打包用：一组回执（整块或其中一段）包上编号标记，组里都发过时整组去掉。 */
+export const wrapNoticesBlock = (ids: string[], text: string): string =>
+  `{{AMSG_NOTICES:${ids.map(encodeURIComponent).join(',')}}}${text}${NOTICES_CLOSE}`;
+
+/** 打包用：单条回执那一行包上它的编号，发过的那条渲染时单独去掉。 */
+export const wrapNoticeLine = (id: string, text: string): string =>
+  `{{AMSG_NOTICE:${encodeURIComponent(id)}}}${text}{{/AMSG_NOTICE}}`;
+
+export const parseSentNotices = (value: string | undefined | null): string[] => {
+  try {
+    const parsed = JSON.parse(value || 'null');
+    return Array.isArray(parsed?.ids) ? parsed.ids.filter((id: unknown): id is string => typeof id === 'string') : [];
+  } catch { return []; }
+};
+
+export const appendSentNotices = (existing: string[], ids: string[]): string =>
+  JSON.stringify({ v: 1, ids: [...new Set([...existing, ...ids])].slice(-SENT_NOTICES_MAX) });
+
+/** 到点渲染：发过的那条回执去掉、没发过的留下；一组里都发过了，连标题和引导一起去掉。 */
+export const renderSentNotices = (template: string, sentIds: Iterable<string>): string => {
+  const sent = new Set(sentIds);
+  let out = template.replace(NOTICE_LINE_RE, (_whole, id: string, body: string) =>
+    (sent.has(decodeURIComponent(id)) ? '' : body));
+  for (let m = NOTICES_BLOCK_RE.exec(out); m; m = NOTICES_BLOCK_RE.exec(out)) {
+    const list = m[1].split(',').filter(Boolean).map(decodeURIComponent);
+    const drop = list.length > 0 && list.every((id) => sent.has(id));
+    out = out.slice(0, m.index) + (drop ? '' : m[2]) + out.slice(m.index + m[0].length);
+  }
+  return out;
+};
 
 /**
  * 大内容旁路：一条 push 塞不下的 XHS 会话数据（笔记详情 + xsecToken）存这个 key，
@@ -126,9 +177,81 @@ export const parseChatFailRecord = (value: string | null | undefined): AmsgChatF
  */
 const GZIP_VALUE_PREFIX = 'gz1:';
 
-/** 运行时有没有压缩能力（老 Safari 没有 CompressionStream）。 */
-const canCompress = (): boolean =>
-  typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
+/**
+ * 合法单成员 gzip 帧的最小长度：10 字节头 + 至少 2 字节 DEFLATE 结束块 + 8 字节尾部（CRC32 + ISIZE）。
+ * 原文字节数不超过这一行加上前缀与 base64 膨胀（gz1: + 28 字符 = 32 字节）时，压完绝不可能比原文短。
+ */
+const GZIP_MIN_FRAME_BYTES = 20;
+const MIN_WORTH_PACKING_BYTES = 32;
+
+export type GzipFallbackCompressor = (
+  rawBytes: Uint8Array,
+) => Promise<Uint8Array | null> | Uint8Array | null;
+
+// 记录已确认异常的原生 CompressionStream 构造器引用：生产环境里页面生命周期内构造器恒定，
+// 一旦触发熔断本页后续不再调它；单测替换并还原 globalThis.CompressionStream 时自动恢复隔离。
+let brokenCompressionStreamCtor: unknown = null;
+let gzipFallbackCompressor: GzipFallbackCompressor | null = null;
+
+/**
+ * 注册前端按需纯 JS gzip 压缩器（如懒加载 fflate）。
+ * 本模块被 Worker bundle 直接引用，保持零外部依赖；纯 JS 兜底由前端入口注入。
+ * 返回先前的处理器便于单测临时替换后还原。
+ */
+export const registerGzipFallbackCompressor = (
+  compressor: GzipFallbackCompressor | null,
+): GzipFallbackCompressor | null => {
+  const prev = gzipFallbackCompressor;
+  gzipFallbackCompressor = compressor;
+  return prev;
+};
+
+/** 单测重置压缩熔断状态用。 */
+export const resetGzipCompressionStateForTests = (): void => {
+  brokenCompressionStreamCtor = null;
+};
+
+let crc32Table: Uint32Array | null = null;
+
+const getCrc32Table = (): Uint32Array => {
+  if (crc32Table) return crc32Table;
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c >>> 0;
+  }
+  crc32Table = table;
+  return table;
+};
+
+const computeCrc32 = (bytes: Uint8Array): number => {
+  const table = getCrc32Table();
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+/**
+ * 核对压缩产物是否为对应输入字节的完整 gzip 帧（RFC 1952）。
+ *
+ * 部分移动端 WebKit 的 CompressionStream 在压缩较大缓冲或切后台时不会抛异常，而是静默返回
+ * 未刷完尾部的半截字节流；单看是否抛错或字节变短无法识别，读侧解压会报 incomplete data。
+ * 核对魔数与末尾 8 字节（CRC32 + 原始长度 ISIZE）可在微秒~亚毫秒级拦截截断产物，且不依赖
+ * 同一内核的 DecompressionStream。
+ */
+export const isValidGzipForInput = (rawBytes: Uint8Array, gz: Uint8Array): boolean => {
+  if (gz.byteLength < GZIP_MIN_FRAME_BYTES) return false;
+  if (gz[0] !== 0x1f || gz[1] !== 0x8b || gz[2] !== 0x08) return false;
+  const view = new DataView(gz.buffer, gz.byteOffset, gz.byteLength);
+  const expectedSize = rawBytes.byteLength >>> 0;
+  if (view.getUint32(gz.byteLength - 4, true) !== expectedSize) return false;
+  return view.getUint32(gz.byteLength - 8, true) === computeCrc32(rawBytes);
+};
 
 // btoa/atob 只吃 latin1 字符串，二进制要一个字节一个字符地喂。整段 apply 展开会在大数据上
 // 爆调用栈，按块拼。
@@ -149,20 +272,69 @@ const base64ToBytes = (base64: string): Uint8Array => {
   return bytes;
 };
 
-const streamThrough = async (data: Uint8Array, transform: TransformStream): Promise<Uint8Array> => {
-  const stream = new Blob([data as BlobPart]).stream().pipeThrough(transform);
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+// 直接向 TransformStream.writable 写入，不经过 Blob.stream()（规避 Safari 读取临时 Blob 流时的
+// I/O 异常）；同时传入独立切片，避免部分流实现转移底层 ArrayBuffer 影响后续长度/CRC32 核对与兜底压缩。
+const streamThrough = async (
+  data: Uint8Array,
+  transform: { readable: ReadableStream<Uint8Array>; writable: WritableStream<BufferSource> },
+): Promise<Uint8Array> => {
+  const readablePromise = new Response(transform.readable).arrayBuffer();
+  const writer = transform.writable.getWriter();
+  const writePromise = writer.write(data.slice())
+    .then(() => writer.close())
+    .catch(async (error) => {
+      try { await writer.abort(error); } catch { /* ignore */ }
+      throw error;
+    });
+  const [buffer] = await Promise.all([readablePromise, writePromise]);
+  return new Uint8Array(buffer);
 };
 
 /**
- * 上传前把值压掉。压不动或运行时不支持时原样返回 —— 这个函数永远不该让同步失败，
+ * 将字节压成经完整性核对的 gzip：优先走健康的原生 CompressionStream；原生缺失、抛错或
+ * 输出截断时熔断本页原生压缩并切换已注册的纯 JS 压缩器；两边都不可用时返回 null 由调用方退回明文。
+ */
+export const compressGzipBytes = async (rawBytes: Uint8Array): Promise<Uint8Array | null> => {
+  if (typeof CompressionStream === 'function' && CompressionStream !== brokenCompressionStreamCtor) {
+    const ctor = CompressionStream;
+    try {
+      const gz = await streamThrough(rawBytes, new CompressionStream('gzip'));
+      if (isValidGzipForInput(rawBytes, gz)) {
+        return gz;
+      }
+      brokenCompressionStreamCtor = ctor;
+      console.warn('[AmsgGzip] 原生 CompressionStream 输出的 gzip 头尾不完整，切换备用压缩通道');
+    } catch (error) {
+      brokenCompressionStreamCtor = ctor;
+      console.warn('[AmsgGzip] 原生 CompressionStream 压缩失败，切换备用压缩通道', error);
+    }
+  }
+  if (gzipFallbackCompressor) {
+    try {
+      const fallbackGz = await gzipFallbackCompressor(rawBytes);
+      if (fallbackGz && isValidGzipForInput(rawBytes, fallbackGz)) {
+        return fallbackGz;
+      }
+    } catch {
+      // 备用压缩也不可用（例如离线且懒加载分包尚未缓存）时回退明文。
+    }
+  }
+  return null;
+};
+
+/**
+ * 上传前把值压掉。压不动或压缩通道均不可用时原样返回 —— 这个函数永远不该让同步失败，
  * 云端那份 fire_pack 是角色到点时唯一的上下文来源，为了省流量把它弄丢是本末倒置。
  */
 export const packStateValue = async (json: string): Promise<string> => {
-  if (!canCompress()) return json;
+  const nativeAvailable =
+    typeof CompressionStream === 'function' && CompressionStream !== brokenCompressionStreamCtor;
+  if (!nativeAvailable && !gzipFallbackCompressor) return json;
   try {
     const rawBytes = new TextEncoder().encode(json);
-    const gz = await streamThrough(rawBytes, new CompressionStream('gzip'));
+    if (rawBytes.byteLength <= MIN_WORTH_PACKING_BYTES) return json;
+    const gz = await compressGzipBytes(rawBytes);
+    if (!gz) return json;
     const packed = `${GZIP_VALUE_PREFIX}${bytesToBase64(gz)}`;
     // 划算不划算按**字节**比，不能用 .length。fire_pack 几乎全是中文，一个字符占 3 个
     // UTF-8 字节，而压完的 base64 全是 ASCII（1 字符 = 1 字节）——拿字符数比的话，
@@ -393,6 +565,15 @@ export const BEFORE_SPEAK_LINES: readonly string[] = [
 export const LIVE_CHAT_WINDOW_MS = 10 * 60_000;
 
 /**
+ * 模板里「突然想起对方、主动来找」口吻的那两处：【1.0 风格主动消息提示】整段和【重要规则】里的
+ * 一条。见面离开提醒的方向是「对方刚从见面里走开、角色在私聊里找人」，这两处跟它冲突，
+ * 到点渲染时拿掉（见 renderFirePack 的 dateLeave）。模板是按角色打一份、所有任务共用的，
+ * 所以只能在渲染时按任务去掉；打包和剥离共用这两个常量，存量包的原文也认得出。
+ */
+export const LEGACY_PROACTIVE_HINT_HEADING = '【1.0 风格主动消息提示】';
+export const LEGACY_PROACTIVE_TONE_RULE = '- 语气更像真人突然想起对方时发来的私聊，不要像在完成任务。';
+
+/**
  * 「即时对话」这一轮要发给模型的对话消息。
  *
  * 和 template 是两条路，不混用：template 是「到点主动找人说话」的提示词，
@@ -433,6 +614,38 @@ export interface AmsgFirePack {
   template: string;
   /** 用户上次真实主动发消息的时间（epoch ms）；没有聊天记录时为 null。 */
   lastUserMessageAt: number | null;
+  /**
+   * 离开后消息计时起点（epoch ms）：用户上次真实发言，或最近一条线下见面 / 实时通话记录
+   * （见 utils/awayMessageCore.ts）。可选字段，不改 FIRE_PACK_VERSION，旧包缺省退回 lastUserMessageAt。
+   */
+  lastAwayAnchorAt?: number | null;
+  /**
+   * 离开计时起点是哪种在场互动（见 awayMessagePrompt）。worker 到点据此现算离开后消息的说法；
+   * 可选字段，不改 FIRE_PACK_VERSION，旧包缺省时用任务 metadata 里排程时写好的那份指令。
+   */
+  awayAnchor?: AwayAnchorInfo;
+  /**
+   * 情绪评估提示词模板（buildEmotionEvalPrompt 的 includeContext=false 形态）。角色开了情绪
+   * 评估时才带，worker 到点与主生成并行跑一次，结果随最后一条推送回去。可选字段，旧包缺省
+   * 不评估。副 API 凭据走任务的 credRefs.emotion。
+   */
+  emotionEval?: { prompt: string };
+  /**
+   * 模板里带进去的「没发出去」回执的 id。worker 发出后随最后一条推送带回（amsgNoticeIds），
+   * 客户端落地时按它销账，口径同本地私聊回复成功后销账。可选字段，旧包缺省不销账。
+   */
+  noticeIds?: string[];
+  /**
+   * 模板里按概率触发、打包时没抽签的世界书条目（{{AMSG_WB_IF:…}} 标记包着）及其概率。
+   * worker 到点用 worldbook.renderWorldbookRolls 现抽，与本地每轮都抽一致。
+   * 可选字段，旧包缺省时模板里也没有标记，行为不变。
+   */
+  worldbookRolls?: WorldbookRoll[];
+  /**
+   * 「互动对象」段里 bio 的字符数（没填时按「无」算）。worker 插用户所在地节日时按它跳过 bio，
+   * 插到与本地同一个位置（见 userHolidays.insertUserHolidayInProfile）。可选，旧包退回插在段标题下。
+   */
+  userBioLength?: number;
   /**
    * 角色的 IANA 时区 id（角色开了自定义时区用角色的，没开用打包设备的）。
    * worker 渲染一切给角色看的时间都以它为参照系（Intl 处理夏令时）。必填：
@@ -923,6 +1136,8 @@ export const renderFirePack = (
     lastUserMessageAt?: number | null;
     /** 到点必发、不给角色选择不说（离开后消息）：模板里【开口之前】那段整个拿掉。 */
     mustSpeak?: boolean;
+    /** 见面离开提醒：拿掉「突然想起对方」口吻的通用提示（见 LEGACY_PROACTIVE_HINT_HEADING）。 */
+    dateLeave?: boolean;
   },
 ): string => {
   const tz: AmsgTzRef = { tzId: pack.tzId };
@@ -938,6 +1153,13 @@ export const renderFirePack = (
 
   let out = pack.template;
   if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join('\n')}\n`).join('');
+  if (extras?.dateLeave) {
+    // 1.0 提示整段到下一个空行为止（段内没有空行），连同段后那个空行一起去掉。
+    const start = out.indexOf(LEGACY_PROACTIVE_HINT_HEADING);
+    const end = start >= 0 ? out.indexOf('\n\n', start) : -1;
+    if (start >= 0 && end >= 0) out = out.slice(0, start) + out.slice(end + 2);
+    out = out.split(`${LEGACY_PROACTIVE_TONE_RULE}\n`).join('');
+  }
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   // 对方那边的钟：跟上面那行是两个主体各自的时间，文案里各自写清主语（见 buildUserClockHint）。
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
@@ -1027,6 +1249,7 @@ export const parseFirePack = (value: string): AmsgFirePack | null => {
       chatFieldOk(parsed.chat) &&
       typeof parsed.template === 'string' && parsed.template.length > 0 &&
       (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === 'number') &&
+      (parsed.lastAwayAnchorAt === undefined || parsed.lastAwayAnchorAt === null || typeof parsed.lastAwayAnchorAt === 'number') &&
       typeof parsed.tzId === 'string' && parsed.tzId.length > 0 &&
       typeof parsed.userTzId === 'string' && parsed.userTzId.length > 0 &&
       typeof parsed.targetName === 'string' &&

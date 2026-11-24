@@ -19,7 +19,7 @@ import { usePersonaSim, personaSimStore } from '../utils/personaSimStore';
 import { createPersonaSimLog, getPersonaSimBeatIndex } from '../utils/personaSimLog';
 import { getLastInnerState } from '../utils/emotionApply';
 import { trackEvent } from '../utils/analytics';
-import { buildPhoneEvidenceChatCard, normalizePhoneEvidence, phoneFieldToText } from '../utils/phoneEvidence';
+import { normalizePhoneEvidence, phoneFieldToText } from '../utils/phoneEvidence';
 import { normalizePhoneAiSession } from '../utils/phoneTranscript';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import { getCheckPhoneApi, resolveCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
@@ -281,6 +281,8 @@ const CheckPhone: React.FC = () => {
     const [selectedEvidenceRecord, setSelectedEvidenceRecord] = useState<PhoneEvidence | null>(null);
     const [evidenceBackAppId, setEvidenceBackAppId] = useState<string>('home');
     const [evidenceMenu, setEvidenceMenu] = useState<{ record: PhoneEvidence; backAppId: string } | null>(null);
+    const [evidenceSyncBusy, setEvidenceSyncBusy] = useState(false);
+    const evidenceSyncLock = useRef(false);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const contactEndRef = useRef<HTMLDivElement>(null);
 
@@ -513,7 +515,8 @@ const CheckPhone: React.FC = () => {
                     max_tokens: 5,
                     stream: false,
                 }),
-            });
+                __sullyMeta: { appId: 'checkphone', appName: '查手机', purpose: '测试连接' },
+            } as RequestInit);
             if (!response.ok) {
                 const detail = await response.text().catch(() => '');
                 setPhoneApiTestResult(`HTTP ${response.status}${detail ? `：${detail.slice(0, 80)}` : ''}`);
@@ -605,6 +608,14 @@ const CheckPhone: React.FC = () => {
         addToast('记录已删除', 'success');
     };
 
+    const confirmDeleteRecord = (record: PhoneEvidence) => askConfirm({
+        title: '删除这条记录？',
+        desc: '删除后不可恢复，聊天里同步的卡片也会一并移除。',
+        confirmLabel: '删除',
+        danger: true,
+        onConfirm: () => { void handleDeleteRecord(record); },
+    });
+
     // 一键清空 Messages 归档里的全部聊天记录（含其在角色私聊里落的卡片）
     const handleClearAllChats = async () => {
         if (!targetChar) return;
@@ -669,11 +680,23 @@ const CheckPhone: React.FC = () => {
 
     const handleDeleteApp = (appId: string) => {
         if (!targetChar) return;
-        const newApps = (targetChar.phoneState?.customApps || []).filter(a => a.id !== appId);
-        updateCharacter(targetChar.id, {
-            phoneState: { records: targetChar.phoneState?.records || [], ...targetChar.phoneState, customApps: newApps }
+        const app = (targetChar.phoneState?.customApps || []).find(a => a.id === appId);
+        askConfirm({
+            title: `卸载「${app?.name || '该应用'}」？`,
+            desc: '将删除这个自定义应用及其设定。',
+            confirmLabel: '卸载',
+            danger: true,
+            onConfirm: () => {
+                updateCharacter(targetChar.id, (cur) => ({
+                    phoneState: {
+                        records: cur.phoneState?.records || [],
+                        ...cur.phoneState,
+                        customApps: (cur.phoneState?.customApps || []).filter(a => a.id !== appId),
+                    },
+                }));
+                addToast('App 已卸载', 'success');
+            },
         });
-        addToast('App 已卸载', 'success');
     };
 
     const openCustomAppEditor = (app?: PhoneCustomApp) => {
@@ -840,6 +863,17 @@ ${realCharRule}
 
             const fullPrompt = `\n\n### [你和用户「${userProfile.name}」的最近聊天（仅背景参考）]\n${recentMsgs}\n\n${perspectiveLock}\n\n### [Task]\n${promptInstruction}\n请结合上面的「当前时间 / 距离上次联系」和人设调整生成内容的时间戳和情绪。如果很久没联系，记录可能是近期的独处状态；如果刚聊过，记录可能与聊天内容相关。`;
 
+            const purposeLabel = customPrompt
+                ? `生成自定义应用·${logPrefix || type}`
+                : ({
+                    chat: '生成聊天记录',
+                    contacts: '扫描通讯录联系人',
+                    call: '生成通话记录',
+                    order: '生成购物订单',
+                    delivery: '生成外卖记录',
+                    social: '生成朋友圈动态',
+                } as Record<string, string>)[type] || '生成手机应用数据';
+
             const response = await fetch(`${effectiveApiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApiConfig.apiKey}` },
@@ -847,8 +881,15 @@ ${realCharRule}
                     model: effectiveApiConfig.model,
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: fullPrompt }])),
                     temperature: 0.8
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'checkphone',
+                    appName: '查手机',
+                    charId: targetChar.id,
+                    charName: targetChar.name,
+                    purpose: purposeLabel,
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error('API Error');
             const data = await safeResponseJson(response);
@@ -952,7 +993,7 @@ ${realCharRule}
     // ============================================================
 
     // 裸 LLM 调用（智能体生成 / 互动续写共用）
-    const callLLM = async (prompt: string, temperature = 0.85, withCharacter = true): Promise<string> => {
+    const callLLM = async (prompt: string, temperature = 0.85, withCharacter = true, purpose = '查手机AI生成'): Promise<string> => {
         const recent = withCharacter && targetChar ? await loadCharacterContextMessages(targetChar) : [];
         const messages = withCharacter && targetChar ? (await ContextBuilder.buildCharacterRequest({
             char: targetChar, user: userProfile, timeOptions: { lastInteractionTs: recent[recent.length - 1]?.timestamp },
@@ -961,7 +1002,13 @@ ${realCharRule}
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApiConfig.apiKey}` },
             body: JSON.stringify({ model: effectiveApiConfig.model, messages, temperature }),
-        });
+            __sullyMeta: {
+                appId: 'checkphone',
+                appName: '查手机',
+                ...(targetChar ? { charId: targetChar.id, charName: targetChar.name } : {}),
+                purpose,
+            },
+        } as RequestInit);
         if (!response.ok) throw new Error('API Error');
         const data = await safeResponseJson(response);
         // 用 extractContent 而非裸读 message.content：兼容 Claude/思考类模型把正文放在
@@ -1045,7 +1092,7 @@ ${AI_VENDOR_LORE}
 
             const fullPrompt = `\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n请结合「当前时间 / 距离上次联系」和人设，让内容贴合你近期的真实状态。只输出 JSON，不要解释。`;
 
-            const content = await callLLM(fullPrompt);
+            const content = await callLLM(fullPrompt, 0.85, true, '生成TA的AI会话');
             const now = Date.now();
             const rid = () => Math.random().toString(36).slice(2, 8);
             const newSessions: AiSession[] = [];
@@ -1176,7 +1223,7 @@ ${prevRecap ? `\n【已有前情（仅供衔接，别重复）】\n${prevRecap}\
 ${olderText}
 
 要求：第三人称，含起因→经过→结果，重点写人物关系/情绪的变化与暴露的心事，200~350 字，文笔流畅，不要分点、不要"总结如下"开场白。直接输出正文：`;
-            let summaryText = (await callLLM(prompt, 0.7, false)).trim();
+            let summaryText = (await callLLM(prompt, 0.7, false, 'AI会话摘要')).trim();
             if (!summaryText) summaryText = '（这段剧情继续推进了）';
             const now = Date.now();
             patchAiSession(sessionId, (s) => ({
@@ -1231,7 +1278,7 @@ ${olderText}
                 prompt = `\n\n你（${charName}）正在用手机和 ${aiDesc} 聊天。下面是对话（"我:"=你本人，"对方:"=那个 AI）。AI 刚回了最新一段，请以你的本色人设续写 "我:" 的下一句——你对它这句话的真实反应 / 追问 / 倾诉，贴合你的处境与心事。可以满意、可以失望、可以怼它答非所问、可以顺着深聊，别一味客气。别太长。只输出正文，不要前缀、不要解释。${recap}\n\n${transcript}`;
             }
 
-            let reply = (await callLLM(prompt)).trim();
+            let reply = (await callLLM(prompt, 0.85, true, 'TA的AI助手回复')).trim();
             reply = reply.replace(/^(我|对方|Me|Them|AI|助手)\s*[:：]\s*/i, '').trim();
             if (!reply) { addToast('对方没说话，再试一次', 'error'); return; }
             const full = `${transcript}\n${replyPrefix}: ${reply}`;
@@ -1273,7 +1320,7 @@ ${olderText}
                 prompt = `你在还原「${charName}」和 AI「${session.serviceName}」的对话（"我:"=用户 ${charName}，"对方:"=AI）。${persona}
 **替玩家跑一个完整回合（一来一回）**：承接最后一段——最后通常是"我:"(${charName} 刚发出、还没被回)，那就先"对方:"按那家口吻作答、再"我:"追问 / 倾诉一句（暴露 TA 的处境或心事）。**整段必须以 "我:"(${charName})收尾**（停在等 AI 回的地方）。**每行带 "我:"/"对方:" 前缀**，不要解释。${recap}\n\n${session.transcript}`;
             }
-            let out = (await callLLM(prompt)).trim().replace(/```/g, '').trim();
+            let out = (await callLLM(prompt, 0.85, true, 'TA的AI会话续写')).trim().replace(/```/g, '').trim();
             if (!/^(我|对方|Me|Them)\s*[:：]/m.test(out)) out = `${lastIsMe ? '对方' : '我'}: ${out}`;
             if (!out.trim()) { addToast('没续出内容，再试一次', 'error'); return; }
             const transcript = `${session.transcript}\n${out}`;
@@ -1402,7 +1449,7 @@ ${olderText}
 **transcript 写法**：长剧情小说体，第三人称叙事 + 引号对白，动作/神态/心理用 *星号*；"我:" = 你(玩家 ${charName}) 敲进输入框的 RP，"对方:" = AI 扮的「${card.name}」，交替推进，4-6 轮，首轮"对方:"当开场白、**整段以 "我:"(玩家)收尾**（停在等对方回应处）。**"我:"括号外只写故事里所扮角色的动作/对白，不要写你现实里的身体反应（盯屏幕/扔手机/吃东西等）；（全角括号内）= 越过角色直接跟皮下 AI 本体说话（骂它/OOC 提醒/指导怎么演/指出哪段不对）。**
 返回 JSON：{ "title": "剧情标题(12字内)", "transcript": "我: ...\\n对方: ..." }`;
             const fullPrompt = `\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n只输出 JSON，不要解释。`;
-            const content = await callLLM(fullPrompt);
+            const content = await callLLM(fullPrompt, 0.85, true, '酒馆角色卡开场');
             const obj: any = extractJson(content) || {};
             if (!obj.transcript) { addToast('没生成出来，再试一次', 'error'); return; }
             const now = Date.now();
@@ -1646,6 +1693,27 @@ ${olderText}
         }
     };
 
+    const confirmRebindContact = (
+        contact: PhoneContact,
+        target: { kind: 'npc' } | { kind: 'real'; charId: string },
+    ) => {
+        if (!targetChar) return;
+        const targetCharName = target.kind === 'real' ? characters.find(c => c.id === target.charId)?.name : undefined;
+        const desc = target.kind === 'npc'
+            ? `将「${contact.name}」转为虚构联系人后，原绑定角色手机里的镜像记录与相关卡片将被清除（当前对话、备注、了解与好感会保留）。`
+            : `将「${contact.name}」绑定到「${targetCharName || ''}」后，原错绑角色的镜像记录与卡片将被清除，新绑定角色手机中已有的对应记录也可能被覆盖。`;
+        askConfirm({
+            title: '确认更改绑定关系？',
+            desc,
+            confirmLabel: '确认更改',
+            danger: true,
+            onConfirm: () => {
+                setShowRebindModal(false);
+                void handleRebindContact(contact, target);
+            },
+        });
+    };
+
     const handleCreateContact = () => {
         if (!targetChar) return;
         let name = ncName.trim();
@@ -1712,8 +1780,8 @@ ${olderText}
             const aChunk = serializeTurns(aLines.slice(mark, mark + ARCHIVE_EVERY));
             const bChunk = flipTranscript(aChunk);
             const [aSum, bSum] = await Promise.all([
-                summarizeConversation({ api: effectiveApiConfig as any, speakerName: targetChar.name, otherName: b.name, transcript: aChunk }),
-                summarizeConversation({ api: effectiveApiConfig as any, speakerName: b.name, otherName: targetChar.name, transcript: bChunk }),
+                summarizeConversation({ api: effectiveApiConfig as any, speakerId: targetChar.id, speakerName: targetChar.name, otherName: b.name, transcript: aChunk }),
+                summarizeConversation({ api: effectiveApiConfig as any, speakerId: b.id, speakerName: b.name, otherName: targetChar.name, transcript: bChunk }),
             ]);
             const ts = Date.now();
             const mk = () => `tp-${ts}-${Math.random().toString(36).slice(2, 7)}`;
@@ -2025,44 +2093,20 @@ ${olderText}
     };
 
     const syncEvidenceRecordToChat = async (record: PhoneEvidence) => {
-        if (!targetChar) return;
+        if (!targetChar || evidenceSyncLock.current) return;
+        evidenceSyncLock.current = true;
+        setEvidenceSyncBusy(true);
         try {
-            if (record.systemMessageId) {
-                const existing = await DB.getMessageById(record.systemMessageId);
-                if (existing) {
-                    addToast('这条记录已经同步到私聊', 'info');
-                    setEvidenceMenu(null);
-                    return;
-                }
-            }
             const app = record.type === 'chat' ? '聊天软件' : appLabel(record.type);
-            const card = buildPhoneEvidenceChatCard(record, app);
-            const messageId = await DB.saveMessage({
-                charId: targetChar.id,
-                role: 'assistant',
-                type: 'phone_card',
-                content: card.content,
-                metadata: card.metadata,
-            } as any);
-            updateCharacter(targetChar.id, (current) => ({
-                phoneState: {
-                    ...current.phoneState,
-                    records: (current.phoneState?.records || []).map(item => item.id === record.id
-                        ? { ...item, systemMessageId: messageId }
-                        : item),
-                },
-            }));
-            if (selectedEvidenceRecord?.id === record.id) {
-                setSelectedEvidenceRecord({ ...selectedEvidenceRecord, systemMessageId: messageId });
-            }
-            if (selectedChatRecord?.id === record.id) {
-                setSelectedChatRecord({ ...selectedChatRecord, systemMessageId: messageId });
-            }
-            setEvidenceMenu(null);
-            addToast('已把这条查手机记录同步到私聊', 'success');
-            trackEvent('事后同步查手机记录到私聊', { kind: record.type });
+            const { inserted } = await DB.syncPhoneEvidenceToChat(targetChar.id, record.id, app);
+            setEvidenceMenu(current => current?.record === record ? null : current);
+            addToast(inserted ? '已把这条查手机记录同步到私聊' : '私聊中已有这条记录，无需重复同步', inserted ? 'success' : 'info');
+            if (inserted) trackEvent('事后同步查手机记录到私聊', { kind: record.type });
         } catch (error: any) {
             addToast(error?.message || '同步失败，请重试', 'error');
+        } finally {
+            evidenceSyncLock.current = false;
+            setEvidenceSyncBusy(false);
         }
     };
 
@@ -2350,10 +2394,11 @@ ${olderText}
                         <div className="flex justify-between gap-4"><dt className="text-white/30">记录编号</dt><dd className="text-white/40 text-right font-mono">#{r.id.slice(-8).toUpperCase()}</dd></div>
                     </dl>
 
-                    <button onClick={() => void syncEvidenceRecordToChat(r)} disabled={!!r.systemMessageId}
+                    <button onClick={() => void syncEvidenceRecordToChat(r)} disabled={evidenceSyncBusy}
                         className="w-full mt-2 py-3 rounded-2xl text-[12px] font-semibold text-sky-100 bg-sky-400/10 border border-sky-300/20 active:scale-[0.99] transition flex items-center justify-center gap-2 disabled:text-white/30 disabled:bg-white/[0.03] disabled:border-white/[0.06]">
-                        <PaperPlaneTilt size={15} weight="bold" /> {r.systemMessageId ? '已同步到私聊' : '同步这条到私聊'}
+                        <PaperPlaneTilt size={15} weight="bold" /> {evidenceSyncBusy ? '同步中…' : r.systemMessageId ? '检查并补同步到私聊' : '同步这条到私聊'}
                     </button>
+                    <p className="mt-2 text-center text-[10px] text-white/40">私聊卡片已删除时可补发，仍在时不会重复发送。</p>
                     <button onClick={() => askConfirm({
                         title: '删除这条记录？', desc: '删除「' + r.title + '」后无法恢复。', confirmLabel: '删除', danger: true,
                         onConfirm: () => handleDeleteRecord(r),
@@ -2393,7 +2438,7 @@ ${olderText}
                                     {r.detail && <div className="text-[10.5px] text-white/30 mt-1 italic truncate">“{r.detail}”</div>}
                                 </div>
                                 <span className="text-[10px] text-white/30 tabular-nums shrink-0">{fmtClock(r.timestamp)}</span>
-                                <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                                <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                             </div>
                         );
                     })}
@@ -2438,7 +2483,7 @@ ${olderText}
                                     <span className="text-[9px] px-2 py-0.5 rounded-full bg-white/[0.06] text-white/50 tracking-wider flex items-center gap-0.5">已下单 <CaretRight size={10} /></span>
                                 </div>
                             </div>
-                            <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                            <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                         </div>
                     ))}
                 </div>
@@ -2473,7 +2518,7 @@ ${olderText}
                             <div className="text-[11.5px] text-white/50 mt-2.5 leading-relaxed pl-1 border-l-2" style={{ borderColor: `${accent}55` }}>
                                 <span className="pl-2">{r.detail}</span>
                             </div>
-                            <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                            <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                         </div>
                     ))}
                 </div>
@@ -2509,7 +2554,7 @@ ${olderText}
                                 <span className="flex items-center gap-1.5 text-[11px]"><ChatCircle size={14} /> {1 + (r.id.length % 9)}</span>
                                 <span className="ml-auto flex items-center gap-0.5 text-[10px]" style={{ color: accent }}>查看详情 <CaretRight size={10} /></span>
                             </div>
-                            <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                            <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                         </div>
                     ))}
                 </div>
@@ -3168,7 +3213,13 @@ ${olderText}
                                 <div className="flex items-center justify-between mb-1.5">
                                     <span className="text-[10px] tracking-[0.2em] uppercase text-white/40">了解 · {targetChar.name} 眼中的 TA</span>
                                     {c.learned && c.learned.trim() && (
-                                        <button onClick={() => mutateContacts(cs => cs.map(x => x.id === c.id ? { ...x, learned: '' } : x))}
+                                        <button onClick={() => askConfirm({
+                                            title: '清空对 TA 的了解？',
+                                            desc: '已记录的关系印象内容将被清空。',
+                                            confirmLabel: '清空',
+                                            danger: true,
+                                            onConfirm: () => mutateContacts(cs => cs.map(x => x.id === c.id ? { ...x, learned: '' } : x)),
+                                        })}
                                             className="text-white/40 active:scale-90 transition" aria-label="清空了解"><Trash size={13} weight="bold" /></button>
                                     )}
                                 </div>
@@ -3252,7 +3303,7 @@ ${olderText}
                                 <span className="text-[9px] px-2 py-0.5 rounded-full bg-white/[0.06] text-white/50 tracking-wider">已下单</span>
                             </div>
                         </div>
-                        <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                        <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                     </div>
                 );
             case 'feed':
@@ -3271,7 +3322,7 @@ ${olderText}
                             <span className="flex items-center gap-1.5 text-[11px]"><Heart size={14} weight="fill" style={{ color: accent }} /> {3 + (r.id.length % 30)}</span>
                             <span className="flex items-center gap-1.5 text-[11px]"><ChatCircle size={14} /> {1 + (r.id.length % 9)}</span>
                         </div>
-                        <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                        <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                     </div>
                 );
             case 'forum':
@@ -3288,7 +3339,7 @@ ${olderText}
                             <span>· {1 + (r.id.length % 200)} 回复</span>
                             <span>· {fmtClock(r.timestamp)}</span>
                         </div>
-                        <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                        <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                     </div>
                 );
             case 'novel':
@@ -3302,7 +3353,7 @@ ${olderText}
                             <span>{r.value || '连载中'}</span>
                             <span className="tabular-nums">{fmtClock(r.timestamp)}</span>
                         </div>
-                        <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                        <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                     </div>
                 );
             default:
@@ -3315,7 +3366,7 @@ ${olderText}
                         </div>
                         <div className="text-[12px] text-white/55 leading-relaxed whitespace-pre-wrap">{r.detail}</div>
                         <div className="text-[9.5px] text-white/25 mt-2 text-right tabular-nums">{fmtClock(r.timestamp)}</div>
-                        <DelBtn onDelete={() => handleDeleteRecord(r)} />
+                        <DelBtn onDelete={() => confirmDeleteRecord(r)} />
                     </div>
                 );
         }
@@ -3809,9 +3860,10 @@ ${olderText}
                             <div className="px-4 py-2.5 text-[12px] text-white/50 border-b border-white/10 truncate">查手机记录：{evidenceMenu.record.title}</div>
                             <button
                                 onClick={() => void syncEvidenceRecordToChat(evidenceMenu.record)}
-                                disabled={!!evidenceMenu.record.systemMessageId}
+                                disabled={evidenceSyncBusy}
                                 className="w-full px-4 py-3.5 text-left text-[14px] text-sky-300 active:bg-white/5 transition flex items-center gap-3 disabled:text-white/30"
-                            ><PaperPlaneTilt size={17} /> {evidenceMenu.record.systemMessageId ? '已同步到私聊' : '同步到私聊'}</button>
+                            ><PaperPlaneTilt size={17} /> {evidenceSyncBusy ? '同步中…' : evidenceMenu.record.systemMessageId ? '检查并补同步到私聊' : '同步到私聊'}</button>
+                            <p className="px-4 pb-3 text-[11px] text-white/40">卡片删掉后可补发；私聊里仍有卡片时不会重复发送。</p>
                             <button onClick={() => {
                                 const record = evidenceMenu.record;
                                 setEvidenceMenu(null);
@@ -4049,7 +4101,7 @@ ${olderText}
                         </p>
                         {/* 转为虚构 */}
                         <button
-                            onClick={() => handleRebindContact(selectedContact, { kind: 'npc' })}
+                            onClick={() => confirmRebindContact(selectedContact, { kind: 'npc' })}
                             disabled={selectedContact.kind === 'npc'}
                             className={`w-full flex items-center gap-2.5 rounded-xl p-3 border text-left transition ${selectedContact.kind === 'npc' ? 'border-slate-200 bg-slate-100 opacity-50' : 'border-slate-200 bg-slate-50 active:scale-[0.99]'}`}>
                             <span className="w-8 h-8 rounded-lg bg-slate-200 flex items-center justify-center text-slate-500 shrink-0"><User size={16} weight="bold" /></span>
@@ -4069,7 +4121,7 @@ ${olderText}
                                     const current = selectedContact.kind === 'real' && selectedContact.linkedCharId === rc.id;
                                     return (
                                         <button key={rc.id}
-                                            onClick={() => handleRebindContact(selectedContact, { kind: 'real', charId: rc.id })}
+                                            onClick={() => confirmRebindContact(selectedContact, { kind: 'real', charId: rc.id })}
                                             disabled={current}
                                             className={`w-full flex items-center gap-2.5 rounded-xl p-2.5 border text-left transition ${current ? 'border-pink-300 bg-pink-50' : 'border-slate-200 bg-slate-50 active:scale-[0.99]'}`}>
                                             <TokenImg value={rc.avatar} alt="" className="w-8 h-8 rounded-lg object-cover shrink-0" />
@@ -4090,9 +4142,17 @@ ${olderText}
                     <div className="flex gap-2">
                         <button onClick={() => {
                             const { contactId, topicId } = topicEdit;
-                            mutateContacts(cs => cs.map(c => c.id === contactId ? { ...c, topicBox: (c.topicBox || []).filter(t => t.id !== topicId) } : c));
-                            setTopicEdit(null);
-                            addToast('已删除该条记忆', 'success');
+                            askConfirm({
+                                title: '删除这段聊天记忆？',
+                                desc: '这段已总结的对话记忆删除后不可恢复。',
+                                confirmLabel: '删除',
+                                danger: true,
+                                onConfirm: () => {
+                                    mutateContacts(cs => cs.map(c => c.id === contactId ? { ...c, topicBox: (c.topicBox || []).filter(t => t.id !== topicId) } : c));
+                                    setTopicEdit(null);
+                                    addToast('已删除该条记忆', 'success');
+                                },
+                            });
                         }} className="px-4 py-3 bg-rose-500 text-white font-bold rounded-2xl">删除</button>
                         <button onClick={() => {
                             const { contactId, topicId, text } = topicEdit;

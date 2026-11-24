@@ -14,6 +14,7 @@ import { getCalendarDayDifference, getLocalDateKey } from '../utils/localDate';
 import { useLocalDateKey } from '../hooks/useLocalDateKey';
 import { trackEvent } from '../utils/analytics';
 import TokenImg from '../components/os/TokenImg';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 const TWEMOJI_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72';
 const twemojiUrl = (codepoint: string) => `${TWEMOJI_BASE}/${codepoint}.png`;
@@ -35,7 +36,7 @@ const THEMES: Record<ThemeMode, any> = {
         iconDone: 'text-green-500',
         decoLine: 'bg-slate-800',
         modalBg: 'bg-[#0f172a] border border-cyan-500',
-        input: 'bg-slate-800 text-white border-none rounded-none',
+        input: 'bg-slate-800 text-white [color-scheme:dark] placeholder:text-slate-400 border-none rounded-none',
         label: 'QUEST LOG',
         eventLabel: 'SERVER EVENTS'
     },
@@ -79,6 +80,7 @@ const THEMES: Record<ThemeMode, any> = {
 
 const ScheduleApp: React.FC = () => {
     const { closeApp, characters, activeCharacterId, apiConfig, addToast, userProfile, characterGroups } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog();
     const localDateKey = useLocalDateKey();
     const [tasks, setTasks] = useState<Task[]>([]);
     const [anniversaries, setAnniversaries] = useState<Anniversary[]>([]);
@@ -182,8 +184,15 @@ const ScheduleApp: React.FC = () => {
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, messages)),
                     temperature: 0.9, 
                     max_tokens: 8000 
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'schedule',
+                    appName: '日程表',
+                    charId: supervisor.id,
+                    charName: supervisor.name,
+                    purpose: '待办完成反馈',
+                },
+            } as RequestInit);
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -268,8 +277,15 @@ const ScheduleApp: React.FC = () => {
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, messages)),
                     temperature: 0.8,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'schedule',
+                    appName: '日程表',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '纪念日感想生成',
+                },
+            } as RequestInit);
 
             if (!response.ok) {
                  const errorText = await response.text();
@@ -332,6 +348,14 @@ const ScheduleApp: React.FC = () => {
     };
 
     const handleDeleteTask = async (id: string) => {
+        const task = tasks.find(t => t.id === id);
+        const confirmed = await requestConfirm({
+            title: '删除任务？',
+            message: task ? `确定删除任务「${task.title}」吗？` : '确定删除这条任务吗？',
+            confirmText: '删除',
+            variant: 'danger',
+        });
+        if (!confirmed) return;
         await DB.deleteTask(id);
         setTasks(prev => prev.filter(t => t.id !== id));
     };
@@ -354,6 +378,14 @@ const ScheduleApp: React.FC = () => {
     };
 
     const handleDeleteAnni = async (id: string) => {
+        const anni = anniversaries.find(a => a.id === id);
+        const confirmed = await requestConfirm({
+            title: '删除纪念日？',
+            message: anni ? `确定删除纪念日「${anni.title}」吗？` : '确定删除这条纪念日吗？',
+            confirmText: '删除',
+            variant: 'danger',
+        });
+        if (!confirmed) return;
         await DB.deleteAnniversary(id);
         setAnniversaries(prev => prev.filter(a => a.id !== id));
     };
@@ -574,7 +606,7 @@ const ScheduleApp: React.FC = () => {
                             {filterCharactersByGroup(characters, characterGroups, supervisorGroupId).map(c => (
                                 <button key={c.id} onClick={() => setNewTaskSupervisor(c.id)} className={`flex flex-col items-center gap-2 p-2 rounded-lg border transition-all min-w-[60px] ${newTaskSupervisor === c.id ? `${currentThemeMode === 'minimal' ? 'shadow-[inset_2px_2px_5px_#d1d9e6,inset_-2px_-2px_5px_#ffffff]' : 'border-current'}` : 'border-transparent opacity-50'}`}>
                                     <TokenImg value={c.avatar} className="w-10 h-10 rounded-md object-cover" />
-                                    <span className={`text-[10px] font-bold whitespace-nowrap ${theme.text}`}>{c.name}</span>
+                                    <span className="text-[10px] font-bold whitespace-nowrap text-slate-700">{c.name}</span>
                                 </button>
                             ))}
                         </div>
@@ -597,13 +629,14 @@ const ScheduleApp: React.FC = () => {
                             {filterCharactersByGroup(characters, characterGroups, anniCharGroupId).map(c => (
                                 <button key={c.id} onClick={() => setNewAnniChar(c.id)} className={`flex flex-col items-center gap-2 p-2 rounded-lg border transition-all min-w-[60px] ${newAnniChar === c.id ? `${currentThemeMode === 'minimal' ? 'shadow-[inset_2px_2px_5px_#d1d9e6,inset_-2px_-2px_5px_#ffffff]' : 'border-current'}` : 'border-transparent opacity-50'}`}>
                                     <TokenImg value={c.avatar} className="w-10 h-10 rounded-md object-cover" />
-                                    <span className={`text-[10px] font-bold whitespace-nowrap ${theme.text}`}>{c.name}</span>
+                                    <span className="text-[10px] font-bold whitespace-nowrap text-slate-700">{c.name}</span>
                                 </button>
                             ))}
                         </div>
                     </div>
                 </div>
             </Modal>
+            {confirmDialog}
         </div>
     );
 };

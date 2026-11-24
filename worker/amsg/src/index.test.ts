@@ -76,6 +76,7 @@ const limitsRow = (settings: Record<string, unknown> = {}, selfScheduleEnabled =
 import { isAmsgServerVersionAtLeast } from '../../../utils/amsgWorkerVersion';
 import { AMSG_TASK_KIND_KEY } from '../../../utils/amsgTaskKinds';
 import { PLATE_CONSOLIDATE_KIND } from '../../../utils/amsgPlateJob';
+import { TOOL_LOOP_FINAL_ROUND_PROMPT } from '../../../utils/toolLoopFinalRound';
 
 const CHAR_ID = 'preset-nyah';
 const TASK_UUID = '3637dae1-1461-4444-a747-34e406f67acc';
@@ -192,6 +193,25 @@ const makeCtx = (opts: {
 };
 
 describe('取消中的 instant hook', () => {
+  it.each([false, true])('自主月度查阅关闭后不进入工具循环，仍发送正常正文（instant=%s）', async instant => {
+    const { ctx, scratch, writeState } = makeCtx({
+      metadata: instant ? { amsgInstantChat: true } : {},
+      charRows: [
+        { key: AMSG_FIRE_PACK_KEY, value: firePackValue(null, instant ? { chat: { messages: [{ role: 'user', content: '还记得六月吗？' }], builtAt: PACK_BUILT_AT } } : {}) },
+        { key: AMSG_TOOL_PACK_KEY, value: JSON.stringify({ ...JSON.parse(toolPackValue), monthlyRecallEnabled: false, memories: [{ date: '2026-06-15', summary: '六月的详细经历' }] }) },
+      ],
+    });
+    const before = await amsgHooks.onBeforeFire(ctx) as any;
+    expect(before.allowedToolNames).not.toContain('recall');
+    const decision = await amsgHooks.onLLMOutput({
+      sessionId: 'sess_task_42', taskId: 42, taskUuid: TASK_UUID,
+      llmResponse: {}, llmOutputText: '六月一起吃过午饭。[[RECALL: 2026-06]]', contactName: 'Nyah',
+      metadata: ctx.task.metadata, scratch, writeState, readState: ctx.readState,
+    } as any) as any;
+    expect(decision.decision).toBe('finish');
+    expect(JSON.stringify(decision.pushPayloads)).toContain('六月一起吃过午饭。');
+    expect(JSON.stringify(decision.pushPayloads)).not.toContain('RECALL');
+  });
   it('已取消的请求不读上下文、不继续处理模型输出', async () => {
     const { ctx, readState, writeState } = makeCtx({ metadata: { amsgInstantChat: true } });
     const cancelled = new DOMException('Stopped', 'AbortError');
@@ -753,6 +773,38 @@ describe('离开后消息（到点）', () => {
     });
     await expect(amsgHooks.onBeforeFire(ctx)).resolves.toEqual({ skip: true });
   });
+
+  it('用户删掉推进词只剩角色见面/通话记录（lastAwayAnchorAt 在等待时长内）→ 照样推迟，不误发', async () => {
+    const ancientUser = NOW.getTime() - 360 * 60_000;
+    const recentDateAnchor = NOW.getTime() - 20 * 60_000;
+    const { ctx } = makeCtx({
+      metadata: awayMeta,
+      charRows: [
+        {
+          key: AMSG_FIRE_PACK_KEY,
+          value: firePackValue(ancientUser, {
+            lastAwayAnchorAt: recentDateAnchor,
+            template: `${BEFORE_SPEAK_LINES.join('\n')}\n${AMSG_SLOT_TASK_INSTRUCTION}`,
+          }),
+        },
+        { key: AMSG_TOOL_PACK_KEY, value: toolPackValue },
+        limitsRow({ minSendGapMinutes: 0 }),
+      ],
+    });
+    await expect(amsgHooks.onBeforeFire(ctx)).resolves.toEqual({ defer: { afterMs: 70 * 60_000 } });
+  });
+
+  it('人正停在见面界面里（presence.scene === date）撞上到点 → 推迟到离开后，不当面弹消息', async () => {
+    const ancientUser = NOW.getTime() - 360 * 60_000;
+    const activeAt = NOW.getTime() - 5_000;
+    const { ctx } = makeCtx({
+      metadata: awayMeta,
+      charRows: rows(ancientUser, [
+        { key: AMSG_CHAT_PRESENCE_KEY, value: presenceValue(activeAt, { lastUserMessageAt: null, scene: 'date' }) },
+      ]),
+    });
+    await expect(amsgHooks.onBeforeFire(ctx)).resolves.toEqual({ defer: { afterMs: 90 * 60_000 - 5_000 } });
+  });
 });
 
 // ─── 用户定的「频率与额度」：到点那几道闸 ───
@@ -1040,13 +1092,14 @@ describe('频率与额度（到点兜底闸）', () => {
     fired(await amsgHooks.onBeforeFire(alarm.ctx));
   });
 
-  // 见面离开提醒：用户为这次见面设的一次性提醒，必发、不受连发和每日上限拦，也不给排程工具；
+  // 见面离开提醒：用户为这次见面设的一次性提醒，必发、不受连发和每日上限拦；这一轮照样给排程工具
+  // （排出来的子任务不带豁免，见 fireParity.test.ts）；
   // 人还在见面里就按租约往后推，走开后在私聊里开过口就作废（见 docs/date-leave-reminder.md）。
   const dateLeaveMeta = { amsgDateLeave: true, amsgDateLeaveDelayMinutes: 5, amsgExpirePolicy: 'force' };
   // 见面里续的租约不带开口时刻（DateApp 传 null）。
   const dateLease = (activeAt: number) => presenceValue(activeAt, { scene: 'date', lastUserMessageAt: null });
 
-  it('见面离开提醒：连发和每日上限都已满 → 照发，而且没有【开口之前】、不给排程工具', async () => {
+  it('见面离开提醒：连发和每日上限都已满 → 照发，而且没有【开口之前】', async () => {
     const { ctx } = makeCtx({
       metadata: dateLeaveMeta,
       charRows: rows({
@@ -1059,7 +1112,6 @@ describe('频率与额度（到点兜底闸）', () => {
     ctx.scheduleTask = vi.fn();
     const result = fired(await amsgHooks.onBeforeFire(ctx));
     expect(result.messages[0].content).not.toContain('【开口之前】');
-    expect(result.tools?.some((t) => t.function.name === AMSG_FIRE_SCHEDULE_TOOL)).toBeFalsy();
   });
 
   it('见面离开提醒：对照组——同样的额度下普通自排任务被连发上限拦下', async () => {
@@ -1565,13 +1617,14 @@ describe('executeToolCalls 的工具编排', () => {
 
   // 轮次快用完了还在请求工具，上游会抛 AGENTIC_LOOP_EXCEEDED：这次攒的旁白全丢、任务
   // 不出清、下一分钟整条从头重跑。先在回喂里说一声，模型自己收尾最省。
-  it('倒数第二轮的回喂末尾加一句「这是最后一轮」', async () => {
+  // 收尾提示与本地工具循环共用同一句（utils/toolLoopFinalRound.ts）。
+  it('倒数第二轮的回喂末尾加上共用的收尾提示', async () => {
     const session = await readySession();
     const [out] = await amsgHooks.executeToolCalls(
       [toolCall('c1', 'recall', { year: '2026', month: '06' })],
       { ...session, iteration: DEFAULT_TOOL_ITERATIONS - 2 },
     );
-    expect(out.content).toContain('最后一轮');
+    expect(out.content.endsWith(`\n${TOOL_LOOP_FINAL_ROUND_PROMPT}`)).toBe(true);
   });
 
   it('还早的轮次不加那句话（别一上来就催着收尾）', async () => {
@@ -1580,7 +1633,7 @@ describe('executeToolCalls 的工具编排', () => {
       [toolCall('c1', 'recall', { year: '2026', month: '06' })],
       { ...session, iteration: 0 },
     );
-    expect(out.content).not.toContain('最后一轮');
+    expect(out.content).not.toContain(TOOL_LOOP_FINAL_ROUND_PROMPT);
   });
 });
 
@@ -1639,6 +1692,7 @@ describe('云端思考链随首条 push 回客户端', () => {
   /** 一轮 LLM：正文 + 可选的思考（放在哪个响应字段里也能挑）。 */
   interface Round {
     output: string;
+    message?: Record<string, unknown>;
     reasoning?: string;
     /** 思考放哪个字段，默认 reasoning_content。 */
     field?: 'reasoning_content' | 'reasoning' | 'thinking';
@@ -1682,6 +1736,7 @@ describe('云端思考链随首条 push 回客户端', () => {
             message: {
               content: round.output,
               ...(round.reasoning ? { [round.field ?? 'reasoning_content']: round.reasoning } : {}),
+              ...round.message,
             },
           }],
         },
@@ -1728,6 +1783,29 @@ describe('云端思考链随首条 push 回客户端', () => {
     expect(JSON.stringify(payloads)).not.toContain('<think>');
   });
 
+  it.each([
+    {content:[{text:'摘要',thought:true},{type:'text',text:'你好'}]},
+    {content:'你好',reasoning_content:'',reasoning_details:[{type:'reasoning.summary',summary:'摘要'}]},
+  ])('structured thoughts stay out of push messages', async message => {
+    const decision=await instantFire([{output:'摘要你好',message}]);
+    expect(decision.decision).toBe('finish');
+    expect(decision.pushPayloads.map((p:any)=>p.message)).toEqual(['你好']);
+    expect(decision.pushPayloads[0].metadata.amsgReasoning).toBe('摘要');
+  });
+
+  it('captures a trailing unfinished block without pushing it', async () => {
+    const decision=await instantFire([{output:'<think>前半段</think>你好<thinking>后半段'}]);
+    expect(decision.decision).toBe('finish');
+    expect(decision.pushPayloads.map((p:any)=>p.message)).toEqual(['你好']);
+    expect(decision.pushPayloads[0].metadata.amsgReasoning).toBe('前半段\n\n后半段');
+  });
+
+  it('does not use SDK fallback thinking as a missing answer', async () => {
+    const decision=await instantFire([{output:'只有思考没有回答',message:{content:null,reasoning:'只有思考没有回答'}}]);
+    expect(decision.decision).toBe('skip-push');
+    expect(decision.pushPayloads).toBeUndefined();
+  });
+
   // 工具循环一次 fire 跑好几轮，每轮都有自己的思考。留最后一轮的：用户看到的正文就是
   // 那一轮写的，配上「我先去查一下」的中间轮思考等于答非所问。
   it('多轮工具循环 → 留下产出正文那一轮的思考', async () => {
@@ -1754,6 +1832,17 @@ describe('云端思考链随首条 push 回客户端', () => {
     for (const payload of decision.pushPayloads as Array<Record<string, any>>) {
       expect(payload.metadata.amsgReasoning).toBeUndefined();
     }
+  });
+
+  it('工具轮已说完话、续写收尾轮留空结束 → 保留真正写出正文那一轮的心象', async () => {
+    const decision = await instantFire([
+      { output: '好呀，早点睡，晚安～\n[[RECALL: 2026-06]]', reasoning: '他困了，先哄他睡。' },
+      { output: '', reasoning: '前面已经说完了，留空结束。' },
+    ]);
+
+    expect(decision.decision).toBe('finish');
+    expect(decision.pushPayloads.map((p: any) => p.message)).toEqual(['好呀，早点睡，晚安～']);
+    expect(decision.pushPayloads[0].metadata.amsgReasoning).toBe('他困了，先哄他睡。');
   });
 
   // 定时任务这条路的 prompt 是 renderFirePack 现拼的，没有「心象」那段提示词，模型的
@@ -3403,6 +3492,122 @@ describe('fire 侧取消 / 改期任务', () => {
     expect(last.metadata.amsgUsage).toEqual({ promptTokens: 1234, completionTokens: 56 });
   });
 
+  it('排程与查记忆后的续答是一笔独立请求，多个工具不虚增调用次数', async () => {
+    const stash = makeStash({ instant: true, maxToolIterations: 5, selfScheduleAllowed: true,
+      fireToolNames: new Set(['schedule_active_message']) });
+    const common = { sessionId: 'sess_task_42', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID,
+      contactName: 'Nyah', metadata: { charId: CHAR_ID, amsgMode: 'instant', amsgInstantChat: true },
+      scratch: { fire: stash }, scheduleTask: vi.fn(),
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })) };
+    const first = await amsgHooks.onLLMOutput({ ...common, iteration: 0,
+      llmResponse: {}, llmOutputText: `[[RECALL: 2026-07]]\nschedule_active_message({"send_at":"${newSendAt}"})`,
+      usage: { prompt_tokens: 1000, completion_tokens: 40 },
+    } as any) as any;
+    expect(first.decision).toBe('tool-request');
+    expect(first.toolCalls.map((call: any) => call.function.name)).toEqual(expect.arrayContaining(['recall', 'schedule_active_message']));
+    const final = await amsgHooks.onLLMOutput({ ...common, iteration: 1,
+      llmResponse: { model: 'actual-backend' }, llmOutputText: '好，到时提醒你。',
+      usage: { prompt_tokens: 1100, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 900 }, provider_secret_detail: 'private' },
+    } as any) as any;
+    const calls = final.pushPayloads.at(-1).metadata.amsgModelCalls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ index: 1, causes: [], promptTokens: 1000, completionTokens: 40 });
+    expect(calls[1]).toMatchObject({ index: 2, causes: expect.arrayContaining(['recall', 'schedule']),
+      promptTokens: 1100, completionTokens: 50, cacheReadTokens: 900, backendModel: 'actual-backend' });
+    expect(JSON.stringify(calls)).not.toContain('private');
+  });
+
+  it.each([
+    ['模型失败', 'failed', 2],
+    ['工具失败', 'failed', 1],
+    ['空回复', 'skipped', 1],
+  ])('%s 时只回传实际发生的模型请求，重复收尾不重发', async (_label, status, llmCalls) => {
+    const stash = makeStash({ instant: true, maxToolIterations: 5 });
+    const writeState = vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 }));
+    await amsgHooks.onLLMOutput({
+      sessionId: 'sess_task_42', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID, iteration: 0,
+      llmResponse: {}, llmOutputText: '[[RECALL: 2026-07]]', contactName: 'Nyah',
+      metadata: { charId: CHAR_ID, amsgMode: 'instant', amsgInstantChat: true },
+      scratch: { fire: stash }, usage: { prompt_tokens: 1000, completion_tokens: 30 }, writeState,
+    } as any);
+    const emitResult = vi.fn(async () => ({}));
+    const info = { status, llmCalls, sentCount: 0, outboxed: false, scratch: { fire: stash }, writeState, emitResult,
+      error: Object.assign(new Error('model rejected'), { llmStatus: 429 }) };
+    await amsgFireSettled(info as any);
+    await amsgFireSettled(info as any);
+    expect(emitResult).toHaveBeenCalledTimes(1);
+    const receipt = (emitResult.mock.calls[0] as any)[0];
+    expect(receipt).toMatchObject({ resultKind: 'instant-api-calls', taskUuid: TASK_UUID, notification: { show: false } });
+    expect(receipt.calls).toHaveLength(llmCalls);
+    expect(receipt.calls[0]).toMatchObject({ ok: true, promptTokens: 1000, completionTokens: 30 });
+    if (llmCalls === 2) {
+      expect(receipt.calls[1]).toMatchObject({ index: 2, ok: false, status: 429, causes: ['recall'] });
+      expect(receipt.calls[1].promptTokens).toBeUndefined();
+    }
+  });
+
+  it('取消租约已禁止写结果时不绕过门禁，也不让记账异常打断收尾', async () => {
+    const emitResult = vi.fn(async () => { throw Object.assign(new Error('cancelled'), { code: 'TASK_CANCELLED' }); });
+    const stash = makeStash({ instant: true, modelCalls: [
+      { index: 1, completedAt: Date.now(), causes: [], ok: true, promptTokens: 1000, completionTokens: 30 },
+    ] });
+    await expect(amsgFireSettled({ status: 'cancelled', llmCalls: 1, outboxed: false,
+      scratch: { fire: stash }, emitResult,
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
+    } as any)).resolves.toBeUndefined();
+    expect(emitResult).toHaveBeenCalledTimes(1);
+    expect(stash.modelCallsReceiptSent).not.toBe(true);
+  });
+
+  it('已落入消息 outbox 的回复即使推送失败也不额外回传一份调用记录', async () => {
+    const emitResult = vi.fn(async () => ({}));
+    await amsgFireSettled({ status: 'failed', llmCalls: 1, outboxed: true,
+      scratch: { fire: makeStash({ instant: true }) }, emitResult,
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
+    } as any);
+    expect(emitResult).not.toHaveBeenCalled();
+  });
+
+  it('多轮工具调用时按轮累加 usage 并标 amsgUsageComplete，定时主动消息同样在末条带回 amsgUsage', async () => {
+    const stash = makeStash({ instant: true, maxToolIterations: 5 });
+    const round1 = await amsgHooks.onLLMOutput({
+      sessionId: 'sess_task_42', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID,
+      iteration: 0,
+      llmResponse: {}, llmOutputText: '[[RECALL: 2026-07]]', contactName: 'Nyah',
+      metadata: { charId: CHAR_ID, amsgClientTaskId: 'ct-u', amsgMode: 'instant', amsgInstantChat: true },
+      scratch: { fire: stash },
+      usage: { prompt_tokens: 1000, completion_tokens: 30 },
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
+    } as any) as any;
+    expect(round1.decision).toBe('tool-request');
+
+    const round2 = await amsgHooks.onLLMOutput({
+      sessionId: 'sess_task_42', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID,
+      iteration: 1,
+      llmResponse: {}, llmOutputText: '想起来了，是七月那件事。', contactName: 'Nyah',
+      metadata: { charId: CHAR_ID, amsgClientTaskId: 'ct-u', amsgMode: 'instant', amsgInstantChat: true },
+      scratch: { fire: stash },
+      usage: { prompt_tokens: 1400, completion_tokens: 70 },
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
+    } as any) as any;
+    const last = round2.pushPayloads[round2.pushPayloads.length - 1];
+    expect(last.metadata.amsgUsage).toEqual({ promptTokens: 2400, completionTokens: 100 });
+    expect(last.metadata.amsgUsageComplete).toBe(true);
+
+    const scheduledStash = makeStash({ instant: false, selfScheduled: true });
+    const scheduledDecision = await amsgHooks.onLLMOutput({
+      sessionId: 'sess_task_43', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID,
+      llmResponse: {}, llmOutputText: '忙完了吗？', contactName: 'Nyah',
+      metadata: { charId: CHAR_ID, amsgClientTaskId: 'ct-s', amsgMode: 'auto' },
+      scratch: { fire: scheduledStash },
+      usage: { prompt_tokens: 900, completion_tokens: 25 },
+      writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
+    } as any) as any;
+    const scheduledLast = scheduledDecision.pushPayloads[scheduledDecision.pushPayloads.length - 1];
+    expect(scheduledLast.metadata.amsgUsage).toEqual({ promptTokens: 900, completionTokens: 25 });
+    expect(scheduledLast.metadata.amsgProactiveKind).toBe('self');
+  });
+
   it('取消 / 改期的账随末条 push 的 amsgTaskMutations 回客户端（首条不带）', async () => {
     const stash = makeStash({
       cancelledTasks: ['u-cancelled'],
@@ -4522,7 +4727,9 @@ describe('onBeforeFire — 即时对话分支', () => {
     // ctx.scheduleTask 存在才教「给自己排下一条」
     (ctx as any).scheduleTask = async () => ({ created: true, id: 1, uuid: 'u', nextSendAt: 'x' });
     const result = fired(await amsgHooks.onBeforeFire(ctx));
-    const appended = result.messages[result.messages.length - 1].content;
+    // 有 MCP 工具时最后一条是本地同款的末尾提醒，时效块在它前面。
+    expect(result.messages[result.messages.length - 1].content).toContain('[MCP 工具 ON');
+    const appended = result.messages[result.messages.length - 2].content;
     expect(appended).toContain('【外部工具');         // MCP 说明块
     expect(appended).toContain('search_memory');
     expect(appended).toContain('给自己排下一条');      // 排程说明块
@@ -5007,6 +5214,96 @@ describe('即时对话的接线', () => {
     expect(body.data.selfUpdate.supported).toBe(true);
     // 桩出来的 DB 读不了诊断表 → 从没查过
     expect(body.data.selfUpdate.state).toBeNull();
+  });
+
+  describe('/self-update 的通道（canary 加入 / 退出走这条）', () => {
+    /** 只认诊断表那两句 SQL 的小桩：够 readDiagnosticValue / writeDiagnosticValue 用。 */
+    const diagnosticsDb = () => {
+      const rows = new Map<string, string>();
+      const statement = (sql: string, params: unknown[] = []) => ({
+        bind: (...values: unknown[]) => statement(sql, values),
+        first: async () => (sql.startsWith('SELECT value') && rows.has(String(params[0])) ? { value: rows.get(String(params[0])) } : null),
+        run: async () => {
+          if (sql.includes('INSERT INTO worker_diagnostics')) rows.set(String(params[0]), String(params[1]));
+          return { success: true };
+        },
+      });
+      return { prepare: (sql: string) => statement(sql), rows };
+    };
+    const BUNDLE = `// src_default as default\n${'x'.repeat(200 * 1024)}`;
+    const env = (db: any, extra: Record<string, unknown> = {}) => ({
+      ...fullEnv, DB: db, AMSG_SERVER_TOKEN: 'shared', CF_API_TOKEN: 'cf', CF_SCRIPT_NAME: 'w', CF_ACCOUNT_ID: 'acc', ...extra,
+    });
+    const realFetch = globalThis.fetch;
+    let pulled: string[] = [];
+    let uploadOk = true;
+    afterEach(() => { globalThis.fetch = realFetch; });
+    const stub = () => {
+      pulled = [];
+      globalThis.fetch = (async (input: any, init: any = {}) => {
+        const url = String(input);
+        if (url.includes('raw.githubusercontent.com')) { pulled.push(new URL(url).pathname); return new Response(BUNDLE); }
+        if ((init.method ?? 'GET') === 'PUT' && !uploadOk) {
+          return Response.json({ success: false, errors: [{ code: 10000, message: 'boom' }] }, { status: 400 });
+        }
+        if (url.endsWith('/settings')) return Response.json({ success: true, result: { bindings: [] } });
+        return Response.json({ success: true, result: {} });
+      }) as typeof fetch;
+    };
+    const post = (workerEnv: any, body?: string) =>
+      (worker as any).fetch(
+        new Request('https://w.example/self-update', { method: 'POST', headers: { 'X-Client-Token': 'shared' }, body }),
+        workerEnv,
+        { waitUntil: () => {} },
+      );
+
+    it('/config-check 报 bundleChannel：没记过、D1 读不了都是 stable', async () => {
+      const body = await (await call('https://w.example/config-check')).json();
+      expect(body.data.bundleChannel).toBe('stable');
+    });
+
+    it('带 canary 装成功 → 记下通道，/config-check 跟着报 canary；之后不带通道的调用继续拉 canary', async () => {
+      stub();
+      uploadOk = true;
+      const db = diagnosticsDb();
+      const response = await post(env(db), JSON.stringify({ channel: 'canary' }));
+      expect(response.status).toBe(200);
+      expect((await response.json()).data.channel).toBe('canary');
+      expect(db.rows.get('bundle_channel')).toBe('canary');
+      expect(pulled).toEqual(['/Tosd0/sullyos-workers/canary/amsg/worker.bundle.js']);
+
+      const check = await (await call('https://w.example/config-check', {}, env(db))).json();
+      expect(check.data.bundleChannel).toBe('canary');
+
+      stub();
+      await post(env(db));
+      expect(pulled).toEqual(['/Tosd0/sullyos-workers/canary/amsg/worker.bundle.js']);
+    });
+
+    it('装失败不写通道', async () => {
+      stub();
+      uploadOk = false;
+      const db = diagnosticsDb();
+      const response = await post(env(db), JSON.stringify({ channel: 'canary' }));
+      uploadOk = true;
+      expect(response.status).toBe(400);
+      expect((await response.json()).error.code).toBe('UPLOAD_FAILED');
+      expect(db.rows.has('bundle_channel')).toBe(false);
+    });
+
+    it('通道值不认识 → 400 INVALID_CHANNEL；自定义成品包地址要换线 → 400 CUSTOM_BUNDLE_URL', async () => {
+      stub();
+      const db = diagnosticsDb();
+      const invalid = await post(env(db), JSON.stringify({ channel: 'beta' }));
+      expect(invalid.status).toBe(400);
+      expect((await invalid.json()).error.code).toBe('INVALID_CHANNEL');
+
+      const custom = await post(env(db, { AMSG_BUNDLE_URL: 'https://example.com/w.js' }), JSON.stringify({ channel: 'canary' }));
+      expect(custom.status).toBe(400);
+      expect((await custom.json()).error.code).toBe('CUSTOM_BUNDLE_URL');
+      expect(pulled).toEqual([]);
+      expect(db.rows.has('bundle_channel')).toBe(false);
+    });
   });
 
   describe('/self-update/check（冷启动顺手问一句该更新了没）', () => {

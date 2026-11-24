@@ -30,7 +30,17 @@ import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
 import { isElevenLabsV4Model } from './elevenLabsModels';
 import { selectCharacterContextMessages } from './chatContextRange';
 import { buildCharacterResponsePrinciples } from './characterResponsePrinciples';
+import { voiceLanguagePromptLabel } from './voiceLanguage';
 import { resolveCharacterUser } from './userPersona';
+
+const buildDateVoiceTranslationGuide = (char: CharacterProfile): string => {
+    if (!char.dateVoiceEnabled || !char.dateVoiceLang) return '';
+    return `### 见面语音译文（与正文在同一次回复中生成）
+正文仍按原来的语言、台词与叙述格式输出。在每一行正文末尾追加 <date-voice lang="${char.dateVoiceLang}">该行的${voiceLanguagePromptLabel(char.dateVoiceLang)}译文</date-voice>，不要另起一行。
+台词行只翻译台词，叙述行翻译该行叙述，逐行对应，不省略、不新增情节。译文不要添加立绘标签或 [v:xxx]；声音 Audio Tags 与 /IPA/ 指令原样保留。OBSERVE 观测块及其他系统指令不加译文。译文只是朗读用，不是角色又说了一遍。
+示例结构：[happy] "原文台词。" [v:calm] <date-voice lang="${char.dateVoiceLang}">对应的目标语言台词。</date-voice>
+即使历史消息没有译文，本次也须按以上格式同步输出。`;
+};
 
 /** Adapted from story preset character-polyphony / evidence-gate / user-agency.
  * In-person companionship permits a small beat; it does not require plot escalation.
@@ -53,7 +63,7 @@ export type ApiMessage = { role: string; content: any };
  * 见面（DateApp）专用的「语音情绪」格式规则（VN 模式下、char.dateVoiceEnabled 时注入）。
  * 与聊天/电话的 VOICE_ACTING_GUIDE 不同：见面台词走 VN 散文，只在台词行末用 [v:xxx] 单独标语音情绪，
  * 与立绘 [emotion] 解耦、不引入 <#秒#> 停顿/语气声标签。开头编号 4. 是承接 VN 规则列表第 1~3 条。
- * 用户可在「设置 → 其他 API → 语音提示词」自定义；留空则用这份内置默认。
+ * 用户可在「设置 → 语音与写歌 → 语音提示词」自定义；留空则用这份内置默认。
  */
 export const DATE_VOICE_GUIDE = `4. **语音情绪（跟立绘分开）**: \`[emotion]\` 只管**立绘表情**。台词会被朗读成真实语音，而立绘的夸张表情 ≠ 语音里的情绪——立绘 happy 是个灿烂笑脸，语音 happy 却会变成过度上扬的腔调，常常不对味。所以**语音情绪要单独标**：在台词行末尾加 \`[v:xxx]\`，xxx 仅限 happy/sad/angry/fearful/disgusted/surprised/calm。
    - 不是每句都要标——情绪平淡、自然说话时**不标**（默认更真实），只在台词确实有明显情绪、且和立绘强度不一致时才标。
@@ -608,6 +618,7 @@ const buildVNModeBlock = (char: CharacterProfile, userName: string): string => {
 2. **情绪标签**: **每一行都必须以** \`[emotion]\` **开头**，表示该行的表情立绘。逐行结合台词、动作和上下文选择最贴切的表情，细微情绪也要体现；[normal] 用于确实平静或中性的状态，不是默认占位符。已有笑意、低落、恼意或羞赧时，应从可用标签中选对应表情，不要把明确情绪全标成 [normal]。同一情绪延续时，相邻行可以重复标签；情绪发生变化时及时切换，不为了凑标签种类制造情绪。仅限使用以下情绪: ${dateEmotions.join(', ')}。不要使用任何不在此列表中的标签。
 3. **格式**: 台词用双引号 **"..."**，动作/叙述直接写（不加引号）。
 ${char.dateVoiceEnabled ? getDateVoiceGuide() : ''}
+${buildDateVoiceTranslationGuide(char)}
 
 ${preset.block}
 
@@ -724,7 +735,8 @@ ${invite ? '描写角色自己的到来、动作与必要的开场台词，停�
 1. **上下文连贯性**: ${continuityRule}
 2. **状态一致性**: ${!dateTimeOn ? '根据最近记录中的剧情进展、场景与情绪来决定当前状态，使角色表现与上一幕自然呼应。' : gapHint.includes('天') ? '如果间隔了很多天，可能在发呆、忙碌或者有点落寞。' : '根据最近的聊天内容和情绪来决定当前状态。如果刚聊完，角色的状态应该与聊天内容相呼应。'}
 3. **描写风格**: ${preset.peekHint}。${isObserveOn(char) ? '先按下方「观测协议」输出观测块，再开始描写内容（描写本身不要加任何前缀）。' : '不要输出任何前缀，直接输出描写内容。'}
-${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlock(char)}` : ''}`;
+${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlock(char)}` : ''}
+${buildDateVoiceTranslationGuide(char)}`;
 
         return {
             messages: [
