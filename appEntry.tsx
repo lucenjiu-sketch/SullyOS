@@ -16,15 +16,7 @@ import { installIOSStatusBarEdge } from './utils/iosStatusBarEdge';
 import { installReducedBlurPolicy } from './utils/blurPolicy';
 import { initAnalytics } from './utils/analytics';
 import { Capacitor } from '@capacitor/core';
-
-// 默认构建不开启时 Rollup 会整段裁掉；普通浏览器/PWA 不加载原生插件、不申请权限。
-if (import.meta.env.VITE_AMSG_NATIVE_PUSH === 'true' && Capacitor.isNativePlatform()) {
-  if (Capacitor.getPlatform() === 'android') {
-    void import('./utils/unifiedPushRuntime').then(({ initUnifiedPushRuntime }) => initUnifiedPushRuntime());
-  } else {
-    void import('./utils/nativeAmsgPush').then(({ initNativeAmsgPush }) => initNativeAmsgPush());
-  }
-}
+import { RELEASE_CHANNEL, watchCanaryBootHealth } from './utils/releaseChannel';
 
 // Prepare storage and the SW in parallel. Only background writers wait for both;
 // DatabaseGuard shares this read check and never waits for the SW/offline downloads.
@@ -32,6 +24,18 @@ startDatabaseOpenDiagnostics();
 const databaseReady = checkDatabaseReadable(openDB).then(async result => { await restoreSpaceCatalog(); return result; });
 void databaseReady.catch(cancelUserSpaceTransition);
 void databaseReady.then(releaseDatabaseDiagnosticPersistence, releaseDatabaseDiagnosticPersistence);
+// 等本地库和空间目录恢复再收件，不依赖浏览器 SW，也不误消费其他空间的结果。
+if (import.meta.env.VITE_AMSG_NATIVE_PUSH === 'true' && Capacitor.isNativePlatform()) {
+  void databaseReady.then(async () => {
+    if (Capacitor.getPlatform() === 'android') {
+      const { initUnifiedPushRuntime } = await import('./utils/unifiedPushRuntime');
+      await initUnifiedPushRuntime();
+    } else {
+      const { initNativeAmsgPush } = await import('./utils/nativeAmsgPush');
+      await initNativeAmsgPush();
+    }
+  }).catch(() => console.warn('原生推送暂未启动：本地存储或原生桥未就绪'));
+}
 const keepAliveReady = KeepAlive.init();
 Promise.all([databaseReady, keepAliveReady]).then(() => {
   recordDatabaseOpen('background-ready');
@@ -61,9 +65,13 @@ if (!rootElement) {
   throw new Error("Could not find root element to mount to");
 }
 
+// 全局样式按通道切换配色（index.html 里的 canary 金黄主题）。
+document.documentElement.dataset.releaseChannel = RELEASE_CHANNEL;
 const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
     <DatabaseGuard readiness={databaseReady}><App /></DatabaseGuard>
   </React.StrictMode>
 );
+// canary 挂载稳住了就清掉启动计数，否则正式版会以为它打不开而自动退回（docs/canary-channel.md）。
+watchCanaryBootHealth(rootElement);

@@ -12,6 +12,7 @@ import { DATE_STYLE_PRESETS } from '../../utils/datePrompts';
 import ObserveSettings from './ObserveSettings';
 import DateExtraPresets from './DateExtraPresets';
 import DateExtraEditor from './DateExtraEditor';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { isAwayCloudRoute } from '../../utils/awayMessage';
 import {
     DATE_LEAVE_MAX_MINUTES, DATE_LEAVE_MIN_MINUTES, disarmDateLeaveReminder, resolveDateLeaveDelayMinutes,
@@ -103,6 +104,7 @@ const LeaveReminderSection: React.FC<{ char: CharacterProfile }> = ({ char }) =>
 
 const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
     const { updateCharacter, addToast, userProfile } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
     const fileInputRef = useRef<HTMLInputElement>(null);
     const pageRef = useRef<HTMLDivElement>(null);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -267,7 +269,15 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
         addToast(`皮肤 [${name}] 已创建`, 'success');
     };
 
-    const handleDeleteSkinSet = (skinId: string) => {
+    const handleDeleteSkinSet = async (skinId: string) => {
+        const target = skinSets.find(s => s.id === skinId);
+        const ok = await requestConfirm({
+            title: `删除皮肤「${target?.name || '未命名'}」？`,
+            message: '该皮肤下的所有表情立绘配置都会移除，无法恢复。',
+            confirmText: '确认删除',
+            variant: 'danger',
+        });
+        if (!ok) return;
         const updated = skinSets.filter(s => s.id !== skinId);
         const patch: Partial<CharacterProfile> = { dateSkinSets: updated };
         if (activeSkinId === skinId) patch.activeSkinSetId = undefined;
@@ -334,7 +344,14 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
         addToast(`已添加自定义情绪 [${key}]`, 'success');
     };
 
-    const handleDeleteCustomEmotion = (key: string) => {
+    const handleDeleteCustomEmotion = async (key: string) => {
+        const ok = await requestConfirm({
+            title: `删除自定义情绪 [${key}]？`,
+            message: '对应的默认立绘图片也会一并移除，无法恢复。',
+            confirmText: '确认删除',
+            variant: 'danger',
+        });
+        if (!ok) return;
         const updated = customEmotions.filter(e => e !== key);
         updateCharacter(char.id, { customDateSprites: updated });
         // Also remove the sprite image for this emotion
@@ -345,7 +362,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
     };
 
     return (
-        <div ref={pageRef} className="h-full min-h-0 w-full bg-slate-50 flex flex-col overflow-hidden">
+        <div ref={pageRef} className="h-full min-h-0 w-full bg-slate-50 text-slate-800 flex flex-col overflow-hidden">
             <div className="h-16 flex items-center justify-between px-4 border-b border-slate-200 bg-white shrink-0 z-20">
                 <button onClick={onBack} className="p-2 -ml-2 text-slate-600 active:scale-95 transition-transform">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg>
@@ -505,7 +522,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             onChange={e => setExtraDraft(e.target.value)}
                             onBlur={saveExtraDraft}
                             placeholder="比如：多写环境互动；不要写心理活动；对话占比多一些……"
-                            className="w-full h-28 px-4 pt-3 pb-11 bg-slate-100 rounded-xl text-sm resize-none focus:ring-1 focus:ring-primary/30 outline-none transition-all leading-relaxed"
+                            className="w-full h-28 px-4 pt-3 pb-11 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm resize-none focus:ring-1 focus:ring-primary/30 outline-none transition-all leading-relaxed"
                         />
                         <button type="button" aria-label="展开自定义补充" onClick={() => setExtraEditorOpen(true)}
                             className="absolute bottom-2 right-2 px-3 py-1.5 rounded-lg bg-white text-xs font-semibold text-primary shadow-sm">↗ 展开</button>
@@ -570,7 +587,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                     <div className="text-center flex items-center justify-center gap-1">
                                         <div className="text-xs font-bold text-slate-600 capitalize truncate">{key}</div>
                                         <button
-                                            onClick={(e) => { e.stopPropagation(); handleDeleteCustomEmotion(key); }}
+                                            onClick={(e) => { e.stopPropagation(); void handleDeleteCustomEmotion(key); }}
                                             className="text-slate-300 hover:text-red-400 transition-colors shrink-0"
                                         >
                                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
@@ -589,7 +606,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             onChange={e => setNewEmotionName(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') handleAddCustomEmotion(); }}
                             placeholder="输入情绪名 (如 scared, excited...)"
-                            className="flex-1 px-4 py-3 bg-slate-100 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
+                            className="flex-1 px-4 py-3 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
                         />
                         <button
                             onClick={handleAddCustomEmotion}
@@ -642,7 +659,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                         <button onClick={() => setEditingSkinId(editingSkinId === skin.id ? null : skin.id)} className="text-[10px] text-slate-500 px-2 py-1 rounded-lg hover:bg-slate-100 transition-colors">
                                             {editingSkinId === skin.id ? '收起' : '编辑'}
                                         </button>
-                                        <button onClick={() => handleDeleteSkinSet(skin.id)} className="text-slate-300 hover:text-red-400 transition-colors p-1">
+                                        <button onClick={() => void handleDeleteSkinSet(skin.id)} className="text-slate-300 hover:text-red-400 transition-colors p-1">
                                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-3.5 h-3.5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
                                         </button>
                                     </div>
@@ -686,7 +703,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             onChange={e => setNewSkinName(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') handleCreateSkinSet(); }}
                             placeholder="皮肤名称 (如 冬装、泳装...)"
-                            className="flex-1 px-4 py-3 bg-slate-100 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
+                            className="flex-1 px-4 py-3 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
                         />
                         <button
                             onClick={handleCreateSkinSet}
@@ -707,7 +724,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
             {/* URL Input Modal */}
             {showUrlModal && (
                 <div className="fixed inset-0 z-[300] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6" onClick={() => setShowUrlModal(false)}>
-                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white text-slate-800 rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
                         <div className="p-4 border-b border-slate-100">
                             <h3 className="font-bold text-slate-700 text-sm">通过 URL 添加立绘</h3>
                             <p className="text-[11px] text-slate-400 mt-1">{urlTargetSkinId ? `目标: ${skinSets.find(s => s.id === urlTargetSkinId)?.name}` : '目标: 默认立绘'}</p>
@@ -718,7 +735,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                 <select
                                     value={skinUrlEmotionKey}
                                     onChange={e => setSkinUrlEmotionKey(e.target.value)}
-                                    className="w-full px-3 py-2.5 bg-slate-100 rounded-xl text-sm outline-none"
+                                    className="w-full px-3 py-2.5 bg-slate-100 text-slate-800 rounded-xl text-sm outline-none"
                                 >
                                     <option value="">选择情绪...</option>
                                     {[...REQUIRED_EMOTIONS, ...(char.customDateSprites || [])].map(k => (
@@ -733,7 +750,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                     value={skinUrlInput}
                                     onChange={e => setSkinUrlInput(e.target.value)}
                                     placeholder="https://example.com/sprite.png"
-                                    className="w-full px-3 py-2.5 bg-slate-100 rounded-xl text-sm outline-none focus:ring-1 focus:ring-primary/30"
+                                    className="w-full px-3 py-2.5 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm outline-none focus:ring-1 focus:ring-primary/30"
                                 />
                             </div>
                             {skinUrlInput && skinUrlInput.startsWith('http') && (
@@ -756,6 +773,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 </button>
             </div>
             </div>
+            {confirmDialog}
         </div>
     );
 };

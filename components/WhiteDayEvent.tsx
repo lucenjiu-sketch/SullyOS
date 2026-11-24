@@ -22,6 +22,7 @@ import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { shareOrDownloadBlob } from '../utils/shareExport';
 import TokenImg from './os/TokenImg';
 import { dataUrlToBlob, isImageValue, putImageBlob, resolveRefToDataUrl } from '../utils/blobRef';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 // ============================================================
 // 美术资产配置（用户填入实际 PNG URL 后生效）
@@ -483,6 +484,7 @@ interface WhiteDaySessionProps {
 
 export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClose }) => {
     const { characters, activeCharacterId, apiConfig, userProfile, addToast, virtualTime, updateCharacter } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true, zIndex: 10010 });
 
     const [selectedCharId, setSelectedCharId] = useState<string>(charId || activeCharacterId || '');
 
@@ -548,6 +550,33 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
 
     const handleSaveSpriteConfig = () => {
         if (char) updateCharacter(char.id, { spriteConfig: { scale: localSpriteScale, x: localSpriteX, y: localSpriteY } });
+    };
+
+    const confirmRestartQuiz = async () => {
+        const ok = await requestConfirm({
+            title: '重新答题并换一套题目？',
+            message: '将清除当前的答题、评价与已保存的白色情人节明信片记录，并重新出题。',
+            confirmText: '确认重答',
+            variant: 'danger',
+        });
+        if (!ok) return;
+        setUserAnswers([]);
+        setQuizData(null);
+        setReviewData(null);
+        setReviewLineIndex(0);
+        setCustomImage(null);
+        setCommentLines([]);
+        setExportedBase64('');
+        setErrorMsg('');
+        // 清除角色已有记录（重新开始）
+        if (char) {
+            const prev = char.specialMomentRecords || {};
+            const updated = { ...prev };
+            delete updated[WHITEDAY_RECORD_KEY];
+            updateCharacter(char.id, { specialMomentRecords: updated });
+        }
+        try { localStorage.removeItem(WHITEDAY_COMPLETED_KEY); } catch { /* */ }
+        setPhase('loading_quiz');
     };
 
     // 展开所有评阅行（reviews + final + chocolate）
@@ -727,7 +756,14 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
                     ])),
                     temperature: 0.85,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '白色情人节',
+                    charId: c.id,
+                    charName: c.name,
+                    purpose: '默契问答出题',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -856,7 +892,14 @@ ${answerSummary}
                     ])),
                     temperature: 0.82,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '白色情人节',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '默契答卷批改',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -933,6 +976,13 @@ ${answerSummary}
 
             const endpoint = `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
             const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` };
+            const commentMeta = {
+                appId: 'special-moments',
+                appName: '白色情人节',
+                charId: char.id,
+                charName: char.name,
+                purpose: '手作巧克力点评',
+            };
             let response = await fetch(endpoint, {
                 method: 'POST',
                 headers,
@@ -949,7 +999,8 @@ ${answerSummary}
                     ])),
                     temperature: 0.88,
                 }),
-            });
+                __sullyMeta: commentMeta,
+            } as RequestInit);
 
             // 模型不支持视觉时降级为纯文字评价
             if (!response.ok && (response.status === 400 || response.status === 422)) {
@@ -964,7 +1015,8 @@ ${answerSummary}
                         ])),
                         temperature: 0.88,
                     }),
-                });
+                    __sullyMeta: commentMeta,
+                } as RequestInit);
             }
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
@@ -1326,7 +1378,14 @@ ${answerSummary}
                             }],
                             temperature: 0.7,
                         }),
-                    });
+                        __sullyMeta: {
+                            appId: 'special-moments',
+                            appName: '白色情人节',
+                            charId: char.id,
+                            charName: char.name,
+                            purpose: '巧克力摆件生成',
+                        },
+                    } as RequestInit);
                     if (resp.ok) {
                         const data = await resp.json();
                         const text = data.choices?.[0]?.message?.content?.trim() || '';
@@ -1924,25 +1983,7 @@ ${answerSummary}
                                     : '请先下载以生成文件'}
                         </button>
                         <button
-                            onClick={() => {
-                                setUserAnswers([]);
-                                setQuizData(null);
-                                setReviewData(null);
-                                setReviewLineIndex(0);
-                                setCustomImage(null);
-                                setCommentLines([]);
-                                setExportedBase64('');
-                                setErrorMsg('');
-                                // 清除角色已有记录（重新开始）
-                                if (char) {
-                                    const prev = char.specialMomentRecords || {};
-                                    const updated = { ...prev };
-                                    delete updated[WHITEDAY_RECORD_KEY];
-                                    updateCharacter(char.id, { specialMomentRecords: updated });
-                                }
-                                try { localStorage.removeItem(WHITEDAY_COMPLETED_KEY); } catch { /* */ }
-                                setPhase('loading_quiz');
-                            }}
+                            onClick={() => void confirmRestartQuiz()}
                             className="w-full py-2.5 rounded-2xl text-amber-500 text-xs border border-amber-200 bg-white active:bg-amber-50"
                         >
                             重新答题（换一套题目）
@@ -1955,6 +1996,7 @@ ${answerSummary}
                         </button>
                     </div>
                 </div>
+                {confirmDialog}
             </div>
         );
     }
@@ -2065,7 +2107,14 @@ ${answerSummary}
                     {/* 重新装饰 / 重新开始 */}
                     <div className="w-full max-w-[320px] mx-auto mt-2 flex flex-col gap-2">
                         <button
-                            onClick={() => {
+                            onClick={async () => {
+                                const ok = await requestConfirm({
+                                    title: '重新装饰图片？',
+                                    message: '将清除已保存的明信片成品图并回到装饰界面，答题与评价记录会保留。',
+                                    confirmText: '确认重做',
+                                    variant: 'warning',
+                                });
+                                if (!ok) return;
                                 // 把已存的 quiz/review 数据加载回 state，直接跳到装饰阶段
                                 if (savedQuizData) setQuizData(savedQuizData);
                                 if (savedReviewData) setReviewData(savedReviewData);
@@ -2094,30 +2143,14 @@ ${answerSummary}
                             重新装饰图片
                         </button>
                         <button
-                            onClick={() => {
-                                setUserAnswers([]);
-                                setQuizData(null);
-                                setReviewData(null);
-                                setReviewLineIndex(0);
-                                setCustomImage(null);
-                                setCommentLines([]);
-                                setExportedBase64('');
-                                setErrorMsg('');
-                                if (char) {
-                                    const prev = char.specialMomentRecords || {};
-                                    const updated = { ...prev };
-                                    delete updated[WHITEDAY_RECORD_KEY];
-                                    updateCharacter(char.id, { specialMomentRecords: updated });
-                                }
-                                try { localStorage.removeItem(WHITEDAY_COMPLETED_KEY); } catch { /* */ }
-                                setPhase('loading_quiz');
-                            }}
+                            onClick={() => void confirmRestartQuiz()}
                             className="w-full py-2.5 rounded-2xl text-amber-500 text-xs border border-amber-200 bg-white active:bg-amber-50"
                         >
                             重新答题（换一套题目）
                         </button>
                     </div>
                 </div>
+                {confirmDialog}
             </div>
         );
     }

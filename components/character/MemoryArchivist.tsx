@@ -2,6 +2,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { MemoryFragment } from '../../types';
 import Modal from '../../components/os/Modal';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { DEFAULT_REFINE_PROMPTS } from '../../components/chat/ChatConstants';
 import { buildMemoryArchiveIndex } from '../../utils/memoryArchiveIndex';
 
@@ -29,6 +30,7 @@ interface MemoryArchivistProps {
 }
 
 const MemoryArchivist: React.FC<MemoryArchivistProps> = ({ memories, refinedMemories, activeMemoryMonths, charName, userName, onRefine, onDeleteMemories, onUpdateMemory, linkedMemoryEnabled, onToggleActiveMonth, onUpdateRefinedMemory, onDeleteRefinedMemory, onForceArchiveDate, forceArchiveTemplates, forceArchiveDefaultPromptId }) => {
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
     // 每个日期的"强制重总结"运行状态
     const [forcingDate, setForcingDate] = useState<string | null>(null);
     // 重总结前弹出模板选择器：把 date 存起来打开 modal
@@ -116,6 +118,16 @@ const MemoryArchivist: React.FC<MemoryArchivistProps> = ({ memories, refinedMemo
 
     const triggerRefine = async () => {
         if (!viewState.selectedYear || !viewState.selectedMonth) return;
+        const monthKey = `${viewState.selectedYear}-${viewState.selectedMonth}`;
+        if (refinedMemories?.[monthKey]) {
+            const ok = await requestConfirm({
+                title: '重新精炼本月核心记忆？',
+                message: '现有的月度核心记忆及手动修改将被覆盖。',
+                confirmText: '确认精炼',
+                variant: 'warning',
+            });
+            if (!ok) return;
+        }
         setIsRefining(true);
         const monthMems = tree[viewState.selectedYear][viewState.selectedMonth];
         const combinedText = monthMems.map(m => `${m.date}: ${m.summary} (${m.mood || '无'})`).join('\n');
@@ -228,7 +240,7 @@ const MemoryArchivist: React.FC<MemoryArchivistProps> = ({ memories, refinedMemo
                                     : (refinedMemories?.[monthKey] ? '仅月度核心' : '无日度记录')}
                             </span>
                         </div>
-                        <button onClick={(e) => { e.stopPropagation(); onToggleActiveMonth(viewState.selectedYear!, month); }} className={`absolute -top-2 -right-2 p-1.5 rounded-full shadow-md z-10 transition-colors ${isActive ? 'bg-primary text-white' : 'bg-white text-slate-300 border border-slate-100'}`}>
+                        <button aria-label={`${isActive ? '关闭' : '开启'} ${monthKey} 的详细记忆`} aria-pressed={isActive} title="开启后，每次聊天都会带上该月全部详细记忆" onClick={(e) => { e.stopPropagation(); onToggleActiveMonth(viewState.selectedYear!, month); }} className={`absolute -top-2 -right-2 p-1.5 rounded-full shadow-md z-10 transition-colors ${isActive ? 'bg-blue-600 text-white' : 'bg-white text-slate-300 border border-slate-100'}`}>
                             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3.5 h-3.5"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" /><path fillRule="evenodd" d="M1.323 11.447C2.811 6.976 7.028 3.75 12.001 3.75c4.97 0 9.185 3.223 10.675 7.69.12.362.12.752 0 1.113-1.487 4.471-5.705 7.697-10.677 7.697-4.97 0-9.186-3.223-10.675-7.69a1.762 1.762 0 0 1 0-1.113ZM17.25 12a5.25 5.25 0 1 1-10.5 0 5.25 5.25 0 0 1 10.5 0Z" clipRule="evenodd" /></svg>
                         </button>
                     </div>
@@ -460,6 +472,7 @@ const MemoryArchivist: React.FC<MemoryArchivistProps> = ({ memories, refinedMemo
                     </div>
                 </div>
             </Modal>
+            {confirmDialog}
         </div>
     );
 };

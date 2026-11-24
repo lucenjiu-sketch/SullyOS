@@ -10,13 +10,16 @@ import {
     WarningCircle,
 } from '@phosphor-icons/react';
 import { useOS } from '../../context/OSContext';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { trackEvent } from '../../utils/analytics';
 import {
     createMcpServer,
+    getMcpAllowCloudDestructive,
     getMcpUseNativeTools,
     loadMcpServers,
     resetMcpSession,
     saveMcpServers,
+    setMcpAllowCloudDestructive,
     setMcpUseNativeTools,
     testMcpConnection,
     type McpConnectionStage,
@@ -80,6 +83,7 @@ const McpConnectionConsole: React.FC<{
     onMcpConfigChanged?: () => void;
 }> = ({ addToast, onMcpConfigChanged }) => {
     const { characters, groups } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
     const [servers, setServers] = useState<McpServerConfig[]>(() => loadMcpServers());
     const [expandedId, setExpandedId] = useState<string | null>(() => {
         try {
@@ -94,6 +98,7 @@ const McpConnectionConsole: React.FC<{
     const [testingId, setTestingId] = useState<string | null>(null);
     const [testStates, setTestStates] = useState<Record<string, TestState>>({});
     const [useNativeTools, setUseNativeToolsState] = useState(() => getMcpUseNativeTools());
+    const [allowCloudDestructive, setAllowCloudDestructiveState] = useState(() => getMcpAllowCloudDestructive());
 
     const summary = useMemo(() => {
         const live = servers.filter(server => server.enabled && (server.tools?.length || 0) > 0);
@@ -133,10 +138,21 @@ const McpConnectionConsole: React.FC<{
         trackEvent('添加 MCP 服务器');
     };
 
-    const removeServer = (server: McpServerConfig) => {
-        if (!window.confirm(`删除「${server.name || '未命名服务器'}」？\n\n本机保存的 URL、凭据和工具清单会一并删除。`)) return;
+    const removeServer = async (server: McpServerConfig) => {
+        const ok = await requestConfirm({
+            title: `删除「${server.name || '未命名服务器'}」？`,
+            message: '本机保存的 URL、凭据和工具清单会一并删除。',
+            confirmText: '确认删除',
+            variant: 'danger',
+        });
+        if (!ok) return;
         resetMcpSession(server.id);
-        persist(servers.filter(item => item.id !== server.id));
+        setServers(prev => {
+            const next = prev.filter(item => item.id !== server.id);
+            saveMcpServers(next);
+            return next;
+        });
+        onMcpConfigChanged?.();
         setExpandedId(current => current === server.id ? null : current);
         trackEvent('删除 MCP 服务器');
     };
@@ -238,6 +254,25 @@ const McpConnectionConsole: React.FC<{
                 />
             </section>
 
+            <section className="flex items-center justify-between gap-3 border-b border-slate-100 px-4 py-3">
+                <div className="min-w-0">
+                    <div className="text-[11px] font-bold">允许云端执行破坏性工具</div>
+                    <p className="mt-0.5 text-[9px] leading-relaxed text-slate-400">
+                        服务器标为破坏性（如删除）的工具，本机调用前会弹窗问你。主动消息 2.0 在云端执行，没法弹窗问你，所以默认不上云。打开后，即时对话和定时主动消息里角色可以直接调用，不再确认。
+                    </p>
+                </div>
+                <PortToggle
+                    label="允许云端执行破坏性工具"
+                    checked={allowCloudDestructive}
+                    onChange={next => {
+                        setAllowCloudDestructiveState(next);
+                        setMcpAllowCloudDestructive(next);
+                        // 上云的工具清单随 tool_config 重传，开关改了要立刻同步。
+                        onMcpConfigChanged?.();
+                    }}
+                />
+            </section>
+
             <div>
                 {!servers.length && (
                     <div className="px-6 py-10 text-center">
@@ -327,7 +362,12 @@ const McpConnectionConsole: React.FC<{
                                                         placeholder="value"
                                                         aria-label={`自定义请求头 ${index + 1} 值`}
                                                     />
-                                                    <button type="button" onClick={() => update(server.id, { customHeaders: (server.customHeaders || []).filter((_, itemIndex) => itemIndex !== index) })} className="rounded-xl border border-slate-200 text-slate-400" aria-label={`删除请求头 ${index + 1}`}>×</button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => update(server.id, { customHeaders: (server.customHeaders || []).filter((_, itemIndex) => itemIndex !== index) })}
+                                                        className="rounded-xl border border-slate-200 text-slate-400"
+                                                        aria-label={`删除请求头 ${index + 1}`}
+                                                    >×</button>
                                                 </div>
                                             ))}
                                             <button type="button" onClick={() => update(server.id, { customHeaders: [...(server.customHeaders || []), { name: '', value: '' }] })} className="text-[10px] font-bold text-violet-600">+ 添加自定义请求头</button>
@@ -423,6 +463,7 @@ const McpConnectionConsole: React.FC<{
             <footer className="border-t border-slate-100 bg-slate-50/60 px-4 py-3 text-[9px] leading-relaxed text-slate-400">
                 URL、Token 与自定义请求头保存在本机。使用自己的代理时，请求只经过你指定的转接点。
             </footer>
+            {confirmDialog}
         </div>
     );
 };

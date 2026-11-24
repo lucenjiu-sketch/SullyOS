@@ -32,6 +32,7 @@ import {
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { markAmsgStateDirty } from '../utils/amsgStateSync';
 import { createQixiChatMessagePair } from '../utils/qixiChatCard';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 // ============================================================
 // 情人节立绘 Sprite 映射 (占位 emoji，等图片整理好后替换为图床URL)
@@ -347,6 +348,7 @@ interface ValentineSessionProps {
 
 export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onClose }) => {
     const { characters, activeCharacterId, apiConfig, userProfile, addToast, virtualTime, updateCharacter, groups, realtimeConfig } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true, zIndex: 10010 });
 
     // 角色选择
     const [selectedCharId, setSelectedCharId] = useState<string>(charId || activeCharacterId || '');
@@ -576,8 +578,15 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                         { role: 'user', content: `[最近记录 (Previous Context)]:\n${recentMsgs}\n\n---\n\n${valentinePrompt}` }
                     ])),
                     temperature: 0.88
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '情人节企划',
+                    charId: c.id,
+                    charName: c.name,
+                    purpose: '情人节剧情生成',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -648,8 +657,17 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
     };
 
     /** 重新生成 */
-    const handleRegenerate = () => {
+    const handleRegenerate = async () => {
         if (!selectedCharId) return;
+        if (phase !== 'error' && (char?.specialMomentRecords?.[VALENTINE_RECORD_KEY] || dialogueLines.length > 0)) {
+            const ok = await requestConfirm({
+                title: '重新生成情人节特别心声？',
+                message: '将重新调用 AI 生成一段新的情人节对话，并覆盖已保存的情人节记录。',
+                confirmText: '确认重新生成',
+                variant: 'warning',
+            });
+            if (!ok) return;
+        }
         setShowRecord(false);
         setDialogueLines([]);
         setCurrentLineIndex(0);
@@ -825,7 +843,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                     <p className="text-slate-400 text-sm mb-6">{errorMsg}</p>
                     <div className="flex flex-col gap-3">
                         <button
-                            onClick={handleRegenerate}
+                            onClick={() => void handleRegenerate()}
                             className="w-full py-3 bg-pink-500 text-white font-bold rounded-2xl active:scale-95 transition-transform"
                         >
                             重试
@@ -1035,7 +1053,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                         </button>
                         <div className="flex items-center gap-2">
                             <button
-                                onClick={handleRegenerate}
+                                onClick={() => void handleRegenerate()}
                                 className="px-3 py-1.5 rounded-full bg-white/10 text-white/60 text-[11px] font-bold active:scale-95 transition-transform"
                             >
                                 重新生成
@@ -1107,6 +1125,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                     </div>
                 </div>
             )}
+            {confirmDialog}
         </div>
     );
 };

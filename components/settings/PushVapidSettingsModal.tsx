@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import Modal from '../os/Modal';
-import { useOS } from '../../context/OSContext';
+import SettingsDetailPage from './SettingsDetailPage';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { generateVapidKeyPair } from '../../utils/vapidGen';
 import { loadPushVapid, savePushVapid, clearPushVapid } from '../../utils/pushVapid';
 import { trackEvent } from '../../utils/analytics';
@@ -8,18 +8,19 @@ import { trackEvent } from '../../utils/analytics';
 interface PushVapidSettingsModalProps {
   open: boolean;
   onClose: () => void;
+  addToast: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
 
 /**
  * 推送凭据 (VAPID) 配置面板.
  *
  * 这对密钥是主动消息 2.0 Worker 签推送用的: 一键部署时自动沿用, 手动部署时照着填进
- * Worker env. 整个站点只有一个 pushManager 订阅, 所以它放在设置顶层当全局推送凭据管.
+ * Worker env. 入口归于主动消息 2.0 的高级配置，不用本机副本判断原生通知状态.
  *
  * 私钥也存 localStorage 方便复制到 CF Worker env, 这里不当成一次性密钥处理.
  */
-export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ open, onClose }) => {
-  const { addToast } = useOS();
+export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ open, onClose, addToast }) => {
+  const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
 
   const [publicKey, setPublicKey] = useState('');
   const [privateKey, setPrivateKey] = useState('');
@@ -39,6 +40,19 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
   };
 
   const handleGenerate = async () => {
+    const saved = loadPushVapid();
+    const hasExisting = Boolean(
+      publicKey.trim() || privateKey.trim() || saved.vapidPublicKey.trim() || saved.vapidPrivateKey.trim(),
+    );
+    if (hasExisting) {
+      const ok = await requestConfirm({
+        title: '重新生成 VAPID 密钥对？',
+        message: '新密钥对会覆盖现有密钥并立即保存。重新部署 Worker 后，旧设备的推送订阅都会失效，需要重新开启推送。',
+        confirmText: '确认重新生成',
+        variant: 'warning',
+      });
+      if (!ok) return;
+    }
     setGenerating(true);
     try {
       const kp = await generateVapidKeyPair();
@@ -59,8 +73,14 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
     }
   };
 
-  const handleClear = () => {
-    if (!confirm('确定清空 VAPID 密钥对？之后重新部署的 Worker 会换成新的一对，推送订阅需要重建。')) {
+  const handleClear = async () => {
+    const ok = await requestConfirm({
+      title: '清空 VAPID 密钥对？',
+      message: '之后重新部署的 Worker 会换成新的一对密钥，旧设备的推送订阅需要重建。',
+      confirmText: '确认清空',
+      variant: 'danger',
+    });
+    if (!ok) {
       trackEvent('清空 VAPID 密钥对', { confirmed: false });
       return;
     }
@@ -120,7 +140,8 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
     : '';
 
   return (
-    <Modal
+    <>
+    <SettingsDetailPage
       isOpen={open}
       title="推送凭据 (VAPID)"
       onClose={onClose}
@@ -145,8 +166,9 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
     >
       <div className="space-y-5 text-sm">
 
-        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3 text-[11px] text-amber-800 leading-relaxed">
-          <p className="font-bold mb-1">⚠ 一份 VAPID, 两个用法</p>
+        <div className="bg-slate-100 rounded-2xl p-4 text-xs text-slate-600 leading-relaxed">
+          <p className="font-semibold mb-2">部署与维护后端时使用</p>
+          <p className="mb-2">一键部署会自动准备这对密钥。这里没有本机副本，不代表 App 的通知通道不可用。</p>
           <p>
             浏览器订阅 push 用<b>公钥</b>; Worker 签名 push 用<b>私钥</b>.
             主动消息 2.0 部署 Worker 时<b>用的就是这一对</b> ——
@@ -247,7 +269,7 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
           <div className="text-center">
             <button
               type="button"
-              onClick={handleClear}
+              onClick={() => void handleClear()}
               className="text-[11px] text-rose-500 hover:text-rose-600 font-medium underline-offset-2 hover:underline"
             >
               清空 VAPID（重新部署后推送订阅要重建）
@@ -255,6 +277,8 @@ export const PushVapidSettingsModal: React.FC<PushVapidSettingsModalProps> = ({ 
           </div>
         )}
       </div>
-    </Modal>
+    </SettingsDetailPage>
+    {confirmDialog}
+    </>
   );
 };

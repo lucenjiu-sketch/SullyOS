@@ -24,16 +24,20 @@ import {
   formatFireTimeFull,
   formatFireTimeShort,
   formatTimeSinceUser,
+  isValidGzipForInput,
   parseFirePack,
   parseLastSkip,
   parseSelfLog,
   packStateValue,
+  registerGzipFallbackCompressor,
   reconcileSelfLogWithPack,
   renderFirePack,
   renderSelfLogBlock,
+  resetGzipCompressionStateForTests,
   resolveMaxUnansweredSends,
   unpackStateValue,
 } from './amsgFirePack';
+import { gzipSync } from 'fflate';
 
 // 回归守卫：这些期望值抄的是 activeMsgClient 拆槽位前（buildTimeGapHint /
 // buildLegacyStyleProactiveHint 内联时代）的旧文案。模板在前端维护、填槽在 worker 里跑，
@@ -226,6 +230,9 @@ describe('parseFirePack', () => {
 
   it('lastUserMessageAt 数字也合法', () => {
     expect(parseFirePack(JSON.stringify({ ...valid, lastUserMessageAt: 123 }))?.lastUserMessageAt).toBe(123);
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: 456 }))?.lastAwayAnchorAt).toBe(456);
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: null }))?.lastAwayAnchorAt).toBeNull();
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: 'bad' }))).toBeNull();
   });
 
   it('tzId 必填：缺失 / 空串 / 非字符串整包打回（渲染时间没有第二套算法可退）', () => {
@@ -743,6 +750,100 @@ describe('client_state 值压缩', () => {
   it('数据损坏时解压抛错，不会把半截内容当正常值放过去', async () => {
     await expect(unpackStateValue('gz1:bm90LWd6aXAtYXQtYWxs')).rejects.toThrow();
   });
+
+  it('gzip 头尾完整性校验：认完整帧，拒截断帧、坏 CRC 与坏长度', () => {
+    const raw = new TextEncoder().encode(bigJson);
+    const full = gzipSync(raw);
+    expect(isValidGzipForInput(raw, full)).toBe(true);
+
+    // 截掉末尾（复现移动端 WebKit 未刷完 Z_FINISH 静默吐出半截流的形态）
+    expect(isValidGzipForInput(raw, full.subarray(0, full.byteLength - 10))).toBe(false);
+
+    // 篡改 CRC32（倒数第 8~5 字节）
+    const badCrc = full.slice();
+    badCrc[badCrc.byteLength - 8] ^= 0xff;
+    expect(isValidGzipForInput(raw, badCrc)).toBe(false);
+
+    // 篡改 ISIZE（倒数第 4~1 字节）
+    const badSize = full.slice();
+    badSize[badSize.byteLength - 4] ^= 0x01;
+    expect(isValidGzipForInput(raw, badSize)).toBe(false);
+
+    // 过短或非 gzip 头
+    expect(isValidGzipForInput(raw, new Uint8Array(10))).toBe(false);
+    const badMagic = full.slice();
+    badMagic[0] = 0x00;
+    expect(isValidGzipForInput(raw, badMagic)).toBe(false);
+  });
+
+  // 回归守卫：iOS WebKit 的 CompressionStream 在大输入收尾阶段可能不抛错、直接返回缺尾部的
+  // 半截 gzip。未注册纯 JS 兜底时必须丢弃半截包退回明文，绝不能把坏的 gz1: 传上云端。
+  it('原生 CompressionStream 静默返回半截 gzip 且无兜底时，退回完整明文而非产出损坏包', async () => {
+    const saved = globalThis.CompressionStream;
+    const prevFallback = registerGzipFallbackCompressor(null);
+    globalThis.CompressionStream = class TruncatedCompressionStream {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+      constructor() {
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            const full = gzipSync(chunk);
+            controller.enqueue(full.subarray(0, full.byteLength - 12));
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    } as unknown as typeof CompressionStream;
+    try {
+      const packed = await packStateValue(bigJson);
+      expect(packed.startsWith('gz1:')).toBe(false);
+      expect(packed).toBe(bigJson);
+      expect(await unpackStateValue(packed)).toBe(bigJson);
+    } finally {
+      globalThis.CompressionStream = saved;
+      registerGzipFallbackCompressor(prevFallback);
+      resetGzipCompressionStateForTests();
+    }
+  });
+
+  it('原生 CompressionStream 静默截断时自动熔断并切到已注册的纯 JS gzip，后续调用不再碰坏构造器', async () => {
+    const saved = globalThis.CompressionStream;
+    let nativeCalls = 0;
+    const prevFallback = registerGzipFallbackCompressor((bytes) => gzipSync(bytes));
+    globalThis.CompressionStream = class TruncatedAndDetachingStream {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+      constructor() {
+        nativeCalls += 1;
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            const full = gzipSync(chunk);
+            // 顺手模拟流消费侧转移底层 ArrayBuffer，确保调用方的原字节不受牵连。
+            structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
+            controller.enqueue(full.subarray(0, full.byteLength - 10));
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    } as unknown as typeof CompressionStream;
+    try {
+      const first = await packStateValue(bigJson);
+      expect(first.startsWith('gz1:')).toBe(true);
+      expect(await unpackStateValue(first)).toBe(bigJson);
+      expect(nativeCalls).toBe(1);
+
+      const second = await packStateValue(bigJson);
+      expect(second.startsWith('gz1:')).toBe(true);
+      expect(await unpackStateValue(second)).toBe(bigJson);
+      expect(nativeCalls, '同一构造器熔断后本页不再重复试错').toBe(1);
+    } finally {
+      globalThis.CompressionStream = saved;
+      registerGzipFallbackCompressor(prevFallback);
+      resetGzipCompressionStateForTests();
+    }
+  });
 });
 
 // 回归守卫：升 fire_pack 版本要 worker bundle 和前端一起动，而设置页的版本门槛读的是
@@ -901,5 +1002,41 @@ describe('renderFirePack — 把 includeClock 透传给场景块', () => {
     const out = renderFirePack(scenePack, at, '指令', { includeClock: false });
     expect(out).toContain('你正在睡觉');
     expect(out).not.toContain('22:00');
+  });
+});
+
+// 见面离开提醒的方向是「对方刚从见面里走开」，模板里通用的「突然想起对方 / 别催问在干嘛」
+// 那几句跟它冲突，到点渲染时整段拿掉。存量包的原文同样要认得出来。
+describe('renderFirePack · 见面离开提醒拿掉冲突的通用提示', () => {
+  const legacyHint = [
+    '【1.0 风格主动消息提示】',
+    `现在是 ${AMSG_SLOT_CURRENT_TIME}。`,
+    '这不是 小明 正在和你聊天，而是你突然想起了 小明，想主动发条消息给他/她。',
+    '关心别变成查岗：不催问 小明 在干嘛、怎么还不回；喝水、早睡这类叮嘱偶尔一句是心意，回回都发就成了说教。',
+  ].join('\n');
+  const pack: AmsgFirePack = {
+    v: FIRE_PACK_VERSION, builtAt: 1, pendingTasks: [], scene: null, selfScheduleEnabled: true,
+    template: [
+      '【重要规则】',
+      '- 像真实聊天一样简短自然，优先 1 到 2 句，最多 3 句。',
+      '- 语气更像真人突然想起对方时发来的私聊，不要像在完成任务。',
+      '', legacyHint, '', '【本次任务】', AMSG_SLOT_TASK_INSTRUCTION,
+    ].join('\n'),
+    lastUserMessageAt: null, tzId: 'UTC', userTzId: 'UTC', targetName: '小明',
+  };
+
+  it('dateLeave 时去掉 1.0 风格提示整段和「突然想起对方」那条规则', () => {
+    const out = renderFirePack(pack, Date.UTC(2026, 6, 17, 8), '任务', { dateLeave: true });
+    expect(out).not.toContain('突然想起');
+    expect(out).not.toContain('不催问');
+    expect(out).not.toContain('1.0 风格');
+    expect(out).toContain('最多 3 句');
+    expect(out).toContain('【本次任务】\n任务');
+  });
+
+  it('其他任务照旧保留', () => {
+    const out = renderFirePack(pack, Date.UTC(2026, 6, 17, 8), '任务');
+    expect(out).toContain('突然想起了 小明');
+    expect(out).toContain('语气更像真人突然想起对方');
   });
 });

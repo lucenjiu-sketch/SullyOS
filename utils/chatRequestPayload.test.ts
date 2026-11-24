@@ -6,6 +6,8 @@ import { RealtimeContextManager } from './realtimeContext';
 import { installSARModuleOnCharacter, installSARModuleOnUser } from './vrWorld/sarModuleRuntime';
 import { SAR_MODULE_CATALOG } from './vrWorld/sarModuleShop';
 import { ChatPrompts } from './chatPrompts';
+import { readFileSync } from 'node:fs';
+import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, MCP_TAIL_REMINDER } from './mcpToolBridge';
 
 // 即时对话（这一轮交给用户自己的 amsg worker 生成）那份 prompt 里，凡是 worker 到点
 // 会自己补一遍的时效段，前端就不再烤进去：当前时间块、【真实世界感知系统】（节日 /
@@ -36,6 +38,26 @@ const baseInput = (): BuildChatPayloadInput => ({
 
 const joinMessages = (messages: Array<{ content: any }>): string =>
     messages.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
+
+it.each([false, true])('excludes original thinking, its translation and bilingual pairs from actual chat context (worker=%s)', async timelyByWorker => {
+    const input = baseInput();
+    input.historyMsgs.unshift({ id: 0, charId: input.char.id, role: 'assistant', type: 'text', content: '这是角色说出口的正文。', timestamp: input.historyMsgs[0].timestamp - 1 });
+    const baseline = await buildChatRequestPayload({ ...input, timelyByWorker });
+    const thinkingChain = 'PRIVATE_THINKING_SOURCE_7f2b';
+    const text = '仅供界面展示的中文译文_9a81';
+    const decorated = { ...input, timelyByWorker, historyMsgs: input.historyMsgs.map(message => message.role === 'assistant' ? {
+        ...message, metadata: { thinkingChain, thinkingChainTranslation: { source: thinkingChain, text, segments: [{ source: thinkingChain, text }] } },
+    } : message) };
+    const payload = await buildChatRequestPayload(decorated);
+    expect(payload.cleanedApiMessages).toEqual(baseline.cleanedApiMessages);
+    expect(joinMessages(payload.fullMessages)).toContain('这是角色说出口的正文。');
+    expect(JSON.stringify(payload.fullMessages)).not.toContain(thinkingChain);
+    expect(JSON.stringify(payload.fullMessages)).not.toContain(text);
+    expect(JSON.stringify(payload.fullMessages)).not.toContain('thinkingChainTranslation');
+    // Proactive message transcripts use this same history formatter.
+    expect(ChatPrompts.buildMessageHistory(decorated.historyMsgs, 20, input.char, input.userProfile, []).apiMessages)
+        .toEqual(ChatPrompts.buildMessageHistory(input.historyMsgs, 20, input.char, input.userProfile, []).apiMessages);
+});
 
 it.each([false,true])('adds home phone background only to this request (worker=%s) and retains normal chat history', async timelyByWorker => {
     const input={...baseInput(),timelyByWorker};
@@ -392,6 +414,20 @@ it('文本入口误传 history 时仍保留深度世界书，不丢弃移交后�
 
 
 describe('ChatApp 按月 RECALL 提示偏好', () => {
+    it.each([false, true])('禁用自主月度查阅时，聊天和后台模板均不教 RECALL（worker=%s），保留月度总结与小眼睛记忆', async timelyByWorker => {
+        const input = baseInput();
+        const char = { ...input.char, monthlyRecallEnabled: false, hideMonthlyRecallPrompt: false,
+            activeMemoryMonths: ['2026-09'], refinedMemories: { '2026-09': '仍然可见的月度总结' },
+            memories: [{ id: 'month-recall-off', date: '2026-09-01', summary: '小眼睛选中的详细记忆' }],
+        } as any;
+        const payload = await buildChatRequestPayload({ ...input, timelyByWorker, char });
+        expect(payload.systemPrompt).not.toContain('[[RECALL');
+        expect(payload.systemPrompt).toContain('仍然可见的月度总结');
+        expect(payload.systemPrompt).toContain('小眼睛选中的详细记忆');
+        const fire = await ChatPrompts.buildSystemPromptParts(char, input.userProfile, [], [], [], [],
+            undefined, undefined, undefined, undefined, undefined, undefined, { forFirePack: true });
+        expect(fire.stable).not.toContain('[[RECALL');
+    });
     const recallRule = "- 调取记忆: `[[RECALL: YYYY-MM]]`，请注意，当用户提及具体某个月份时，或者当你想仔细想某个月份的事情时，欢迎你随时使该动作";
     for (const timelyByWorker of [false, true]) {
         it.each([undefined, true])('本地/云端模式 '+timelyByWorker+'：缺省或开启 %s 时隐藏指令教学', async hideMonthlyRecallPrompt => {
@@ -413,7 +449,7 @@ describe('ChatApp 按月 RECALL 提示偏好', () => {
             expect(visible.systemPrompt.replace('   '+recallRule+'\n', '')).toBe(hidden.systemPrompt);
         });
     }
-    it('后台主动消息打包保留原教学，且不修改记忆或激活月份', async () => {
+    it('后台主动消息打包同样跟随隐藏开关，且不修改记忆或激活月份', async () => {
         const input = baseInput();
         const char = { ...input.char, hideMonthlyRecallPrompt: true,
             activeMemoryMonths: ['2026-09'],
@@ -422,7 +458,31 @@ describe('ChatApp 按月 RECALL 提示偏好', () => {
         const before = JSON.stringify(char);
         const result = await ChatPrompts.buildSystemPromptParts(char, input.userProfile, [], [], [], [],
             undefined, undefined, undefined, undefined, undefined, undefined, { forFirePack: true });
-        expect(result.stable).toContain(recallRule);
+        expect(result.stable).not.toContain(recallRule);
         expect(JSON.stringify(char)).toBe(before);
     });
+});
+
+// 末尾提醒写着「严禁写成正文」，用户关掉原生 tools 时请求走正文兼容协议，提醒不能跟着发出去。
+// payload 不看这个开关，由 useChatAI 首轮把请求转成兼容请求体时滤掉，这里把两段一起钉住。
+it('原生 tools 开关关着时，发出去的 MCP 请求里没有末尾提醒', async () => {
+    localStorage.setItem('aetheros.mcp.useNativeTools', '0');
+    try {
+        const input = baseInput();
+        const payload = await buildChatRequestPayload(input);
+        expect(payload.flags.mcpChatActive).toBe(true);
+        expect(payload.fullMessages.some((m: any) => m.content === MCP_TAIL_REMINDER)).toBe(true);
+        const sent = buildMcpRejectedToolsFallbackBody({
+            model: 'm', messages: payload.fullMessages,
+            tools: buildMcpOpenAITools(input.char.id).tools, tool_choice: 'auto',
+        });
+        expect(sent.messages.some((m: any) => m.content === MCP_TAIL_REMINDER)).toBe(false);
+        expect(sent.tools).toBeUndefined();
+        // 开关关着、只有 MCP 工具时，useChatAI 首轮必须走这个兼容请求体。
+        const hook = readFileSync(new URL('../hooks/useChatAI.ts', import.meta.url), 'utf8');
+        expect(hook).toMatch(/if \(!getMcpUseNativeTools\(\) && mcpOnly\) \{[\s\S]{0,200}?buildMcpRejectedToolsFallbackBody\(/);
+        expect(hook).toMatch(/baseReqBody\.messages = compatibilityBody\.messages;/);
+    } finally {
+        localStorage.removeItem('aetheros.mcp.useNativeTools');
+    }
 });

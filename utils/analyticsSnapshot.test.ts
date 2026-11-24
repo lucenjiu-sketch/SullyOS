@@ -48,6 +48,22 @@ it('聊天备注快照仅报开关，不含备注或非法开关内容', () => {
     }
 });
 
+it.each([undefined, 'append', 'replace', POISON.key])('心象模式快照仅使用固定枚举', mode => {
+    const char = { id: 'qa', thinkingChainPromptMode: mode, thinkingChainCustomPrompt: POISON.token } as CharacterProfile;
+    const result = collectCharSettings([char], char.id);
+    expect(result.心象提示词模式).toBe(mode === 'replace' ? '替换' : undefined);
+    expect(JSON.stringify(result)).not.toContain(POISON.key);
+    expect(JSON.stringify(result)).not.toContain(POISON.token);
+});
+
+it('跟随共用时仅报告生效的模式，专属草稿和共用原文不进入快照', () => {
+    const char = { id: 'scope-qa', thinkingChainPromptScope: 'space', thinkingChainCustomPrompt: POISON.token } as CharacterProfile;
+    const result = collectCharSettings([char], char.id, { thinkingChainPrompt: { mode: 'replace', customPrompt: POISON.key } });
+    expect(result.心象提示词模式).toBe('替换');
+    expect(result).not.toHaveProperty('心象提示词范围');
+    for (const secret of Object.values(POISON)) expect(JSON.stringify(result)).not.toContain(secret);
+});
+
 /** 全部字段都塞了毒药的实时感知配置。 */
 function poisonedRealtimeConfig(overrides: Partial<RealtimeConfig> = {}): RealtimeConfig {
     return {
@@ -169,6 +185,15 @@ describe('当前功能启用 · 不泄漏配置内容', () => {
         expectNoLeak(flags);
         localStorage.setItem(USER_LOCATION_STORAGE_KEY, JSON.stringify({ ...location, enabled: false }));
         expect(collectFeatureFlags(poisonedSources()).真实定位).toBe('关');
+    });
+    it('云端执行破坏性 MCP 工具只报开/关，默认关', () => {
+        localStorage.removeItem('aetheros.mcp.allowCloudDestructive');
+        expect(collectFeatureFlags(poisonedSources()).MCP云端破坏性工具).toBe('关');
+        localStorage.setItem('aetheros.mcp.allowCloudDestructive', '1');
+        const flags = collectFeatureFlags(poisonedSources());
+        expect(flags.MCP云端破坏性工具).toBe('开');
+        expectNoLeak(flags);
+        localStorage.removeItem('aetheros.mcp.allowCloudDestructive');
     });
     it('没有定位配置记关，坏配置记读取失败，不透传任何字段', () => {
         expect(collectFeatureFlags(poisonedSources()).真实定位).toBe('关');
@@ -598,11 +623,13 @@ describe('快照事件的属性宽度', () => {
     const plainChar = (id: string) => ({ id, name: '小明' } as unknown as CharacterProfile);
 
     it('当前外观', () => {
-        expect(Object.keys(collectAppearance({} as OSTheme, undefined)).length).toBeLessThanOrEqual(38);
+        expect(Object.keys(collectAppearance({} as OSTheme, undefined)).length).toBeLessThanOrEqual(39);
     });
 
     it('当前角色设置', () => {
-        expect(Object.keys(collectCharSettings([plainChar('a')], 'a')).length).toBeLessThanOrEqual(38);
+        const fields = collectCharSettings([{...plainChar('a'),stickerVision:true}], 'a');
+        expect(fields.表情看图).toBe('有人开');
+        expect(Object.keys(fields).length).toBeLessThanOrEqual(39);
     });
 
     it('SAR 发布功能保持小快照', () => {

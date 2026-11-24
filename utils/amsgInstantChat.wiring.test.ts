@@ -79,6 +79,15 @@ describe('useChatAI 的分流接缝', () => {
     expect(routing).toContain('reason: skipReason');
   });
 
+  it('小红书服务器 Worker 够不着时否决这一轮上云（同 MCP 那条：上云会让角色掉工具）', () => {
+    // 上云的工具配置（buildToolConfig）把 Worker 够不着的小红书整个去掉，本地提示词却照教。
+    // 这一轮上云的话，角色以为自己能搜小红书，实际每次调用都失败。
+    const routing = routingSrc();
+    expect(routing).toContain('hasWorkerUnreachableXhs(char, realtimeConfig)');
+    expect(routing).toContain("'xhs-worker-unreachable'");
+    expect(routing).toContain("skipReason === 'xhs-worker-unreachable'");
+  });
+
   it('全局配置读不出来单独留一条 trace（它不是「用户没开」）', () => {
     // 读失败时 instantChatOn 天然为假，veto 那条 trace 的条件够不到它。不单独留痕的话，
     // 这一轮悄悄退回本地直连生成，用户按完发送锁屏就什么都收不到，观察窗里还查无此事。
@@ -97,7 +106,7 @@ describe('useChatAI 的分流接缝', () => {
     // 也不许给 char-disabled 单开留痕分支：那是用户的主动选择，和「全局没开」同一待遇，
     // 每条消息刷一遍 warn 就成骚扰了。查的是带引号的字面量——真要按它分支绕不开这个比较；
     // 注释里提一嘴不算。
-    expect(routing).not.toContain("'char-disabled'");
+    expect(routing).not.toMatch(/(?:if|else if)\s*\(instantChatReadiness\.reason\s*===\s*'char-disabled'/);
   });
 
   it('上云的判定在构建 prompt 之前就定下来，并作为 timelyByWorker 交给 payload', () => {
@@ -342,7 +351,7 @@ describe('设置页那一道门', () => {
     // 顺序和每道门的文案钉在 amsgDiagnostics.test.ts（resolveInstantChatBlocker 是纯函数，
     // 能直接测）。这里只钉「设置页确实把三个输入都递过去了」——漏一个的话那道门就消失了，
     // 界面上表现为开关能点，点完发一条挂一条。
-    const gate = sliceSrc(settingsSrc, '即时对话开关的置灰理由', 'const instantChatBlocker = resolveInstantChatBlocker(', '\n  const instantChatBlockedReason');
+    const gate = sliceSrc(settingsSrc, '即时对话开关的置灰理由', 'const instantChatBlocker = globallyPaused', '\n  const instantChatBlockedReason');
     expect(gate).toContain('isConnected');
     expect(gate).toContain('pushStatus?.hasSubscription');
     expect(gate).toContain('instantChatSupported');
@@ -360,12 +369,23 @@ describe('设置页那一道门', () => {
     expect(report).toContain('instantChatGateReported');
   });
 
-  it('开关落盘：两个 saveGlobalConfig 调用点都要带上它', () => {
+  it('保存连接时保留即时对话开关；其他独立配置允许局部保存', async () => {
     // 漏一处的话，用户改完 Worker 地址（或点一次「连接」）开关就被冲回默认值。
-    const saves = settingsSrc.match(/ActiveMsgStore\.saveGlobalConfig\(\{[\s\S]{0,220}?\}\)/g) ?? [];
+    const ts = await import('typescript');
+    const source = ts.createSourceFile('settings.tsx', settingsSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const saves: string[][] = [];
+    const visit = (node: import('typescript').Node) => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 'ActiveMsgStore.saveGlobalConfig') {
+        const config = node.arguments[0];
+        if (config && ts.isObjectLiteralExpression(config)) {
+          const fields = config.properties.map(property => property.name?.getText(source) || '');
+          if (fields.includes('workerUrl')) saves.push(fields);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
     expect(saves.length).toBeGreaterThanOrEqual(3);
-    for (const save of saves) {
-      expect(save).toContain('instantChatEnabled');
-    }
+    for (const save of saves) expect(save).toContain('instantChatEnabled');
   });
 });

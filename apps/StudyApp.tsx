@@ -12,6 +12,7 @@ import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } fr
 import TokenImg from '../components/os/TokenImg';
 import { trackEvent } from '../utils/analytics';
 import { extractPdfText, isPdfFile } from '../utils/pdfText';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 type KatexLike = {
     renderToString: (latex: string, options: any) => string;
@@ -306,6 +307,7 @@ const BlackboardRenderer: React.FC<{ text: string, isTyping?: boolean, katexRend
 
 const StudyApp: React.FC = () => {
     const { closeApp, characters, activeCharacterId, apiConfig, addToast, userProfile, updateCharacter, characterGroups } = useOS();
+    const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
     const [mode, setMode] = useState<'bookshelf' | 'classroom' | 'quiz' | 'quiz_review' | 'practice_book'>('bookshelf');
     const [courses, setCourses] = useState<StudyCourse[]>([]);
     const [activeCourse, setActiveCourse] = useState<StudyCourse | null>(null);
@@ -461,7 +463,14 @@ const StudyApp: React.FC = () => {
         addToast('自习室 API 已保存', 'success');
     };
 
-    const clearStudyApi = () => {
+    const clearStudyApi = async () => {
+        const confirmed = await requestConfirm({
+            title: '清除自习室专用 API？',
+            message: '清除后将恢复使用全局 API 设置。',
+            confirmText: '清除',
+            variant: 'warning',
+        });
+        if (!confirmed) return;
         setStudyApi({});
         setLocalStudyUrl('');
         setLocalStudyKey('');
@@ -490,7 +499,15 @@ const StudyApp: React.FC = () => {
         addToast('预设已保存', 'success');
     };
 
-    const deletePreset = (id: string) => {
+    const deletePreset = async (id: string) => {
+        const preset = tutorPresets.find(p => p.id === id);
+        const confirmed = await requestConfirm({
+            title: '删除讲课预设？',
+            message: preset ? `确定删除预设「${preset.name}」吗？` : '确定删除这条提示词预设吗？',
+            confirmText: '删除',
+            variant: 'danger',
+        });
+        if (!confirmed) return;
         savePresets(tutorPresets.filter(p => p.id !== id));
     };
 
@@ -588,8 +605,14 @@ For each chapter, provide a title, a brief summary of what it covers, and a diff
                 messages: [{ role: "user", content: prompt }],
                 temperature: 0.5,
                 max_tokens: 8000
-            })
-        });
+            }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                ...(selectedChar ? { charId: selectedChar.id, charName: selectedChar.name } : {}),
+                purpose: '拆分教材大纲',
+            },
+        } as RequestInit);
 
         if (!response.ok) throw new Error('API Error');
         const data = await safeResponseJson(response);
@@ -708,8 +731,15 @@ Explain this chapter's key concepts to the user based strictly on the Source Mat
                         { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
                         { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
                     ]
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成章节讲义',
+                },
+            } as RequestInit);
         };
 
         try {
@@ -781,8 +811,18 @@ You are now acting as a private tutor for ${userProfile.name}.
     };
 
     // Regenerate Logic
-    const handleRegenerateChapter = () => {
+    const handleRegenerateChapter = async () => {
         if (!activeCourse) return;
+        const chapter = activeCourse.chapters[activeCourse.currentChapterIndex];
+        if (chapter?.content) {
+            const confirmed = await requestConfirm({
+                title: '重新生成本章讲解？',
+                message: `「${chapter.title}」已有的黑板讲解内容将被替换。`,
+                confirmText: '重新生成',
+                variant: 'warning',
+            });
+            if (!confirmed) return;
+        }
         trackEvent('重新生成本章讲解');
         handleTeach(activeCourse, activeCourse.currentChapterIndex, true);
     };
@@ -832,8 +872,15 @@ Answer the question based on the source material. Be helpful and encouraging (in
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'system', content: studyInstructions }, { role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '课堂提问答疑',
+                },
+            } as RequestInit);
             
             const data = await safeResponseJson(response);
             const text = data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || "（无回答）";
@@ -885,8 +932,15 @@ Note: Use "我" (I) to refer to yourself.
         fetch(`${effectiveApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
-            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] })
-        }).then(res => safeResponseJson(res)).then(data => {
+            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                charId: selectedChar.id,
+                charName: selectedChar.name,
+                purpose: '结课辅导日记',
+            },
+        } as RequestInit).then(res => safeResponseJson(res)).then(data => {
             const mem = data.choices[0].message.content;
             const newMem = { id: `mem-${Date.now()}`, date: new Date().toLocaleDateString(), summary: `[教学] ${mem}`, mood: 'proud' };
             updateCharacter(selectedChar.id, { memories: [...(selectedChar.memories || []), newMem] });
@@ -1011,8 +1065,15 @@ ${chunkText.substring(0, 10000)}
                     messages: [{ role: "user", content: prompt }],
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成随堂测验',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1131,8 +1192,15 @@ ${resultsText}
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: reviewPrompt }])),
                     temperature: 0.8,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '测验批改评语',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1236,8 +1304,15 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                     messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 4000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '错题追问讲解',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1351,6 +1426,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                         <p className="text-xs text-red-400">试卷和锐评内容将被永久删除。</p>
                     </div>
                 </Modal>
+                {confirmDialog}
             </div>
         );
     }
@@ -1481,6 +1557,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                         返回课堂
                     </button>
                 </div>
+                {confirmDialog}
             </div>
         );
     }
@@ -1591,6 +1668,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                         </div>
                     </>
                 ) : null}
+                {confirmDialog}
             </div>
         );
     }
@@ -1781,6 +1859,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                         <p className="text-xs text-red-400">删除后无法恢复，学习进度将丢失。</p>
                     </div>
                 </Modal>
+                {confirmDialog}
             </div>
         );
     }
@@ -1925,6 +2004,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                     </div>
                 </div>
             </Modal>
+            {confirmDialog}
         </div>
     );
 };

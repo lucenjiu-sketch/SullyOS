@@ -1,28 +1,90 @@
 
-import React from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useLocalBackHandler } from '../../hooks/useLocalBackHandler';
 
 interface ConfirmDialogProps {
     isOpen: boolean;
     title: string;
-    message: string;
+    message: React.ReactNode;
     confirmText?: string;
     cancelText?: string;
     variant?: 'danger' | 'warning' | 'info';
+    /** 打开后确认按钮要等这么多秒才能点，用于必须读完的提醒 */
+    confirmDelaySeconds?: number;
+    /** 是否挂载到 document.body，用于在带 transform 的弹窗或抽屉内突破裁切 */
+    portal?: boolean;
+    /** 弹窗层级，默认 10000（高于活动浮层与各类全屏抽屉） */
+    zIndex?: number;
     onConfirm: () => void;
     onCancel: () => void;
 }
 
-const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ 
-    isOpen, 
-    title, 
-    message, 
-    confirmText = '确认', 
-    cancelText = '取消', 
-    variant = 'info', 
-    onConfirm, 
-    onCancel 
+const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
+    isOpen,
+    title,
+    message,
+    confirmText = '确认',
+    cancelText = '取消',
+    variant = 'info',
+    confirmDelaySeconds = 0,
+    portal = false,
+    zIndex = 10000,
+    onConfirm,
+    onCancel
 }) => {
+    const [remaining, setRemaining] = useState(confirmDelaySeconds);
+    const topLayerRef = useRef<HTMLDialogElement | null>(null);
+    const onCancelRef = useRef(onCancel);
+    onCancelRef.current = onCancel;
+    const needsTopLayer = Boolean(
+        portal && isOpen && typeof document !== 'undefined'
+        && document.querySelector('dialog[open]:not([data-sully-confirm-top-layer])'),
+    );
+    // 每次打开都从头倒数；用 layout effect 赶在绘制前重置，免得上次的 0 让按钮闪一帧可点
+    useLayoutEffect(() => {
+        setRemaining(isOpen ? confirmDelaySeconds : 0);
+    }, [isOpen, confirmDelaySeconds]);
+    useLayoutEffect(() => {
+        const el = topLayerRef.current;
+        if (!el || !isOpen || !needsTopLayer) return;
+        if (!el.open) {
+            if (typeof el.showModal === 'function') {
+                try { el.showModal(); } catch { el.setAttribute('open', ''); }
+            } else {
+                el.setAttribute('open', '');
+            }
+        }
+        return () => {
+            try {
+                if (el.open && typeof el.close === 'function') el.close();
+                else el.removeAttribute('open');
+            } catch {}
+        };
+    }, [isOpen, needsTopLayer]);
+    useEffect(() => {
+        if (!isOpen || remaining <= 0) return;
+        const timer = setTimeout(() => setRemaining((value) => value - 1), 1000);
+        return () => clearTimeout(timer);
+    }, [isOpen, remaining]);
+    useEffect(() => {
+        if (!isOpen) return;
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key !== 'Escape') return;
+            e.preventDefault();
+            e.stopPropagation();
+            onCancelRef.current();
+        };
+        window.addEventListener('keydown', handleKeyDown, true);
+        return () => window.removeEventListener('keydown', handleKeyDown, true);
+    }, [isOpen]);
+    useLocalBackHandler(() => {
+        onCancel();
+        return true;
+    }, 120, isOpen);
+
     if (!isOpen) return null;
+    const locked = remaining > 0;
 
     const getBtnColor = () => {
         switch (variant) {
@@ -61,36 +123,79 @@ const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
         }
     };
 
-    return (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 animate-fade-in" style={{ zIndex: 9999 }}>
+    const dialogNode = (
+        <div
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="fixed inset-0 z-[100] flex items-center justify-center p-4 animate-fade-in"
+            style={{ zIndex }}
+        >
             <div className="absolute inset-0 bg-black/30 backdrop-blur-sm transition-opacity" onClick={onCancel}></div>
-            <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden animate-pop-in transform transition-all">
-                <div className="p-6">
+            {/* 限高 + 正文内滚：长提醒在小屏上也看得到底部按钮 */}
+            <div className="sully-system-ui relative bg-white text-slate-800 rounded-2xl shadow-2xl w-full max-w-sm max-h-full flex flex-col overflow-hidden animate-pop-in transform transition-all">
+                <div className="p-6 min-h-0 overflow-y-auto">
                     <div className="flex gap-4">
                         {getIcon()}
                         <div className="flex-1">
                             <h3 className="text-lg font-bold text-slate-800 leading-6 mb-2">{title}</h3>
-                            <p className="text-sm text-slate-500 leading-relaxed">{message}</p>
+                            <div className="text-sm text-slate-500 leading-relaxed">{message}</div>
                         </div>
                     </div>
                 </div>
-                <div className="bg-slate-50 px-6 py-4 flex gap-3 justify-end border-t border-slate-100">
+                {/* 按钮文字不折行；窄屏放不下两个时整颗换到下一行，而不是把「先不开」劈成两行 */}
+                <div className="shrink-0 bg-slate-50 px-6 py-4 flex flex-wrap gap-3 justify-end border-t border-slate-100">
                     <button 
                         onClick={onCancel}
-                        className="px-4 py-2 bg-white border border-slate-200 rounded-xl text-sm font-bold text-slate-600 hover:bg-slate-50 transition-colors"
+                        className="px-4 py-2 whitespace-nowrap bg-white border border-slate-200 rounded-xl text-sm font-bold text-slate-600 hover:bg-slate-50 transition-colors"
                     >
                         {cancelText}
                     </button>
-                    <button 
+                    <button
                         onClick={onConfirm}
-                        className={`px-4 py-2 rounded-xl text-sm font-bold shadow-lg transition-transform active:scale-95 ${getBtnColor()}`}
+                        disabled={locked}
+                        className={`px-4 py-2 whitespace-nowrap rounded-xl text-sm font-bold shadow-lg transition-transform active:scale-95 disabled:opacity-50 disabled:active:scale-100 ${getBtnColor()}`}
                     >
-                        {confirmText}
+                        {locked ? `${confirmText}（${remaining}）` : confirmText}
                     </button>
                 </div>
             </div>
         </div>
     );
+
+    if (portal && typeof document !== 'undefined' && document.body) {
+        if (needsTopLayer) {
+            return createPortal(
+                <dialog
+                    ref={topLayerRef}
+                    data-sully-confirm-top-layer="true"
+                    role="presentation"
+                    onCancel={(e) => { e.preventDefault(); onCancel(); }}
+                    onClick={(e) => e.stopPropagation()}
+                    style={{
+                        margin: 0,
+                        padding: 0,
+                        border: 0,
+                        background: 'transparent',
+                        maxWidth: 'none',
+                        maxHeight: 'none',
+                        width: '100vw',
+                        height: '100dvh',
+                        inset: 0,
+                        overflow: 'visible',
+                    }}
+                >
+                    <style>{'dialog[data-sully-confirm-top-layer]::backdrop{background:transparent;}'}</style>
+                    {dialogNode}
+                </dialog>,
+                document.body,
+            );
+        }
+        return createPortal(dialogNode, document.body);
+    }
+    return dialogNode;
 };
 
 export default ConfirmDialog;

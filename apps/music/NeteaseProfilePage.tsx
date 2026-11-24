@@ -14,6 +14,7 @@ import NeteaseLoginPanel from './NeteaseLoginPanel';
 import TokenImg from '../../components/os/TokenImg';
 import { isBlobRef } from '../../utils/blobRef';
 import { trackEvent } from '../../utils/analytics';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 
 interface Playlist {
   id: number;
@@ -46,7 +47,7 @@ interface LocalAlbumCardProps {
   currentId: number | null;
   playing: boolean;
   onPlay: (song: Song, idx: number) => void;
-  onRemove: (id: number) => void;
+  onRemove: (song: Song) => void;
 }
 const LocalAlbumCard: React.FC<LocalAlbumCardProps> = ({ songs, expanded, setExpanded, currentId, playing, onPlay, onRemove }) => (
   <div
@@ -135,12 +136,7 @@ const LocalAlbumCard: React.FC<LocalAlbumCardProps> = ({ songs, expanded, setExp
                 </div>
               </button>
               <button
-                onClick={() => {
-                  if (typeof window !== 'undefined' && window.confirm(`从专辑移除《${s.name}》？`)) {
-                    onRemove(s.id);
-                    trackEvent('从本地专辑移除一首歌');
-                  }
-                }}
+                onClick={() => onRemove(s)}
                 className="text-[10px] px-1.5 py-0.5 rounded shrink-0 transition-colors"
                 style={{ color: C.faint }}
                 title="移除"
@@ -157,13 +153,25 @@ const LocalAlbumCard: React.FC<LocalAlbumCardProps> = ({ songs, expanded, setExp
 
 const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearch, onOpenSettings, onVisitChar }) => {
   const { addToast, characters, userProfile } = useOS();
+  const { requestConfirm, confirmDialog } = useConfirmDialog({ portal: true });
   const {
-    cfg, setCfg, profile, refreshProfile, playSong,
+    cfg, setCfg, profile, profileLoading, retryAccount, playSong,
     current, playing, togglePlay, nextSong, prevSong,
     listeningTogetherWith, removeListeningPartner,
     localAlbumSongs, removeLocalSong,
     regeneratingId, regeneratingStatus,
   } = useMusic();
+  const handleRemoveLocalSong = useCallback(async (song: Song) => {
+    const confirmed = await requestConfirm({
+      title: '从专辑移除歌曲？',
+      message: `确定从「一起写的歌」移除《${song.name}》吗？`,
+      confirmText: '移除',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    removeLocalSong(song.id);
+    trackEvent('从本地专辑移除一首歌');
+  }, [requestConfirm, removeLocalSong]);
   const [localAlbumExpanded, setLocalAlbumExpanded] = useState(false);
   const [showNeteaseLogin, setShowNeteaseLogin] = useState(false);
 
@@ -313,21 +321,25 @@ const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearc
     setCfg({ ...curCfg, cookie: '' });
     toastRef.current('已退出', 'success');
     trackEvent('退出网易云登录');
-    await refreshProfile();
-  }, [setCfg, refreshProfile]);
+  }, [setCfg]);
 
   // 未登录 → 默认展示「一起写的歌」本地专辑 + 网易云登录入口；
   // 没本地专辑 → 直接进登录面板（保持原来体验）。
   // ⚠️ 所有 hooks 必须在这个 early-return **之前** 声明完。
+  if (profileLoading) return (
+    <div className="flex flex-col h-full">
+      <MizuHeader title="My Cloud" onBack={onBack} />
+      <p role="status" className="m-auto text-sm" style={{ color: C.muted }}>正在读取网易云账号…</p>
+    </div>
+  );
   if (!cfg.cookie || !profile) {
     if (localAlbumSongs.length === 0 || showNeteaseLogin) {
       return (
         <NeteaseLoginPanel
           onBack={localAlbumSongs.length > 0 ? () => setShowNeteaseLogin(false) : onBack}
-          onLoggedIn={async (cookie) => {
+          onLoggedIn={(cookie) => {
+            if (cookie === cfgRef.current.cookie) retryAccount();
             setCfg({ ...cfgRef.current, cookie });
-            await new Promise(r => setTimeout(r, 300));
-            await refreshProfile();
             toastRef.current('登录成功', 'success');
             setShowNeteaseLogin(false);
           }}
@@ -352,7 +364,7 @@ const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearc
               playSong(s, { alsoSetQueue: true, replaceQueue: localAlbumSongs, startIdx: idx });
               trackEvent('播放「我的」页列表里的一首歌', { source: 'local' });
             }}
-            onRemove={removeLocalSong}
+            onRemove={(s) => void handleRemoveLocalSong(s)}
           />
           {/* 登录入口卡 */}
           <button
@@ -387,6 +399,7 @@ const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearc
             regenStatus={current.id === regeneratingId ? regeneratingStatus : undefined}
           />
         )}
+        {confirmDialog}
       </div>
     );
   }
@@ -652,7 +665,7 @@ const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearc
                   playSong(s, { alsoSetQueue: true, replaceQueue: localAlbumSongs, startIdx: idx });
                   trackEvent('播放「我的」页列表里的一首歌', { source: 'local' });
                 }}
-                onRemove={removeLocalSong}
+                onRemove={(s) => void handleRemoveLocalSong(s)}
               />
             )}
             {playlists.length === 0 && !loading && localAlbumSongs.length === 0 && (
@@ -780,6 +793,7 @@ const NeteaseProfilePage: React.FC<Props> = ({ onBack, onOpenPlayer, onOpenSearc
           regenStatus={current.id === regeneratingId ? regeneratingStatus : undefined}
         />
       )}
+      {confirmDialog}
     </div>
   );
 };
