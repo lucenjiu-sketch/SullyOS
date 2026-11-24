@@ -96,14 +96,27 @@ const tidyContent = (content: string): string => describeEmojiTags(content)
  *
  * 一个窗口会堆好几本书的讨论（久定的「窗口不分书」的直接后果），
  * 所以书名和章节**从每条消息自己的 `reference` 读**，不在外面猜一本。
+ *
+ * **说话人一律写真名，不写「用户」「角色」。** 2026-11-24 久真机发现人称反了：
+ * 总结里的「我」变成了她。原因是记录里只有「用户 / 角色」这两个通用词，
+ * 而提示词说「用${characterName}的第一人称写」，模型得自己猜「我」是哪一边
+ * —— 共读室每条引用要写三行「用户正在读 / 用户划的原文 / 用户当时的想法」，
+ * 「用户」密度高，就被当成了第一人称主角。写真名后这个歧义不存在。
+ * 顺带也不再和提示词里「不要出现『用户』这类词」那条自相矛盾。
+ *
+ * 名字留空时退回「用户 / 角色」—— 只为兜住脏数据，正常路径一定传真名。
  */
 export function buildReadingArchiveTranscript(
   messages: ReadingDiscussionMessage[],
+  characterName?: string,
+  userName?: string,
 ): string {
+  const charLabel = characterName?.trim() || '角色';
+  const userLabel = userName?.trim() || '用户';
   const rows = messages
     .filter(message => message.role === 'user' || message.role === 'assistant')
     .map(message => {
-      const speaker = message.role === 'user' ? '用户' : '角色';
+      const speaker = message.role === 'user' ? userLabel : charLabel;
       const body = tidyContent(message.content);
       if (message.role !== 'user' || !message.reference) {
         return body ? `${speaker}：${body}` : '';
@@ -111,11 +124,11 @@ export function buildReadingArchiveTranscript(
       const reference = message.reference;
       const quote = reference.quote.replace(/\s+/g, ' ').trim().slice(0, MAX_QUOTE_CHARS);
       const lines = [
-        `用户正在读《${reference.bookTitle}》${reference.chapterTitle ? ` · ${reference.chapterTitle}` : ''}`,
+        `${userLabel}正在读《${reference.bookTitle}》${reference.chapterTitle ? ` · ${reference.chapterTitle}` : ''}`,
       ];
-      if (quote) lines.push(`用户划的原文：${quote}`);
+      if (quote) lines.push(`${userLabel}划的原文：${quote}`);
       // 只划线没说话也要留着引用：那也是「她在这句上停了一下」。
-      lines.push(body ? `用户当时的想法：${body}` : '用户没有另外说什么。');
+      lines.push(body ? `${userLabel}当时的想法：${body}` : `${userLabel}没有另外说什么。`);
       return lines.join('\n');
     })
     .filter(Boolean);
@@ -136,6 +149,10 @@ export function buildReadingArchivePrompt(characterName: string, userName: strin
   const user = userName?.trim() || '用户';
   return [
     `你正在为${characterName}整理一条长期记忆：${characterName}和${user}一起读书、讨论书里某些段落的经历。`,
+    // 人称这一句必须写死。记录里两边都是真名，不点明「我」是谁的话，
+    // 模型会按行文密度猜 —— 久 2026-11-24 真机撞到过，总结里的「我」变成了她。
+    `下面的记录里，署名${characterName}的是你自己说的话，署名${user}的是对方说的话。`,
+    `“我”只能指${characterName}，绝不能用“我”去指${user}。`,
     `只输出一段 60～180 字的中文，用${characterName}的第一人称写（“我和${user}……”）。`,
     '不要标题、不要日期、不要列表、不要引号、不要 Markdown。',
     `写清楚我和${user}读了哪本书、聊到了什么具体的内容或人物、${user}说过什么想法、我当时怎么回应的。`,
@@ -194,7 +211,7 @@ export const summarizeReadingRoomForMemory = async (
 ): Promise<string> => {
   const { lightLLM, characterName, userName, windowName, messages, signal } = input;
   if (!isArchiveSummaryApiConfigured(lightLLM)) throw new Error(archiveSummaryApiHint());
-  const transcript = buildReadingArchiveTranscript(messages);
+  const transcript = buildReadingArchiveTranscript(messages, characterName, userName);
   if (!transcript.trim()) throw new Error('这个窗口还没有可以总结的讨论');
   const baseUrl = lightLLM.baseUrl.trim().replace(/\/+$/, '');
   const data = await safeFetchJson(

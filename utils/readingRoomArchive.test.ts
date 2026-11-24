@@ -142,6 +142,47 @@ describe('共读归档 · 转写给总结模型的内容', () => {
       message({ role: 'assistant', content: '' }),
     ]).trim()).toBe('');
   });
+
+  // 2026-11-24：久真机发现总结里的「我」变成了她。根因是转写只写
+  // 「用户 / 角色」两个通用词，模型得自己猜「我」是哪一边。下面四条钉死真名。
+  it('说话人写真名，不出现「用户」「角色」字样', () => {
+    const text = buildReadingArchiveTranscript([
+      message({ role: 'user', content: '你怎么看这段' }),
+      message({ role: 'assistant', content: '我觉得他在逃' }),
+    ], '尚州', '陆沫久');
+    expect(text).toContain('陆沫久：你怎么看这段');
+    expect(text).toContain('尚州：我觉得他在逃');
+    expect(text).not.toContain('用户');
+    expect(text).not.toContain('角色：');
+  });
+
+  it('引用那三行也用真名，不写「用户正在读」', () => {
+    const text = buildReadingArchiveTranscript([
+      message({ reference: reference(), content: '这句有点疼' }),
+    ], '尚州', '陆沫久');
+    expect(text).toContain('陆沫久正在读《玻璃城堡》');
+    expect(text).toContain('陆沫久划的原文：');
+    expect(text).toContain('陆沫久当时的想法：');
+    expect(text).not.toContain('用户');
+  });
+
+  it('只划线没说话那句也用真名', () => {
+    const text = buildReadingArchiveTranscript([
+      message({ reference: reference(), content: '' }),
+    ], '尚州', '陆沫久');
+    expect(text).toContain('陆沫久没有另外说什么。');
+    expect(text).not.toContain('用户');
+  });
+
+  it('名字缺失时退回通用词，不写出 undefined', () => {
+    const text = buildReadingArchiveTranscript([
+      message({ role: 'user', content: '在吗' }),
+      message({ role: 'assistant', content: '在' }),
+    ]);
+    expect(text).not.toContain('undefined');
+    expect(text).toContain('用户：在吗');
+    expect(text).toContain('角色：在');
+  });
 });
 
 describe('共读归档 · 总结提示词', () => {
@@ -156,6 +197,16 @@ describe('共读归档 · 总结提示词', () => {
     const prompt = buildReadingArchivePrompt('尚州', '陆沫久');
     expect(prompt).toContain('第一人称');
     expect(prompt).toContain('我和陆沫久');
+  });
+
+  // 2026-11-24：光说「用角色的第一人称」不够，模型会把用户当成「我」。
+  // 必须点明署名谁是谁、以及「我」不许指用户。
+  it('点明两边署名，并禁止用「我」指代用户', () => {
+    const prompt = buildReadingArchivePrompt('尚州', '陆沫久');
+    expect(prompt).toContain('署名尚州的是你自己说的话');
+    expect(prompt).toContain('署名陆沫久的是对方说的话');
+    expect(prompt).toContain('“我”只能指尚州');
+    expect(prompt).toContain('绝不能用“我”去指陆沫久');
   });
 
   it('禁止编造双方没表达过的东西', () => {
