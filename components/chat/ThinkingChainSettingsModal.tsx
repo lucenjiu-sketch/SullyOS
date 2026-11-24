@@ -110,19 +110,6 @@ const ThinkingChainSettingsModal: React.FC<Props> = ({ isOpen, onClose, characte
                     <textarea aria-label="自定义心象提示词" value={draftPrompt} onChange={event => setDraftPrompt(event.target.value)} onBlur={commitPrompt}
                         placeholder="比如：请用中文概括思考，多写一些感官细节…" />
                 </section>
-                {/* 自带引导的开关。「替换」模式下自带引导本来就不发，此时灰掉避免看起来像没生效。 */}
-                <section>
-                    <div className="thinking-setting-heading">
-                        <h3>发送项目自带引导</h3>
-                        <button type="button" role="switch" aria-label="发送项目自带引导"
-                            aria-checked={value.builtinEnabled} className="thinking-switch"
-                            disabled={value.mode === 'replace'}
-                            onClick={() => onChangeCharacter({ thinkingChainPromptEnabled: !value.builtinEnabled })}><span /></button>
-                    </div>
-                    <p className="thinking-setting-hint">{value.mode === 'replace'
-                        ? '当前是「替换」模式，自带引导本来就不发送。'
-                        : '关掉后只少项目自带那篇引导，上方你自己写的内容照常发送。心象卡片和抓取不受影响。'}</p>
-                </section>
                 <details className="thinking-help" open={helpOpen} onToggle={event => setHelpOpen(event.currentTarget.open)}>
                     <summary>关于心象与常见问题</summary>
                     <p>「心象」展示模型或渠道返回的思考文字。有些模型只提供摘要，不代表完整的内部思考，也不保证每轮都有。</p>

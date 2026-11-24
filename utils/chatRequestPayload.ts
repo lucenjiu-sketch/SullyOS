@@ -405,18 +405,11 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         ? ContextBuilder.buildSARModuleContext(char, userProfile, input.appPrompt ? 'home' : 'chat')
         : '';
     const sarEnvelopeActive = sarModulePlan?.requiresEnvelope === true;
-    // 调用方可能自己手搭 thinkingChain（没走 getThinkingChainSettings），
-    // 那种情况下 builtinEnabled 缺失 —— 以角色档案上的字段兜底，保证开关不失效。
-    const thinkingChainWithToggle = thinkingChain
-        ? {
-            ...thinkingChain,
-            builtinEnabled: thinkingChain.builtinEnabled ?? (char.thinkingChainPromptEnabled !== false),
-        }
-        : thinkingChain;
+
     const { prompt: outputStylePrompt, bilingualActive, htmlActive, thinkingActive } = buildChatOutputStylePrompt({
         charName: char.name,
         userName: userProfile?.name,
-        ...(!input.appPrompt ? { translationConfig, htmlMode, thinkingChain: thinkingChainWithToggle, sarEnvelopeActive } : {}),
+        ...(!input.appPrompt ? { translationConfig, htmlMode, thinkingChain, sarEnvelopeActive } : {}),
     });
     systemPrompt += outputStylePrompt;
 

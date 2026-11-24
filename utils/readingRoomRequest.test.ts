@@ -96,7 +96,7 @@ describe('共读室 · 能发什么', () => {
   });
 });
 
-describe('共读室 · 心象（思考链）三档开关', () => {
+describe('共读室 · 心象（思考链）跟随统一口径', () => {
   it('总开关关掉就什么都不发', () => {
     expect(buildReadingRoomThinkingPrompt(character(), user())).toBe('');
     expect(buildReadingRoomThinkingPrompt(
@@ -104,7 +104,6 @@ describe('共读室 · 心象（思考链）三档开关', () => {
       user(),
     )).toBe('');
   });
-
   it('总开关开着，默认发项目自带那份', () => {
     const text = buildReadingRoomThinkingPrompt(
       character({ showThinkingChain: true } as any),
@@ -112,9 +111,8 @@ describe('共读室 · 心象（思考链）三档开关', () => {
     );
     expect(text.trim().length).toBeGreaterThan(0);
   });
-
-  it('关掉「自带提示词」后不发原生那份，只发用户写的', () => {
-    // 这个开关是久自己做的，她要求共读室也认它。
+  it('「替换」模式下不发自带那份，只发用户写的', () => {
+    // 共读室必须和聊天/通话/协同同口径，别在 requestContext 里手写判断。
     const builtin = buildReadingRoomThinkingPrompt(
       character({ showThinkingChain: true } as any),
       user(),
@@ -122,36 +120,39 @@ describe('共读室 · 心象（思考链）三档开关', () => {
     const text = buildReadingRoomThinkingPrompt(
       character({
         showThinkingChain: true,
-        thinkingChainPromptEnabled: false,
+        thinkingChainPromptScope: 'character',
+        thinkingChainPromptMode: 'replace',
         thinkingChainCustomPrompt: '只写一句话的心象。',
       } as any),
       user(),
     );
     expect(text).toContain('只写一句话的心象。');
     expect(text).not.toBe(builtin);
-    expect(text).toContain('用户追加的心象规则');
   });
-
-  it('关掉自带、又没写自定义，就彻底不发', () => {
+  it('「替换」模式又没写自定义，就彻底不发', () => {
     expect(buildReadingRoomThinkingPrompt(
-      character({ showThinkingChain: true, thinkingChainPromptEnabled: false } as any),
+      character({
+        showThinkingChain: true,
+        thinkingChainPromptScope: 'character',
+        thinkingChainPromptMode: 'replace',
+      } as any),
       user(),
     )).toBe('');
   });
-
-  it('自带和自定义都在时两份都发', () => {
+  it('「追加」模式下自带和自定义两份都发', () => {
     const text = buildReadingRoomThinkingPrompt(
       character({
         showThinkingChain: true,
+        thinkingChainPromptScope: 'character',
         thinkingChainCustomPrompt: '别写太长。',
       } as any),
       user(),
     );
     expect(text).toContain('别写太长。');
+    expect(text).toContain('用户追加的心象规则');
     expect(text.trim().length).toBeGreaterThan('别写太长。'.length);
   });
 });
-
 describe('共读室 · 历史消息里没有前后文', () => {
   it('带引用的历史只给书名、章节、划线原文', () => {
     const message = createDiscussionMessage({

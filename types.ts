@@ -3329,13 +3329,6 @@ export interface CharacterProfile {
   };
   /** 角色自定义心象提示词。未设置模式的角色默认追加。 */
   thinkingChainCustomPrompt?: string;
-  // 是否注入项目自带的那篇 THINKING 阶段引导（utils/thinkingChainPrompt.ts）。
-  // 默认开（!== false 即开）。受 showThinkingChain 统辖：主开关关着时本开关无意义。
-  // 关掉后只少那篇引导本身 —— reasoning 抓取、心象卡片渲染、以及用户自己写的
-  // thinkingChainCustomPrompt 照常生效，所以可以用它「只用我自己写的引导」。
-  // 判定收在 getThinkingChainSettings() 里（utils/thinkingChainPrompt.ts），
-  // 所以聊天、语音通话、协同窗口、共读室、定时主动消息全部一并受控。
-  thinkingChainPromptEnabled?: boolean;
   thinkingChainPromptMode?: 'append' | 'replace';
   thinkingChainPromptScope?: 'space' | 'character';
   /**

@@ -1,7 +1,7 @@
 import type { CharacterProfile, Emoji, EmojiCategory, UserProfile } from '../../types';
 import { ContextBuilder } from '../../utils/context';
 import { ChatPrompts } from '../../utils/chatPrompts';
-import { buildThinkingChainPrompt } from '../../utils/thinkingChainPrompt';
+import { buildThinkingChainPrompt, getThinkingChainSettings } from '../../utils/thinkingChainPrompt';
 import { injectMemoryPalace } from '../../utils/memoryPalace/pipeline';
 import { buildHighlightContext } from './highlight';
 import type { ReadingDiscussionMessage, ReadingMessageReference } from './types';
@@ -90,25 +90,27 @@ ${emojiRule}
 /**
  * 心象（思考链）规则。
  *
- * 口径和协同工作完全一致，久确认过这件事：
+ * 口径和聊天、通话、协同完全一致，全部走 getThinkingChainSettings +
+ * buildThinkingChainPrompt 这个统一入口：
  * - `showThinkingChain` 关 → 什么都不发
- * - `thinkingChainPromptEnabled` 为 false → **不发项目自带那份**，只发用户写的
- * - 两个都开 → 自带 + 用户追加
+ * - 「替换」模式 → 只发用户写的那份
+ * - 「追加」模式 → 自带 + 用户追加
  *
- * 那个「关掉自带提示词」的开关是久自己做的，她要求共读室也认它。
+ * 2026-11-24：这里原先手写判断、并认一个本地自造的
+ * `thinkingChainPromptEnabled` 开关。上游后来自己做了「追加 / 替换」，
+ * 效果重复，久决定删掉自造的那个、跟随上游。
+ * **别再在这里手写判断**，否则共读室会跟其他四条路口径不一致。
  */
 export const buildReadingRoomThinkingPrompt = (
   char: CharacterProfile,
   user: UserProfile,
 ): string => {
-  if (!char.showThinkingChain) return '';
-  const custom = (char.thinkingChainCustomPrompt || '').trim();
-  const builtin = char.thinkingChainPromptEnabled !== false
-    ? buildThinkingChainPrompt(char.name, user.name)
-    : '';
-  const customBlock = custom ? `\n\n### 用户追加的心象规则\n${custom}` : '';
-  if (!builtin && !customBlock) return '';
-  return `\n\n${builtin}${customBlock}`;
+  const block = buildThinkingChainPrompt(
+    char.name, user.name,
+    getThinkingChainSettings(char, user),
+    '### 用户追加的心象规则',
+  );
+  return block ? `\n\n${block}` : '';
 };
 
 /** 这一轮的引用要带的临时正文。**只在本轮请求里存在。** */

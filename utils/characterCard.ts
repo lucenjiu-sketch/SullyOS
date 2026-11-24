@@ -39,7 +39,6 @@ export const CARD_STRIPPED_FIELDS = [
   'thinkingChainStyle',
   'thinkingChainCustomColors',
   'thinkingChainCustomPrompt',
-  'thinkingChainPromptEnabled', // 与上一行同类：是否发送内置思考引导，属本机偏好
   'thinkingChainPromptMode',
   'thinkingChainPromptScope',
   'thinkingChainCustomCss',
